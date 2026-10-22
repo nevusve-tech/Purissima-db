@@ -1056,8 +1056,13 @@ app.delete('/api/roles/:clave', autenticar, soloAdmin, asyncH(async (req, res) =
 /* Nadie puede abrir una foto adivinando su dirección: para verla hay   */
 /* que pedirle al backend un enlace firmado, que caduca en una hora.    */
 /* ------------------------------------------------------------------ */
-const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+/*
+ * Se recortan los espacios: al pegar una clave en el panel es fácil
+ * arrastrar un espacio o un salto de línea al final, y eso la invalida
+ * sin que nada lo explique.
+ */
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+const SUPABASE_SERVICE_KEY = (process.env.SUPABASE_SERVICE_KEY || '').trim();
 const BUCKET_FOTOS = 'fotos';
 const FOTOS_HABILITADAS = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 const FOTO_MAX_BYTES = 2 * 1024 * 1024;
@@ -2317,11 +2322,27 @@ const server = app.listen(PORT, async () => {
   if (FOTOS_HABILITADAS) {
     console.log(`[fotos] Activadas. Almacén "${BUCKET_FOTOS}" en ${SUPABASE_URL}`);
   } else {
-    const faltan = [
-      !SUPABASE_URL && 'SUPABASE_URL',
-      !SUPABASE_SERVICE_KEY && 'SUPABASE_SERVICE_KEY',
-    ].filter(Boolean);
-    console.warn(`[fotos] Desactivadas: falta ${faltan.join(' y ')} en las variables de entorno.`);
+    /*
+     * Distingue "no existe" de "existe pero vacía": decir sólo "falta"
+     * dejaba sin saber si el nombre estaba mal escrito o si el valor no
+     * se había pegado.
+     */
+    const estado = (nombre) => {
+      if (!(nombre in process.env)) return 'NO EXISTE';
+      const v = process.env[nombre];
+      if (v === '') return 'existe pero está VACÍA';
+      if (v.trim() === '') return 'existe pero sólo tiene espacios';
+      return `definida (${v.trim().length} caracteres)`;
+    };
+    console.warn(`[fotos] Desactivadas. SUPABASE_URL: ${estado('SUPABASE_URL')}`);
+    console.warn(`[fotos] Desactivadas. SUPABASE_SERVICE_KEY: ${estado('SUPABASE_SERVICE_KEY')}`);
+    /*
+     * Lista los NOMBRES de las variables parecidas que sí llegaron, para
+     * cazar un nombre mal escrito. Sólo los nombres: el valor de una
+     * clave no se escribe nunca en el registro.
+     */
+    const parecidas = Object.keys(process.env).filter((k) => /supa/i.test(k));
+    console.warn(`[fotos] Variables cuyo nombre contiene "supa": ${parecidas.length ? parecidas.join(', ') : 'ninguna'}`);
     console.warn('[fotos] El sistema funciona igual, pero no acepta fotos y el checklist no las exige.');
   }
 
