@@ -32,6 +32,7 @@ DROP TABLE IF EXISTS productos          CASCADE;
 DROP TABLE IF EXISTS proveedores        CASCADE;
 DROP TABLE IF EXISTS motos              CASCADE;
 DROP TABLE IF EXISTS usuarios           CASCADE;
+DROP TABLE IF EXISTS roles              CASCADE;
 DROP FUNCTION IF EXISTS set_actualizado_en() CASCADE;
 DROP FUNCTION IF EXISTS sync_usuario_activo() CASCADE;
 
@@ -46,6 +47,42 @@ END;
 $fn$ LANGUAGE plpgsql;
 
 -- =====================================================================
+-- ROLES (los cargos del equipo)
+--
+-- Cada rol es un PERFIL: lleva su nombre y, guardados dentro, qué
+-- módulos trae y qué funciones especiales concede. Quien lo tenga hereda
+-- todo eso; encima se le puede marcar algo extra a una persona concreta,
+-- y el permiso efectivo es la suma de los dos.
+--
+-- El Master los crea y edita desde "Accesos". 'admin' queda protegido
+-- para que el sistema nunca se quede sin dueño, y el nivel Master
+-- (es_master) no se concede desde la aplicación.
+-- =====================================================================
+CREATE TABLE roles (
+  clave               varchar(30)  PRIMARY KEY
+                                   CHECK (clave ~ '^[a-z][a-z0-9_]{2,29}$'),
+  nombre              varchar(60)  NOT NULL,
+  modulos_permitidos  jsonb        NOT NULL DEFAULT '[]'::jsonb
+                                   CHECK (jsonb_typeof(modulos_permitidos) = 'array'),
+  permisos_especiales jsonb        NOT NULL DEFAULT '[]'::jsonb
+                                   CHECK (jsonb_typeof(permisos_especiales) = 'array'),
+  es_master           boolean      NOT NULL DEFAULT FALSE,
+  protegido           boolean      NOT NULL DEFAULT FALSE,
+  activo              boolean      NOT NULL DEFAULT TRUE,
+  creado_en           timestamptz  NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX ux_roles_nombre ON roles (lower(nombre));
+CREATE INDEX ix_roles_activo ON roles (activo);
+
+-- Los tres de arranque. Nacen SIN permisos propios a propósito: así cada
+-- empleado lleva lo suyo en su ficha y el Master decide después qué
+-- conviene subir al cargo.
+INSERT INTO roles (clave, nombre, es_master, protegido) VALUES
+  ('admin',       'Master',     TRUE,  TRUE),
+  ('tienda',      'Tienda',     FALSE, FALSE),
+  ('motorizados', 'Motorizado', FALSE, FALSE);
+
+-- =====================================================================
 -- USUARIOS
 -- modulos_permitidos (JSONB) controla de forma dinámica qué formularios
 -- ve y puede llenar cada empleado. El Master lo edita desde "Accesos".
@@ -56,7 +93,10 @@ CREATE TABLE usuarios (
                                    CHECK (length(trim(usuario)) >= 3 AND usuario !~ '\s'),
   nombre              varchar(80)  NOT NULL CHECK (length(trim(nombre)) >= 2),
   apellido            varchar(80)  NOT NULL DEFAULT '',
-  rol                 varchar(20)  NOT NULL CHECK (rol IN ('motorizados', 'tienda', 'admin')),
+  -- El cargo sale de la tabla "roles": no se borra un rol que alguien
+  -- tenga asignado, y renombrar su clave arrastra a sus empleados.
+  rol                 varchar(30)  NOT NULL REFERENCES roles (clave)
+                                   ON UPDATE CASCADE ON DELETE RESTRICT,
   pin_hash            varchar(120) NOT NULL,
   -- Qué formularios puede llenar
   modulos_permitidos  jsonb        NOT NULL DEFAULT '[]'::jsonb
@@ -343,7 +383,7 @@ CREATE UNIQUE INDEX ux_cierres_fecha ON cierres_caja (fecha) WHERE NOT anulado;
 DO $$
 DECLARE t text;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['usuarios', 'motos', 'checklist_motos', 'proveedores', 'productos',
+  FOREACH t IN ARRAY ARRAY['roles', 'usuarios', 'motos', 'checklist_motos', 'proveedores', 'productos',
                            'entradas_agua', 'entradas_mercancia', 'cierres_caja',
                            'solicitudes', 'incidencias']
   LOOP

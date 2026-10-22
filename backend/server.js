@@ -166,6 +166,8 @@ const COLUMNAS_REQUERIDAS = [
   ['usuarios', 'apellido'],
   ['usuarios', 'estado'],
   ['usuarios', 'permisos_especiales'],
+  ['roles', 'clave'],
+  ['roles', 'es_master'],
   ['solicitudes', 'titulo'],
   ['solicitudes', 'descripcion'],
   ['solicitudes', 'notas_admin'],
@@ -201,7 +203,7 @@ async function verificarEsquema() {
     console.error('\n=============================================================');
     console.error(' FALTA APLICAR LA MIGRACIÓN');
     console.error(' Columnas ausentes:', faltan.join(', '));
-    console.error(' Ejecute: database/migracion_001_modulos_y_reportes.sql');
+    console.error(' Aplique las migraciones pendientes de database/ en orden.');
     console.error(' (Supabase -> SQL Editor -> pegar el archivo -> Run)');
     console.error('=============================================================\n');
     return false;
@@ -467,20 +469,53 @@ app.use((req, res, next) => {
 });
 app.use(express.json({ limit: '50kb' }));
 
+/** Une dos listas de permisos sin repetir. */
+const unirClaves = (a, b) => [
+  ...new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])]),
+];
+
+/**
+ * Calcula lo que el empleado puede de verdad: lo que HEREDA de su rol
+ * más lo EXTRA que se le marcó a él en particular.
+ *
+ * Se recalcula en cada petición leyendo de la base y nunca del token,
+ * así que quitar un permiso surte efecto de inmediato y editar un rol
+ * cambia a todos los que lo tengan.
+ */
+function calcularEfectivos(u) {
+  u.es_master = u.es_master === true;
+  // Un rol desactivado deja de conceder; a la persona le queda sólo lo suyo.
+  const delRol = u.rol_activo === false ? { m: [], p: [] } : { m: u.rol_modulos, p: u.rol_permisos };
+  u.modulos_efectivos = u.es_master
+    ? [...MODULOS_VALIDOS]
+    : unirClaves(delRol.m, u.modulos_permitidos);
+  u.permisos_efectivos = u.es_master
+    ? [...CLAVES_PERMISOS]
+    : unirClaves(delRol.p, u.permisos_especiales);
+  return u;
+}
+
+const SELECT_USUARIO_SESION = `
+  SELECT u.id, u.usuario, u.nombre, u.apellido, u.rol, u.estado,
+         u.modulos_permitidos, u.permisos_especiales,
+         r.nombre   AS rol_nombre,
+         r.es_master,
+         r.activo   AS rol_activo,
+         r.modulos_permitidos  AS rol_modulos,
+         r.permisos_especiales AS rol_permisos
+    FROM usuarios u
+    JOIN roles r ON r.clave = u.rol`;
+
 async function autenticar(req, res, next) {
   try {
     const cab = req.get('authorization') || '';
     const token = cab.startsWith('Bearer ') ? cab.slice(7).trim() : '';
     const payload = verificarJwt(token);
     if (!payload) throw new HttpError(401, 'Sesión inválida o vencida');
-    const { rows } = await pool.query(
-      `SELECT id, usuario, nombre, apellido, rol, modulos_permitidos, permisos_especiales, estado
-         FROM usuarios WHERE id = $1`,
-      [payload.sub],
-    );
+    const { rows } = await pool.query(`${SELECT_USUARIO_SESION} WHERE u.id = $1`, [payload.sub]);
     const u = rows[0];
     if (!u || u.estado !== 'activo') throw new HttpError(401, 'Su cuenta no tiene acceso. Consulte con el Master.');
-    req.usuario = u; // permisos siempre frescos desde la BD
+    req.usuario = calcularEfectivos(u); // permisos siempre frescos desde la BD
     next();
   } catch (err) {
     next(err);
@@ -488,11 +523,11 @@ async function autenticar(req, res, next) {
 }
 
 const soloAdmin = (req, res, next) =>
-  (req.usuario.rol === 'admin' ? next() : next(new HttpError(403, 'Acceso exclusivo del Master')));
+  (req.usuario.es_master ? next() : next(new HttpError(403, 'Acceso exclusivo del Master')));
 
 /** El Master tiene todas las funciones especiales sin que figuren en su lista. */
 const tienePermiso = (u, clave) =>
-  u.rol === 'admin' || (Array.isArray(u.permisos_especiales) && u.permisos_especiales.includes(clave));
+  u.es_master || (Array.isArray(u.permisos_efectivos) && u.permisos_efectivos.includes(clave));
 
 const requierePermiso = (clave) => (req, res, next) => {
   if (tienePermiso(req.usuario, clave)) return next();
@@ -501,7 +536,7 @@ const requierePermiso = (clave) => (req, res, next) => {
 };
 
 const tieneModulo = (u, modulo) =>
-  u.rol === 'admin' || (Array.isArray(u.modulos_permitidos) && u.modulos_permitidos.includes(modulo));
+  u.es_master || (Array.isArray(u.modulos_efectivos) && u.modulos_efectivos.includes(modulo));
 
 const requiereModulo = (modulo) => (req, res, next) => {
   if (tieneModulo(req.usuario, modulo)) return next();
@@ -525,8 +560,12 @@ const usuarioPublico = (u) => ({
   apellido: u.apellido || '',
   nombre_completo: nombreCompleto(u),
   rol: u.rol,
-  modulos_permitidos: u.modulos_permitidos,
-  permisos_especiales: u.rol === 'admin' ? CLAVES_PERMISOS : (u.permisos_especiales || []),
+  rol_nombre: u.rol_nombre || u.rol,
+  es_master: u.es_master === true,
+  // Lo efectivo: lo que hereda del rol más lo suyo. El frontend arma el
+  // menú con esto, así que debe ser la suma y no sólo lo propio.
+  modulos_permitidos: u.modulos_efectivos || u.modulos_permitidos || [],
+  permisos_especiales: u.permisos_efectivos || u.permisos_especiales || [],
 });
 
 /* ------------------------------------------------------------------ */
@@ -550,10 +589,16 @@ app.post('/api/auth/login', limitadorLogin, asyncH(async (req, res) => {
   if (!esPinValido(pin)) throw new HttpError(401, 'Credenciales inválidas');
 
   const { rows } = await pool.query(
-    `SELECT id, usuario, nombre, apellido, rol, modulos_permitidos, permisos_especiales, estado,
-            intentos_fallidos, bloqueado_hasta,
-            (pin_hash = crypt($2, pin_hash)) AS pin_ok
-       FROM usuarios WHERE lower(usuario) = lower($1)`,
+    `SELECT u.id, u.usuario, u.nombre, u.apellido, u.rol, u.estado,
+            u.modulos_permitidos, u.permisos_especiales,
+            r.nombre AS rol_nombre, r.es_master, r.activo AS rol_activo,
+            r.modulos_permitidos  AS rol_modulos,
+            r.permisos_especiales AS rol_permisos,
+            u.intentos_fallidos, u.bloqueado_hasta,
+            (u.pin_hash = crypt($2, u.pin_hash)) AS pin_ok
+       FROM usuarios u
+       JOIN roles r ON r.clave = u.rol
+      WHERE lower(u.usuario) = lower($1)`,
     [ingreso, pin],
   );
   const u = rows[0];
@@ -590,7 +635,7 @@ app.post('/api/auth/login', limitadorLogin, asyncH(async (req, res) => {
     [u.id],
   ).catch(() => {});
   intentosLogin.delete(req.limiteIp);
-  res.json({ token: firmarJwt({ sub: u.id, rol: u.rol }), usuario: usuarioPublico(u) });
+  res.json({ token: firmarJwt({ sub: u.id, rol: u.rol }), usuario: usuarioPublico(calcularEfectivos(u)) });
 }));
 
 app.get('/api/auth/me', autenticar, (req, res) => {
@@ -627,16 +672,43 @@ function validarModulos(valor) {
 
 const COLS_USUARIO = `id, usuario, nombre, apellido, rol, modulos_permitidos, permisos_especiales,
             estado, activo, creado_en,
+            (SELECT r.nombre    FROM roles r WHERE r.clave = usuarios.rol) AS rol_nombre,
+            (SELECT r.es_master FROM roles r WHERE r.clave = usuarios.rol) AS es_master,
+            (SELECT r.modulos_permitidos  FROM roles r WHERE r.clave = usuarios.rol) AS rol_modulos,
+            (SELECT r.permisos_especiales FROM roles r WHERE r.clave = usuarios.rol) AS rol_permisos,
             trim(nombre || ' ' || apellido) AS nombre_completo,
             (bloqueado_hasta IS NOT NULL AND bloqueado_hasta > now()) AS bloqueado`;
+
+/** ¿Esta clave de rol concede el nivel Master? */
+async function esRolMaster(clave, cliente) {
+  const { rows } = await (cliente || pool).query(
+    'SELECT es_master FROM roles WHERE clave = $1', [clave],
+  );
+  return rows[0] ? rows[0].es_master === true : false;
+}
+
+/**
+ * El rol debe existir en la tabla y estar activo. Reemplaza a la lista
+ * fija de tres valores que había antes de la migración 006.
+ */
+async function validarRol(valor, cliente) {
+  const clave = texto(valor, 'Rol', { requerido: true, max: 30 });
+  const { rows } = await (cliente || pool).query(
+    'SELECT clave, activo FROM roles WHERE clave = $1', [clave],
+  );
+  if (!rows[0]) throw bad(`El rol "${clave.slice(0, 30)}" no existe`);
+  if (rows[0].activo === false) throw bad(`El rol "${clave.slice(0, 30)}" está desactivado`);
+  return rows[0].clave;
+}
 
 /**
  * Nadie que no sea Master puede tocar una cuenta de Master ni crear una.
  * Sin esto, alguien con "gestionar empleados" podría cambiarle el PIN al
  * Master y quedarse con todo el sistema.
  */
-function protegerMaster(actor, rolObjetivo) {
-  if (actor.rol !== 'admin' && rolObjetivo === 'admin') {
+async function protegerMaster(actor, rolObjetivo, cliente) {
+  if (actor.es_master) return;
+  if (await esRolMaster(rolObjetivo, cliente)) {
     throw new HttpError(403, 'Sólo el Master puede crear o modificar otra cuenta de Master');
   }
 }
@@ -645,7 +717,7 @@ function protegerMaster(actor, rolObjetivo) {
 async function exigirPuedeTocar(actor, id) {
   const { rows } = await pool.query('SELECT id, rol FROM usuarios WHERE id = $1', [id]);
   if (!rows[0]) throw new HttpError(404, 'Usuario no encontrado');
-  protegerMaster(actor, rows[0].rol);
+  await protegerMaster(actor, rows[0].rol);
   return rows[0];
 }
 
@@ -664,12 +736,20 @@ app.get('/api/usuarios', autenticar, requierePermiso('ver_accesos'), asyncH(asyn
       ORDER BY estado, nombre, apellido`,
     [incluirEliminados],
   );
+  const { rows: roles } = await pool.query(
+    `SELECT clave, nombre, modulos_permitidos, permisos_especiales,
+            es_master, protegido, activo,
+            (SELECT count(*) FROM usuarios u
+              WHERE u.rol = roles.clave AND u.estado <> 'eliminado') AS en_uso
+       FROM roles ORDER BY es_master DESC, nombre`,
+  );
   res.json({
     usuarios: rows,
+    roles: roles.map((r) => ({ ...r, en_uso: Number(r.en_uso) })),
     modulos_disponibles: MODULOS_VALIDOS,
     estados: ESTADOS_USUARIO,
     permisos_disponibles: PERMISOS_ESPECIALES,
-    puede_conceder: req.usuario.rol === 'admin',
+    puede_conceder: req.usuario.es_master === true,
   });
 }));
 
@@ -678,8 +758,8 @@ app.post('/api/usuarios', autenticar, requierePermiso('gestionar_empleados'), as
   const usuario = nombreUsuario(b.usuario);
   const nombre = texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 80 });
   const apellido = texto(b.apellido, 'Apellido', { max: 80 });
-  const rol = unoDe(b.rol, ['motorizados', 'tienda', 'admin'], 'Rol');
-  protegerMaster(req.usuario, rol);
+  const rol = await validarRol(b.rol);
+  await protegerMaster(req.usuario, rol);
   if (!esPinValido(b.pin)) throw bad('El PIN debe tener entre 4 y 8 dígitos');
   const modulos = validarModulos(b.modulos_permitidos || []);
   const { rows } = await pool.query(
@@ -705,16 +785,15 @@ app.put('/api/usuarios/:id', autenticar, requierePermiso('gestionar_empleados'),
       ? texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 80 }) : actual.nombre;
     const apellido = b.apellido !== undefined
       ? texto(b.apellido, 'Apellido', { max: 80 }) : actual.apellido;
-    const rol = b.rol !== undefined
-      ? unoDe(b.rol, ['motorizados', 'tienda', 'admin'], 'Rol') : actual.rol;
+    const rol = b.rol !== undefined ? await validarRol(b.rol, c) : actual.rol;
 
     // No se puede tocar una cuenta de Master, ni ascender a nadie a Master,
     // si quien edita no es Master
-    protegerMaster(req.usuario, actual.rol);
-    protegerMaster(req.usuario, rol);
+    await protegerMaster(req.usuario, actual.rol, c);
+    await protegerMaster(req.usuario, rol, c);
 
-    // El Master no puede quitarse a sí mismo el rol
-    if (id === req.usuario.id && req.usuario.rol === 'admin' && rol !== 'admin') {
+    // El Master no puede quitarse a sí mismo el nivel Master
+    if (id === req.usuario.id && req.usuario.es_master && !(await esRolMaster(rol, c))) {
       throw bad('No puede quitarse a sí mismo el rol de Master');
     }
 
@@ -767,12 +846,9 @@ app.put('/api/usuarios/:id/permisos', autenticar, soloAdmin, asyncH(async (req, 
  */
 app.put('/api/usuarios/:id/especiales', autenticar, soloAdmin, asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
-  const lista = req.body && req.body.permisos_especiales;
-  if (!Array.isArray(lista)) throw bad('permisos_especiales debe ser un arreglo');
-  const unicos = [...new Set(lista)];
-  for (const c of unicos) {
-    if (!CLAVES_PERMISOS.includes(c)) throw bad(`Función no válida: ${String(c).slice(0, 40)}`);
-  }
+  // Se guardan sólo como EXTRAS de esta persona: lo que ya hereda de su
+  // rol no se copia aquí, para que al editar el rol le siga cambiando.
+  const unicos = validarPermisos(req.body && req.body.permisos_especiales);
   const { rows } = await pool.query(
     `UPDATE usuarios SET permisos_especiales = $2::jsonb WHERE id = $1
      RETURNING ${COLS_USUARIO}`,
@@ -807,6 +883,161 @@ app.put('/api/usuarios/:id/activo', autenticar, requierePermiso('gestionar_emple
   );
   if (!rows[0]) throw new HttpError(404, 'Usuario no encontrado');
   res.json({ usuario: rows[0] });
+}));
+
+/* ------------------------------------------------------------------ */
+/* Roles (perfiles de cargo)                                           */
+/*                                                                     */
+/* Un rol es un PERFIL: lleva su nombre y, guardados dentro, qué        */
+/* módulos ve y qué funciones especiales trae. Quien lo tenga hereda    */
+/* todo eso, y encima se le puede marcar algo extra a él en particular. */
+/*                                                                     */
+/* Crear y editar roles es EXCLUSIVO del Master (soloAdmin), igual que  */
+/* conceder permisos: quien pudiera crear un rol podría armarse uno con */
+/* todo y asignárselo.                                                 */
+/* ------------------------------------------------------------------ */
+
+/** Valida una lista de funciones especiales contra el catálogo. */
+function validarPermisos(valor) {
+  if (!Array.isArray(valor)) throw bad('permisos_especiales debe ser un arreglo');
+  const unicos = [...new Set(valor)];
+  for (const c of unicos) {
+    if (!CLAVES_PERMISOS.includes(c)) throw bad(`Función no válida: ${String(c).slice(0, 40)}`);
+  }
+  return unicos;
+}
+
+/**
+ * La clave interna se deriva del nombre, para que el Master sólo escriba
+ * "Gerente de Recursos Humanos" y no tenga que inventar un identificador.
+ */
+function claveDesdeNombre(nombre) {
+  const base = String(nombre)
+    .normalize('NFD').replace(/[̀-ͯ]/g, '') // quita acentos
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 30)
+    .replace(/_+$/, '');
+  if (/^[a-z][a-z0-9_]{2,29}$/.test(base)) return base;
+  return `rol_${base}`.slice(0, 30).replace(/_+$/, '') || 'rol';
+}
+
+/** Busca una clave libre: gerente, gerente_2, gerente_3... */
+async function claveLibre(nombre, cliente) {
+  const base = claveDesdeNombre(nombre);
+  for (let i = 1; i <= 50; i += 1) {
+    const intento = i === 1 ? base : `${base.slice(0, 27)}_${i}`;
+    const { rows } = await (cliente || pool).query(
+      'SELECT 1 FROM roles WHERE clave = $1', [intento],
+    );
+    if (!rows[0]) return intento;
+  }
+  throw bad('No se pudo generar una clave para ese nombre. Pruebe con otro.');
+}
+
+const COLS_ROL = `clave, nombre, modulos_permitidos, permisos_especiales,
+            es_master, protegido, activo, creado_en,
+            (SELECT count(*) FROM usuarios u
+              WHERE u.rol = roles.clave AND u.estado <> 'eliminado')::int AS en_uso`;
+
+app.get('/api/roles', autenticar, requierePermiso('ver_accesos'), asyncH(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT ${COLS_ROL} FROM roles ORDER BY es_master DESC, nombre`,
+  );
+  res.json({
+    roles: rows,
+    modulos_disponibles: MODULOS_VALIDOS,
+    permisos_disponibles: PERMISOS_ESPECIALES,
+    puede_gestionar: req.usuario.es_master === true,
+  });
+}));
+
+app.post('/api/roles', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const b = req.body || {};
+  const nombre = texto(b.nombre, 'Nombre del rol', { requerido: true, min: 3, max: 60 });
+  const modulos = validarModulos(b.modulos_permitidos || []);
+  const permisos = validarPermisos(b.permisos_especiales || []);
+
+  const rol = await withTx(async (c) => {
+    const { rows: dup } = await c.query('SELECT clave FROM roles WHERE lower(nombre) = lower($1)', [nombre]);
+    if (dup[0]) throw bad(`Ya existe un rol llamado "${nombre}"`);
+    const clave = await claveLibre(nombre, c);
+    // es_master y protegido se dejan en false a propósito: el nivel
+    // Master no se concede desde la aplicación.
+    const { rows } = await c.query(
+      `INSERT INTO roles (clave, nombre, modulos_permitidos, permisos_especiales)
+       VALUES ($1, $2, $3::jsonb, $4::jsonb)
+       RETURNING ${COLS_ROL}`,
+      [clave, nombre, JSON.stringify(modulos), JSON.stringify(permisos)],
+    );
+    return rows[0];
+  });
+  res.status(201).json({ rol });
+}));
+
+/**
+ * Editar un rol cambia de inmediato lo que pueden TODOS los que lo
+ * tengan, porque los permisos se recalculan en cada petición.
+ */
+app.put('/api/roles/:clave', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const clave = texto(req.params.clave, 'Rol', { requerido: true, max: 30 });
+  const b = req.body || {};
+  const rol = await withTx(async (c) => {
+    const { rows } = await c.query('SELECT * FROM roles WHERE clave = $1 FOR UPDATE', [clave]);
+    const actual = rows[0];
+    if (!actual) throw new HttpError(404, 'Rol no encontrado');
+    if (actual.protegido) {
+      throw new HttpError(403, `El rol "${actual.nombre}" es del sistema y no se puede modificar`);
+    }
+
+    const nombre = b.nombre !== undefined
+      ? texto(b.nombre, 'Nombre del rol', { requerido: true, min: 3, max: 60 }) : actual.nombre;
+    const modulos = b.modulos_permitidos !== undefined
+      ? validarModulos(b.modulos_permitidos) : actual.modulos_permitidos;
+    const permisos = b.permisos_especiales !== undefined
+      ? validarPermisos(b.permisos_especiales) : actual.permisos_especiales;
+
+    if (nombre.toLowerCase() !== String(actual.nombre).toLowerCase()) {
+      const { rows: dup } = await c.query(
+        'SELECT clave FROM roles WHERE lower(nombre) = lower($1) AND clave <> $2', [nombre, clave],
+      );
+      if (dup[0]) throw bad(`Ya existe un rol llamado "${nombre}"`);
+    }
+
+    const r = await c.query(
+      `UPDATE roles SET nombre = $2, modulos_permitidos = $3::jsonb, permisos_especiales = $4::jsonb
+        WHERE clave = $1 RETURNING ${COLS_ROL}`,
+      [clave, nombre, JSON.stringify(modulos), JSON.stringify(permisos)],
+    );
+    return r.rows[0];
+  });
+  res.json({ rol });
+}));
+
+app.delete('/api/roles/:clave', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const clave = texto(req.params.clave, 'Rol', { requerido: true, max: 30 });
+  await withTx(async (c) => {
+    const { rows } = await c.query('SELECT * FROM roles WHERE clave = $1 FOR UPDATE', [clave]);
+    const rol = rows[0];
+    if (!rol) throw new HttpError(404, 'Rol no encontrado');
+    if (rol.protegido) {
+      throw new HttpError(403, `El rol "${rol.nombre}" es del sistema y no se puede eliminar`);
+    }
+    const { rows: uso } = await c.query(
+      `SELECT count(*)::int AS n FROM usuarios WHERE rol = $1 AND estado <> 'eliminado'`, [clave],
+    );
+    if (uso[0].n > 0) {
+      throw bad(`"${rol.nombre}" lo tiene ${uso[0].n} empleado(s). Cámbieles el cargo antes de eliminarlo.`);
+    }
+    // Si alguna cuenta ya retirada lo conserva, se la pasamos a Motorizado
+    // para que la llave foránea no impida borrar el rol.
+    await c.query(
+      `UPDATE usuarios SET rol = 'motorizados' WHERE rol = $1 AND estado = 'eliminado'`, [clave],
+    );
+    await c.query('DELETE FROM roles WHERE clave = $1', [clave]);
+  });
+  res.json({ ok: true });
 }));
 
 /* ------------------------------------------------------------------ */

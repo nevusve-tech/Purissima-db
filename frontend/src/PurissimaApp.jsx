@@ -36,7 +36,13 @@ const VISTAS_MASTER = {
 const puede = (u, clave) =>
   Boolean(u) && Array.isArray(u.permisos_especiales) && u.permisos_especiales.includes(clave);
 
+/*
+ * Los cargos ahora viven en la base y el Master los crea. El backend
+ * manda el nombre ya resuelto en "rol_nombre"; esta tabla sólo queda de
+ * respaldo para los tres que existían antes de la migración 006.
+ */
 const ROL_ETIQUETA = { admin: 'Master', motorizados: 'Motorizado', tienda: 'Tienda' };
+const nombreRol = (u) => (u && (u.rol_nombre || ROL_ETIQUETA[u.rol] || u.rol)) || '';
 const ESTADO_USUARIO_ETIQUETA = { activo: 'Activo', pausado: 'Pausado', eliminado: 'Sin acceso' };
 const TONO_ESTADO_USUARIO = { activo: 'verde', pausado: 'ambar', eliminado: 'rojo' };
 
@@ -2414,9 +2420,204 @@ function VistaFinanzas({ call, aviso }) {
 /* ------------------------------------------------------------------ */
 /* Master: Accesos                                                     */
 /* ------------------------------------------------------------------ */
+/*
+ * Los cargos del equipo. Un cargo es un PERFIL: guarda su nombre y, dentro,
+ * qué formularios trae y qué funciones especiales concede. Al asignarlo, la
+ * persona hereda todo eso; al editarlo, cambia para todos los que lo tengan.
+ *
+ * Sólo el Master entra aquí: quien pudiera crear un cargo se armaría uno con
+ * todo y se lo asignaría.
+ */
+const ROL_VACIO = { nombre: '', modulos_permitidos: [], permisos_especiales: [] };
+
+function PanelRoles({ roles, disponibles, permisosDisp, call, aviso, recargar }) {
+  const [editando, setEditando] = useState(null); // clave del rol, o 'nuevo'
+  const [borrador, setBorrador] = useState(ROL_VACIO);
+  const [guardando, setGuardando] = useState(false);
+
+  const cerrar = () => { setEditando(null); setBorrador(ROL_VACIO); };
+  const abrirNuevo = () => { setBorrador(ROL_VACIO); setEditando('nuevo'); };
+  const abrirRol = (r) => {
+    setBorrador({
+      nombre: r.nombre,
+      modulos_permitidos: [...(r.modulos_permitidos || [])],
+      permisos_especiales: [...(r.permisos_especiales || [])],
+    });
+    setEditando(r.clave);
+  };
+
+  const alternar = (campo, v) => setBorrador((b) => ({
+    ...b,
+    [campo]: b[campo].includes(v) ? b[campo].filter((x) => x !== v) : [...b[campo], v],
+  }));
+
+  const guardar = async (e) => {
+    e.preventDefault();
+    setGuardando(true);
+    try {
+      if (editando === 'nuevo') {
+        await call('/api/roles', { method: 'POST', body: borrador });
+        aviso(`Cargo “${borrador.nombre}” creado. Ya puedes asignarlo.`, 'ok');
+      } else {
+        await call(`/api/roles/${editando}`, { method: 'PUT', body: borrador });
+        aviso(`“${borrador.nombre}” actualizado. Cambia para todos los que lo tengan.`, 'ok');
+      }
+      cerrar();
+      await recargar();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setGuardando(false);
+    }
+  };
+
+  const eliminar = async (r) => {
+    if (!window.confirm(`¿Eliminar el cargo “${r.nombre}”? Nadie lo tiene asignado.`)) return;
+    try {
+      await call(`/api/roles/${r.clave}`, { method: 'DELETE' });
+      aviso('Cargo eliminado', 'ok');
+      await recargar();
+    } catch (err) {
+      aviso(err.message, 'error');
+    }
+  };
+
+  const resumen = (r) => {
+    if (r.es_master) return 'Acceso total al sistema';
+    const m = (r.modulos_permitidos || []).length;
+    const p = (r.permisos_especiales || []).length;
+    if (!m && !p) return 'No trae permisos: cada persona los lleva en su ficha';
+    return [
+      m ? `${m} formulario${m === 1 ? '' : 's'}` : null,
+      p ? `${p} función${p === 1 ? '' : 'es'} especial${p === 1 ? '' : 'es'}` : null,
+    ].filter(Boolean).join(' · ');
+  };
+
+  return (
+    <div className="card space-y-3">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="font-bold">Cargos del equipo</h3>
+          <p className="text-xs text-slate-500">
+            Un cargo guarda sus permisos. Al asignarlo la persona los hereda; si lo
+            editas, cambia para todos los que lo tengan.
+          </p>
+        </div>
+        <button
+          type="button"
+          className="btn-sec !py-2 !min-h-[40px] shrink-0"
+          onClick={editando === 'nuevo' ? cerrar : abrirNuevo}
+        >
+          {editando === 'nuevo' ? 'Cerrar' : '+ Cargo'}
+        </button>
+      </div>
+
+      <div className="space-y-1">
+        {roles.map((r) => (
+          <div key={r.clave} className="flex items-center gap-2 py-2 border-b border-slate-100">
+            <span className="min-w-0 flex-1">
+              <span className="font-medium">{r.nombre}</span>
+              <span className="block text-xs text-slate-500">{resumen(r)}</span>
+            </span>
+            {r.en_uso > 0 && <Chip>{r.en_uso === 1 ? '1 persona' : `${r.en_uso} personas`}</Chip>}
+            {r.protegido ? (
+              <Chip tono="azul">del sistema</Chip>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="btn-sec !py-1 !px-2 !min-h-[32px] !text-xs shrink-0"
+                  onClick={() => (editando === r.clave ? cerrar() : abrirRol(r))}
+                >
+                  {editando === r.clave ? 'Cerrar' : 'Editar'}
+                </button>
+                {!r.en_uso && (
+                  <button
+                    type="button"
+                    className="btn !py-1 !px-2 !min-h-[32px] !text-xs bg-red-100 text-red-800 shrink-0"
+                    onClick={() => eliminar(r)}
+                  >
+                    Eliminar
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {editando && (
+        <form onSubmit={guardar} className="rounded-xl bg-slate-50 p-3 space-y-3">
+          <h4 className="font-bold text-sm">
+            {editando === 'nuevo' ? 'Nuevo cargo' : `Editar “${borrador.nombre}”`}
+          </h4>
+          <Campo etiqueta="Nombre del cargo">
+            <input
+              className="campo"
+              value={borrador.nombre}
+              onChange={(e) => setBorrador({ ...borrador, nombre: e.target.value })}
+              placeholder="Gerente de Recursos Humanos"
+              minLength={3}
+              maxLength={60}
+              required
+            />
+          </Campo>
+
+          <div>
+            <p className="etiqueta">Formularios que trae</p>
+            <div className="space-y-1">
+              {disponibles.map((m) => (
+                <label key={m} className="flex items-center gap-3 min-h-[40px]">
+                  <input
+                    type="checkbox"
+                    className="h-5 w-5"
+                    checked={borrador.modulos_permitidos.includes(m)}
+                    onChange={() => alternar('modulos_permitidos', m)}
+                  />
+                  <span className="text-sm">
+                    {MODULOS[m] ? `${MODULOS[m].icono} ${MODULOS[m].etiqueta}` : m}
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {[['ver', 'Lo que puede VER'], ['hacer', 'Lo que puede HACER']].map(([grupo, titulo]) => (
+            <div key={grupo}>
+              <p className="etiqueta">{titulo}</p>
+              <div className="space-y-1">
+                {permisosDisp.filter((x) => x.grupo === grupo).map((x) => (
+                  <label key={x.clave} className="flex items-start gap-3 py-1">
+                    <input
+                      type="checkbox"
+                      className="h-5 w-5 mt-0.5 shrink-0"
+                      checked={borrador.permisos_especiales.includes(x.clave)}
+                      onChange={() => alternar('permisos_especiales', x.clave)}
+                    />
+                    <span className="min-w-0 text-sm">{x.etiqueta}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          ))}
+
+          <p className="text-xs text-slate-500">
+            Conceder permisos sigue siendo sólo tuyo: ningún cargo puede repartir
+            accesos ni tocar una cuenta de Master.
+          </p>
+          <button className="btn-primario w-full" disabled={guardando}>
+            {guardando ? 'Guardando…' : (editando === 'nuevo' ? 'Crear cargo' : 'Guardar cambios')}
+          </button>
+        </form>
+      )}
+    </div>
+  );
+}
+
 function VistaAccesos({ usuario, call, aviso }) {
   const puedeGestionar = puede(usuario, 'gestionar_empleados');
   const [usuarios, setUsuarios] = useState(null);
+  const [roles, setRoles] = useState([]);
   const [disponibles, setDisponibles] = useState(Object.keys(MODULOS));
   const [verEliminados, setVerEliminados] = useState(false);
   const [selId, setSelId] = useState('');
@@ -2433,6 +2634,7 @@ function VistaAccesos({ usuario, call, aviso }) {
     try {
       const data = await call(`/api/usuarios${qs({ eliminados: verEliminados ? 'true' : '' })}`);
       setUsuarios(data.usuarios);
+      setRoles(data.roles || []);
       setDisponibles(data.modulos_disponibles);
       setPermisosDisp(data.permisos_disponibles || []);
       setPuedeConceder(Boolean(data.puede_conceder));
@@ -2444,6 +2646,20 @@ function VistaAccesos({ usuario, call, aviso }) {
   useEffect(() => { cargar(); }, [cargar]);
 
   const sel = (usuarios || []).find((u) => String(u.id) === String(selId));
+
+  /* Los cargos vienen de la base. El Master los crea en el panel de abajo. */
+  const opcionesRol = roles.length
+    ? roles.filter((r) => r.activo !== false)
+      .map((r) => [r.clave, r.es_master ? `${r.nombre} (acceso total)` : r.nombre])
+    : [['motorizados', 'Motorizado'], ['tienda', 'Tienda'], ['admin', 'Master']];
+
+  /*
+   * Lo que la persona HEREDA de su cargo. Se muestra marcado y bloqueado:
+   * para cambiarlo hay que editar el rol, no la ficha de la persona. Lo
+   * que se marca aquí es lo EXTRA que tiene ella y nadie más.
+   */
+  const heredadosMod = sel && !sel.es_master && Array.isArray(sel.rol_modulos) ? sel.rol_modulos : [];
+  const heredadosEsp = sel && !sel.es_master && Array.isArray(sel.rol_permisos) ? sel.rol_permisos : [];
 
   const seleccionar = (id) => {
     setSelId(id);
@@ -2567,7 +2783,7 @@ function VistaAccesos({ usuario, call, aviso }) {
             <Select
               valor={nuevo.rol}
               onChange={(v) => setNuevo({ ...nuevo, rol: v })}
-              opciones={[['motorizados', 'Motorizado'], ['tienda', 'Tienda'], ['admin', 'Master']]}
+              opciones={opcionesRol}
             />
           </Campo>
           <Campo etiqueta="PIN inicial (4 a 8 dígitos)">
@@ -2592,7 +2808,7 @@ function VistaAccesos({ usuario, call, aviso }) {
             onChange={seleccionar}
             opciones={usuarios.map((u) => [
               String(u.id),
-              `${u.nombre_completo || u.nombre} (${ROL_ETIQUETA[u.rol] || u.rol})${u.estado === 'activo' ? '' : ` — ${ESTADO_USUARIO_ETIQUETA[u.estado]}`}`,
+              `${u.nombre_completo || u.nombre} (${nombreRol(u)})${u.estado === 'activo' ? '' : ` — ${ESTADO_USUARIO_ETIQUETA[u.estado]}`}`,
             ])}
             vacio="Seleccione…"
           />
@@ -2633,7 +2849,7 @@ function VistaAccesos({ usuario, call, aviso }) {
               <Select
                 valor={datos.rol}
                 onChange={(v) => setDatos({ ...datos, rol: v })}
-                opciones={[['motorizados', 'Motorizado'], ['tienda', 'Tienda'], ['admin', 'Master']]}
+                opciones={opcionesRol}
                 disabled={esYo}
               />
             </Campo>
@@ -2648,22 +2864,36 @@ function VistaAccesos({ usuario, call, aviso }) {
           </div>
 
           <div className="card space-y-3">
-            <h3 className="font-bold">Formularios que puede ver y llenar</h3>
-            <div className="space-y-1">
-              {disponibles.map((m) => (
-                <label key={m} className="flex items-center gap-3 min-h-[44px] border-b border-slate-100">
-                  <input
-                    type="checkbox"
-                    className="h-6 w-6"
-                    checked={marcados.includes(m)}
-                    disabled={!puedeConceder}
-                    onChange={() => alternar(m)}
-                  />
-                  <span>{MODULOS[m] ? `${MODULOS[m].icono} ${MODULOS[m].etiqueta}` : m}</span>
-                </label>
-              ))}
+            <div>
+              <h3 className="font-bold">Formularios que puede ver y llenar</h3>
+              {heredadosMod.length > 0 && (
+                <p className="text-xs text-slate-500">
+                  Los marcados como <b>del cargo</b> los hereda de {nombreRol(sel)} y se cambian
+                  editando ese cargo. Aquí marcas lo extra que tiene sólo esta persona.
+                </p>
+              )}
             </div>
-            {sel.rol === 'admin' && (
+            <div className="space-y-1">
+              {disponibles.map((m) => {
+                const delRol = heredadosMod.includes(m);
+                return (
+                  <label key={m} className="flex items-center gap-3 min-h-[44px] border-b border-slate-100">
+                    <input
+                      type="checkbox"
+                      className="h-6 w-6"
+                      checked={delRol || marcados.includes(m)}
+                      disabled={!puedeConceder || delRol}
+                      onChange={() => alternar(m)}
+                    />
+                    <span className="min-w-0 flex-1">
+                      {MODULOS[m] ? `${MODULOS[m].icono} ${MODULOS[m].etiqueta}` : m}
+                    </span>
+                    {delRol && <Chip tono="azul">del cargo</Chip>}
+                  </label>
+                );
+              })}
+            </div>
+            {sel.es_master && (
               <p className="text-xs text-slate-500">
                 El Master siempre tiene acceso completo; esto solo decide qué ve en su menú.
               </p>
@@ -2675,7 +2905,7 @@ function VistaAccesos({ usuario, call, aviso }) {
             )}
           </div>
 
-          {sel.rol === 'admin' ? (
+          {sel.es_master ? (
             <div className="card">
               <h3 className="font-bold mb-1">Funciones especiales</h3>
               <p className="text-sm text-slate-500">
@@ -2688,6 +2918,8 @@ function VistaAccesos({ usuario, call, aviso }) {
                 <h3 className="font-bold">Funciones especiales</h3>
                 <p className="text-xs text-slate-500">
                   Cosas que normalmente sólo hace el Master. Puedes concederlas una por una.
+                  {heredadosEsp.length > 0
+                    && ` Las marcadas como “del cargo” vienen de ${nombreRol(sel)}.`}
                 </p>
               </div>
 
@@ -2695,21 +2927,25 @@ function VistaAccesos({ usuario, call, aviso }) {
                 <div key={grupo}>
                   <p className="etiqueta">{titulo}</p>
                   <div className="space-y-1">
-                    {permisosDisp.filter((x) => x.grupo === grupo).map((x) => (
-                      <label key={x.clave} className="flex items-start gap-3 py-2 border-b border-slate-100">
-                        <input
-                          type="checkbox"
-                          className="h-6 w-6 mt-0.5 shrink-0"
-                          checked={especiales.includes(x.clave)}
-                          disabled={!puedeConceder}
-                          onChange={() => alternarEspecial(x.clave)}
-                        />
-                        <span className="min-w-0">
-                          <span className="font-medium">{x.etiqueta}</span>
-                          <span className="block text-xs text-slate-500">{x.detalle}</span>
-                        </span>
-                      </label>
-                    ))}
+                    {permisosDisp.filter((x) => x.grupo === grupo).map((x) => {
+                      const delRol = heredadosEsp.includes(x.clave);
+                      return (
+                        <label key={x.clave} className="flex items-start gap-3 py-2 border-b border-slate-100">
+                          <input
+                            type="checkbox"
+                            className="h-6 w-6 mt-0.5 shrink-0"
+                            checked={delRol || especiales.includes(x.clave)}
+                            disabled={!puedeConceder || delRol}
+                            onChange={() => alternarEspecial(x.clave)}
+                          />
+                          <span className="min-w-0 flex-1">
+                            <span className="font-medium">{x.etiqueta}</span>
+                            {delRol && <> <Chip tono="azul">del cargo</Chip></>}
+                            <span className="block text-xs text-slate-500">{x.detalle}</span>
+                          </span>
+                        </label>
+                      );
+                    })}
                   </div>
                 </div>
               ))}
@@ -2752,6 +2988,17 @@ function VistaAccesos({ usuario, call, aviso }) {
           </div>
         </>
       )}
+
+      {puedeConceder && (
+        <PanelRoles
+          roles={roles}
+          disponibles={disponibles}
+          permisosDisp={permisosDisp}
+          call={call}
+          aviso={aviso}
+          recargar={cargar}
+        />
+      )}
     </div>
   );
 }
@@ -2783,7 +3030,7 @@ function VistaPerfil({ usuario, call, aviso }) {
       <Titulo>Mi cuenta</Titulo>
       <div className="card">
         <p className="font-bold text-lg">{usuario.nombre_completo || usuario.nombre}</p>
-        <p className="text-slate-500">{ROL_ETIQUETA[usuario.rol] || usuario.rol}</p>
+        <p className="text-slate-500">{nombreRol(usuario)}</p>
         <p className="text-sm text-slate-400 mt-1">Usuario de ingreso: <b>{usuario.usuario}</b></p>
       </div>
       <form onSubmit={enviar} className="card space-y-3">
@@ -2901,7 +3148,7 @@ export default function PurissimaApp() {
             <span className="text-2xl">💧</span>
             <div className="leading-tight min-w-0">
               <p className="font-extrabold truncate">{usuario.nombre_completo || usuario.nombre}</p>
-              <p className="text-xs text-agua-100 truncate">{ROL_ETIQUETA[usuario.rol] || usuario.rol}</p>
+              <p className="text-xs text-agua-100 truncate">{nombreRol(usuario)}</p>
             </div>
           </div>
           <div className="flex items-center gap-1 shrink-0">
