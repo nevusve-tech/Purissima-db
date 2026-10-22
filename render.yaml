@@ -19,7 +19,8 @@ services:
     region: oregon
     rootDir: .
     # TEMPORAL: la última línea imprime el detalle de las vulnerabilidades del
-    # backend en el registro del build, para saber cuáles son. Se quita después.
+    # backend en el registro del build. Se mantiene para confirmar que la
+    # actualización de nodemailer las resolvió; después se quita.
     # El "|| true" evita que el informe tumbe el despliegue.
     buildCommand: >-
       npm --prefix frontend install --include=dev &&
