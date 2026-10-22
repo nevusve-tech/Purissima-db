@@ -12,7 +12,10 @@ services:
   - type: web
     name: purissima-cloud
     runtime: node
-    plan: starter
+    # Plan gratuito: el servicio se duerme tras ~15 min sin tráfico y el
+    # siguiente acceso tarda unos 40 s en despertar. Para quitar esa espera,
+    # cambiar a "starter" (pagado) aquí o desde el panel de Render.
+    plan: free
     region: oregon
     rootDir: .
     buildCommand: >-
