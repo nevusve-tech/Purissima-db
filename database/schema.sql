@@ -169,7 +169,26 @@ CREATE TABLE checklist_motos (
                                               OR jsonb_typeof(detalles_items) IN ('object', 'array')),
   tiene_falla              boolean     NOT NULL DEFAULT FALSE,
   observacion_falla        text,
-  foto_falla_url           text        CHECK (foto_falla_url IS NULL OR foto_falla_url ~* '^https?://'),
+  -- Las fotos NO viven aquí: viven en el almacén de archivos de Supabase
+  -- (bucket "fotos", privado) y aquí sólo se guarda su ruta. Se acepta
+  -- también un enlace http pegado a mano, como antes.
+  foto_falla_url           text        CHECK (
+                                         foto_falla_url IS NULL
+                                         OR foto_falla_url ~* '^https?://'
+                                         OR (foto_falla_url ~ '^[a-z0-9][a-z0-9/_.-]{3,250}$'
+                                             AND position('..' in foto_falla_url) = 0)),
+  -- Las tres del día: tablero (que se lea el km), frontal y contrapicado
+  -- trasero. Que sean obligatorias lo exige la aplicación, no la base,
+  -- para que los checklists viejos sigan siendo válidos.
+  foto_tablero             text        CHECK (foto_tablero IS NULL
+                                         OR (foto_tablero ~ '^[a-z0-9][a-z0-9/_.-]{3,250}$'
+                                             AND position('..' in foto_tablero) = 0)),
+  foto_frontal             text        CHECK (foto_frontal IS NULL
+                                         OR (foto_frontal ~ '^[a-z0-9][a-z0-9/_.-]{3,250}$'
+                                             AND position('..' in foto_frontal) = 0)),
+  foto_trasera             text        CHECK (foto_trasera IS NULL
+                                         OR (foto_trasera ~ '^[a-z0-9][a-z0-9/_.-]{3,250}$'
+                                             AND position('..' in foto_trasera) = 0)),
   CONSTRAINT ck_checklist_km_si_uso CHECK (NOT se_uso_hoy OR kilometraje_inicial IS NOT NULL),
   CONSTRAINT ck_checklist_obs_si_falla CHECK (
     NOT tiene_falla OR (observacion_falla IS NOT NULL AND length(trim(observacion_falla)) > 0)
@@ -242,7 +261,12 @@ CREATE TABLE entradas_mercancia (
   usuario_id        integer     NOT NULL REFERENCES usuarios (id),
   fecha_hora        timestamptz NOT NULL DEFAULT now(),
   items_recibidos   jsonb       NOT NULL CHECK (jsonb_typeof(items_recibidos) IN ('array', 'object')),
-  foto_factura_url  text        CHECK (foto_factura_url IS NULL OR foto_factura_url ~* '^https?://'),
+  -- Igual que las del checklist: ruta del almacén, o un enlace pegado
+  foto_factura_url  text        CHECK (
+                                  foto_factura_url IS NULL
+                                  OR foto_factura_url ~* '^https?://'
+                                  OR (foto_factura_url ~ '^[a-z0-9][a-z0-9/_.-]{3,250}$'
+                                      AND position('..' in foto_factura_url) = 0)),
   observaciones     text
 );
 CREATE INDEX ix_entradas_merc_fecha ON entradas_mercancia (fecha_hora);
@@ -395,6 +419,23 @@ BEGIN
     END;
   END LOOP;
 END $$;
+
+-- =====================================================================
+-- ALMACÉN DE FOTOS
+--
+-- Las fotos (facturas y checklist de motos) no caben en la base: una
+-- pesa mil veces más que una fila. Van al almacén de archivos de
+-- Supabase, que tiene su propio gigabyte, y en la base queda sólo la
+-- ruta.
+--
+-- Se crea PRIVADO: nadie abre una foto adivinando su dirección. El
+-- backend firma un enlace temporal cada vez que alguien autorizado
+-- necesita verla. El tope de 2 MB es un techo de seguridad: el teléfono
+-- comprime a unos 200 kB antes de subir.
+-- =====================================================================
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES ('fotos', 'fotos', false, 2097152, ARRAY['image/jpeg', 'image/webp', 'image/png'])
+ON CONFLICT (id) DO NOTHING;
 
 -- =====================================================================
 -- SEMILLA: un único usuario Master

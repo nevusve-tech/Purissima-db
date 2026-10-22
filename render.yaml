@@ -18,15 +18,10 @@ services:
     plan: free
     region: oregon
     rootDir: .
-    # TEMPORAL: la última línea imprime el detalle de las vulnerabilidades del
-    # backend en el registro del build. Se mantiene para confirmar que la
-    # actualización de nodemailer las resolvió; después se quita.
-    # El "|| true" evita que el informe tumbe el despliegue.
     buildCommand: >-
       npm --prefix frontend install --include=dev &&
       npm --prefix frontend run build &&
-      npm --prefix backend install --omit=dev &&
-      (npm --prefix backend audit --omit=dev || true)
+      npm --prefix backend install --omit=dev
     startCommand: npm --prefix backend start
     healthCheckPath: /api/salud
     envVars:
@@ -40,6 +35,15 @@ services:
         sync: false
       - key: JWT_SECRET
         generateValue: true
+      # Fotos (facturas y checklist de motos). Sin estas dos variables el
+      # sistema funciona igual, sólo que no acepta fotos y lo dice.
+      # Supabase -> Project Settings -> Data API -> Project URL
+      - key: SUPABASE_URL
+        sync: false
+      # Supabase -> Project Settings -> API Keys -> service_role (secreta).
+      # Se pega directamente aquí en Render; nunca debe viajar por el chat.
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
       - key: ADMIN_EMAIL
         sync: false
       - key: MAIL_FROM

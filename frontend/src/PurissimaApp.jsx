@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 /* ------------------------------------------------------------------ */
 /* Constantes (alineadas con el esquema real de la base de datos)      */
@@ -167,6 +167,207 @@ const qs = (obj) => {
 };
 
 /* ------------------------------------------------------------------ */
+/* Fotos                                                               */
+/*                                                                     */
+/* La foto se comprime EN EL TELÉFONO antes de subirla. Una foto de     */
+/* cámara moderna pesa entre 3 y 8 MB; reducida a 1600 px de lado largo */
+/* queda en unos 200 kB, que es más que suficiente para ver un daño en  */
+/* la lata o leer una factura, y sube rápido con señal móvil.           */
+/* ------------------------------------------------------------------ */
+const FOTO_LADO_MAX = 1600;
+const FOTO_PESO_OBJETIVO = 220 * 1024;
+/* Se baja la calidad por pasos hasta que la foto entre en el objetivo */
+const FOTO_CALIDADES = [0.82, 0.7, 0.6, 0.5, 0.4];
+
+/**
+ * Lee el archivo como imagen. Se pide la orientación "from-image" para
+ * que una foto tomada de lado no salga acostada: el teléfono guarda ese
+ * dato aparte, en los metadatos, y hay que pedirlo explícitamente.
+ */
+async function leerImagen(archivo) {
+  if (typeof createImageBitmap === 'function') {
+    try {
+      return await createImageBitmap(archivo, { imageOrientation: 'from-image' });
+    } catch {
+      try {
+        return await createImageBitmap(archivo);
+      } catch {
+        /* algunos navegadores viejos no lo soportan: se usa el respaldo */
+      }
+    }
+  }
+  const url = URL.createObjectURL(archivo);
+  try {
+    return await new Promise((listo, falla) => {
+      const img = new Image();
+      img.onload = () => listo(img);
+      img.onerror = () => falla(new Error('No se pudo leer la foto'));
+      img.src = url;
+    });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function comprimirFoto(archivo) {
+  if (!/^image\//.test(archivo.type || '')) throw new Error('Ese archivo no es una foto');
+  const img = await leerImagen(archivo);
+  const anchoOrig = img.width;
+  const altoOrig = img.height;
+  if (!anchoOrig || !altoOrig) throw new Error('No se pudo leer la foto');
+
+  const escala = Math.min(1, FOTO_LADO_MAX / Math.max(anchoOrig, altoOrig));
+  const ancho = Math.max(1, Math.round(anchoOrig * escala));
+  const alto = Math.max(1, Math.round(altoOrig * escala));
+
+  const lienzo = document.createElement('canvas');
+  lienzo.width = ancho;
+  lienzo.height = alto;
+  const ctx = lienzo.getContext('2d');
+  if (!ctx) throw new Error('El teléfono no pudo procesar la foto');
+  ctx.drawImage(img, 0, 0, ancho, alto);
+  if (typeof img.close === 'function') img.close();
+
+  let blob = null;
+  for (const calidad of FOTO_CALIDADES) {
+    // eslint-disable-next-line no-await-in-loop
+    blob = await new Promise((listo) => lienzo.toBlob(listo, 'image/jpeg', calidad));
+    if (!blob) throw new Error('El teléfono no pudo procesar la foto');
+    if (blob.size <= FOTO_PESO_OBJETIVO) break;
+  }
+  return blob;
+}
+
+const pesoLegible = (bytes) => (bytes >= 1024 * 1024
+  ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  : `${Math.max(1, Math.round(bytes / 1024))} kB`);
+
+/**
+ * Botón de cámara. Al tocarlo abre la cámara trasera del teléfono,
+ * comprime lo que salga y lo sube; se queda con la ruta que devuelve el
+ * servidor, que es lo que después viaja con el formulario.
+ */
+function CapturaFoto({ etiqueta, ayuda, destino, valor, onCambio, subirFoto, aviso, requerido = false }) {
+  const [ocupado, setOcupado] = useState('');
+  const [vista, setVista] = useState('');
+  const [peso, setPeso] = useState(0);
+  const refInput = useRef(null);
+
+  // Libera la miniatura al desmontar para no dejar memoria colgando
+  useEffect(() => () => { if (vista) URL.revokeObjectURL(vista); }, [vista]);
+
+  const elegir = async (e) => {
+    const archivo = e.target.files && e.target.files[0];
+    e.target.value = ''; // permite volver a elegir el mismo archivo
+    if (!archivo) return;
+    try {
+      setOcupado('Preparando la foto…');
+      const blob = await comprimirFoto(archivo);
+      setOcupado('Subiendo…');
+      const ruta = await subirFoto(destino, blob);
+      setVista((previa) => {
+        if (previa) URL.revokeObjectURL(previa);
+        return URL.createObjectURL(blob);
+      });
+      setPeso(blob.size);
+      onCambio(ruta);
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setOcupado('');
+    }
+  };
+
+  const quitar = () => {
+    setVista((previa) => { if (previa) URL.revokeObjectURL(previa); return ''; });
+    setPeso(0);
+    onCambio('');
+  };
+
+  return (
+    <div className="rounded-xl border border-slate-200 p-3 space-y-2">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="font-medium text-sm">
+            {etiqueta}
+            {requerido && !valor && <span className="text-red-600"> *</span>}
+          </p>
+          {ayuda && <p className="text-xs text-slate-500">{ayuda}</p>}
+        </div>
+        {valor ? <Chip tono="verde">Lista</Chip> : requerido && <Chip tono="ambar">Falta</Chip>}
+      </div>
+
+      {vista && (
+        <img
+          src={vista}
+          alt={etiqueta}
+          className="w-full max-h-56 object-contain rounded-lg bg-slate-50"
+        />
+      )}
+
+      <input
+        ref={refInput}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="hidden"
+        onChange={elegir}
+      />
+      <div className="flex gap-2">
+        <button
+          type="button"
+          className="btn-sec flex-1"
+          disabled={Boolean(ocupado)}
+          onClick={() => refInput.current && refInput.current.click()}
+        >
+          {ocupado || (valor ? 'Tomar de nuevo' : '📷 Tomar foto')}
+        </button>
+        {valor && !ocupado && (
+          <button type="button" className="btn-sec !px-3" onClick={quitar} aria-label="Quitar la foto">
+            Quitar
+          </button>
+        )}
+      </div>
+      {peso > 0 && <p className="text-xs text-slate-400">Subida: {pesoLegible(peso)}</p>}
+    </div>
+  );
+}
+
+/** Miniatura de una foto ya guardada: pide el enlace firmado al abrirla. */
+function FotoGuardada({ ruta, etiqueta, verFoto, aviso }) {
+  const [url, setUrl] = useState('');
+  const [cargando, setCargando] = useState(false);
+
+  const abrir = async () => {
+    if (url) return;
+    setCargando(true);
+    try {
+      setUrl(await verFoto(ruta));
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setCargando(false);
+    }
+  };
+
+  if (!ruta) return null;
+  return (
+    <div className="space-y-1">
+      <p className="text-xs text-slate-500">{etiqueta}</p>
+      {url ? (
+        <a href={url} target="_blank" rel="noreferrer">
+          <img src={url} alt={etiqueta} className="w-full max-h-48 object-contain rounded-lg bg-slate-50" />
+        </a>
+      ) : (
+        <button type="button" className="btn-sec w-full !py-2 !min-h-[40px] !text-sm" disabled={cargando} onClick={abrir}>
+          {cargando ? 'Abriendo…' : 'Ver foto'}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Componentes base                                                    */
 /* ------------------------------------------------------------------ */
 function NumInput({ value, onChange, ...rest }) {
@@ -333,7 +534,7 @@ function Login({ onLogin }) {
 /* ------------------------------------------------------------------ */
 /* Motos                                                               */
 /* ------------------------------------------------------------------ */
-function FormChecklist({ moto, call, aviso, onListo, onCancelar }) {
+function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
   const lista = CHECKLISTS[moto.tipo_modelo] || [];
   const [seUso, setSeUso] = useState(true);
   const [km, setKm] = useState(String(moto.ultimo_kilometraje));
@@ -342,13 +543,32 @@ function FormChecklist({ moto, call, aviso, onListo, onCancelar }) {
   const [tieneFalla, setTieneFalla] = useState(false);
   const [obs, setObs] = useState('');
   const [enviando, setEnviando] = useState(false);
+  /* Las tres del día, más la de la falla cuando hay una */
+  const [fotos, setFotos] = useState({ tablero: '', frontal: '', trasera: '', falla: '' });
+  const [fotosExigidas, setFotosExigidas] = useState(false);
+
+  // Si el almacén de fotos no está configurado todavía, no se exigen:
+  // más vale un checklist sin foto que un motorizado que no puede registrar.
+  useEffect(() => {
+    let vivo = true;
+    call('/api/motos/config')
+      .then((d) => { if (vivo) setFotosExigidas(Boolean(d.fotos_habilitadas)); })
+      .catch(() => { /* si falla, se quedan opcionales */ });
+    return () => { vivo = false; };
+  }, [call]);
 
   const hayItemMalo = Object.values(items).some((v) => !v);
   const falla = tieneFalla || (seUso && hayItemMalo);
+  const ponerFoto = (clave) => (ruta) => setFotos((p) => ({ ...p, [clave]: ruta }));
+  const faltanFotos = fotosExigidas
+    && ['tablero', 'frontal', 'trasera'].filter((k) => !fotos[k]);
 
   const enviar = async (e) => {
     e.preventDefault();
     if (falla && !obs.trim()) return aviso('Describa la falla en la observación', 'error');
+    if (faltanFotos && faltanFotos.length) {
+      return aviso(`Faltan ${faltanFotos.length} foto(s) por tomar`, 'error');
+    }
     setEnviando(true);
     try {
       await call(`/api/motos/${moto.id}/checklist`, {
@@ -360,6 +580,10 @@ function FormChecklist({ moto, call, aviso, onListo, onCancelar }) {
           cambio_aceite_realizado: cambioAceite,
           tiene_falla: falla,
           observacion_falla: falla ? obs.trim() : undefined,
+          foto_tablero: fotos.tablero || undefined,
+          foto_frontal: fotos.frontal || undefined,
+          foto_trasera: fotos.trasera || undefined,
+          foto_falla_url: falla && fotos.falla ? fotos.falla : undefined,
         },
       });
       aviso('Checklist guardado', 'ok');
@@ -432,6 +656,58 @@ function FormChecklist({ moto, call, aviso, onListo, onCancelar }) {
         </Campo>
       )}
 
+      <div className="space-y-2">
+        <div>
+          <p className="etiqueta">
+            Fotos del día{fotosExigidas ? ' (obligatorias)' : ' (opcionales por ahora)'}
+          </p>
+          <p className="text-xs text-slate-500">
+            Se reducen en el teléfono antes de subir, así que pesan poco y suben rápido.
+          </p>
+        </div>
+        <CapturaFoto
+          etiqueta="Tablero"
+          ayuda="Que se lea el kilometraje"
+          destino="tablero"
+          valor={fotos.tablero}
+          onCambio={ponerFoto('tablero')}
+          subirFoto={subirFoto}
+          aviso={aviso}
+          requerido={fotosExigidas}
+        />
+        <CapturaFoto
+          etiqueta="Frontal"
+          ayuda="La moto de frente, completa"
+          destino="frontal"
+          valor={fotos.frontal}
+          onCambio={ponerFoto('frontal')}
+          subirFoto={subirFoto}
+          aviso={aviso}
+          requerido={fotosExigidas}
+        />
+        <CapturaFoto
+          etiqueta="Trasera en contrapicado"
+          ayuda="Desde abajo hacia arriba, por detrás"
+          destino="trasera"
+          valor={fotos.trasera}
+          onCambio={ponerFoto('trasera')}
+          subirFoto={subirFoto}
+          aviso={aviso}
+          requerido={fotosExigidas}
+        />
+        {falla && (
+          <CapturaFoto
+            etiqueta="Foto de la falla (opcional)"
+            ayuda="Si se puede fotografiar, ayuda a resolverla más rápido"
+            destino="falla"
+            valor={fotos.falla}
+            onCambio={ponerFoto('falla')}
+            subirFoto={subirFoto}
+            aviso={aviso}
+          />
+        )}
+      </div>
+
       <button className="btn-primario w-full" disabled={enviando}>{enviando ? 'Guardando…' : 'Guardar checklist'}</button>
     </form>
   );
@@ -483,7 +759,7 @@ function FormMoto({ call, aviso, onListo }) {
   );
 }
 
-function VistaMotos({ usuario, call, aviso }) {
+function VistaMotos({ usuario, call, aviso, subirFoto }) {
   const [motos, setMotos] = useState(null);
   const [seleccion, setSeleccion] = useState(null);
   const [mostrarForm, setMostrarForm] = useState(false);
@@ -506,6 +782,7 @@ function VistaMotos({ usuario, call, aviso }) {
         moto={seleccion}
         call={call}
         aviso={aviso}
+        subirFoto={subirFoto}
         onCancelar={() => setSeleccion(null)}
         onListo={() => { setSeleccion(null); cargar(); }}
       />
@@ -711,7 +988,7 @@ function VistaCaja({ usuario, call, aviso }) {
 /* ------------------------------------------------------------------ */
 /* Recepción                                                           */
 /* ------------------------------------------------------------------ */
-function VistaRecepcion({ usuario, call, aviso }) {
+function VistaRecepcion({ usuario, call, aviso, subirFoto, verFoto }) {
   const [tab, setTab] = useState('agua');
   const [datos, setDatos] = useState(null);
 
@@ -745,6 +1022,7 @@ function VistaRecepcion({ usuario, call, aviso }) {
   if (!datos) return <Cargando />;
   const props = {
     call, aviso, datos, onListo: cargar, puedeCatalogo, puedeAnular, puedeEliminar,
+    subirFoto, verFoto,
   };
 
   return (
@@ -890,10 +1168,13 @@ function EntradaAgua({ call, aviso, datos, onListo, puedeCatalogo, puedeAnular }
   );
 }
 
-function EntradaMercancia({ call, aviso, datos, onListo, puedeCatalogo, puedeAnular }) {
+function EntradaMercancia({
+  call, aviso, datos, onListo, puedeCatalogo, puedeAnular, subirFoto, verFoto,
+}) {
   const [proveedor, setProveedor] = useState('');
   const [obs, setObs] = useState('');
   const [filas, setFilas] = useState([{ producto_id: '', cantidad: '' }]);
+  const [factura, setFactura] = useState('');
   const [enviando, setEnviando] = useState(false);
 
   const setFila = (i, k, v) => setFilas((p) => p.map((f, idx) => (idx === i ? { ...f, [k]: v } : f)));
@@ -910,11 +1191,13 @@ function EntradaMercancia({ call, aviso, datos, onListo, puedeCatalogo, puedeAnu
           items: filas.map((f) => ({
             producto_id: Number(f.producto_id), cantidad: Number(f.cantidad),
           })),
+          foto_factura_url: factura || undefined,
         },
       });
       aviso('Mercancía recibida y stock actualizado', 'ok');
       setFilas([{ producto_id: '', cantidad: '' }]);
       setObs('');
+      setFactura('');
       onListo();
     } catch (err) {
       aviso(err.message, 'error');
@@ -975,6 +1258,15 @@ function EntradaMercancia({ call, aviso, datos, onListo, puedeCatalogo, puedeAnu
           + Agregar ítem
         </button>
         {!puedeCatalogo && <AgregarProductoRapido call={call} aviso={aviso} onListo={onListo} />}
+        <CapturaFoto
+          etiqueta="Foto de la factura (opcional)"
+          ayuda="Que se lean los montos y la fecha"
+          destino="factura"
+          valor={factura}
+          onCambio={setFactura}
+          subirFoto={subirFoto}
+          aviso={aviso}
+        />
         <Campo etiqueta="Observaciones (opcional)">
           <textarea className="campo" rows={2} maxLength={500} value={obs} onChange={(e) => setObs(e.target.value)} />
         </Campo>
@@ -989,6 +1281,11 @@ function EntradaMercancia({ call, aviso, datos, onListo, puedeCatalogo, puedeAnu
               <li key={i}>{it.nombre || `Producto #${it.producto_id}`}: {nf.format(it.cantidad)}</li>
             ))}
           </ul>
+          {e.foto_factura_url && (
+            <div className="mt-2">
+              <FotoGuardada ruta={e.foto_factura_url} etiqueta="Factura" verFoto={verFoto} aviso={aviso} />
+            </div>
+          )}
           {puedeAnular && (
             <div className="mt-2 flex justify-end">
               <BotonAnular recurso="entrada-mercancia" id={e.id} anulado={e.anulado} call={call} aviso={aviso} onListo={onListo} etiqueta="esta entrada de mercancía" />
@@ -2070,7 +2367,7 @@ function EditarMoto({ moto, call, aviso, onListo }) {
   );
 }
 
-function DetalleMoto({ detalle, onVolver, call, aviso, onRecargar }) {
+function DetalleMoto({ detalle, onVolver, call, aviso, verFoto, onRecargar }) {
   const { moto, checklists, incidencias, cambios_aceite: cambios } = detalle;
   const [tab, setTab] = useState('checklists');
 
@@ -2128,6 +2425,16 @@ function DetalleMoto({ detalle, onVolver, call, aviso, onRecargar }) {
               </p>
             )}
             {c.observacion_falla && <p className="text-slate-700">{c.observacion_falla}</p>}
+            {(c.foto_tablero || c.foto_frontal || c.foto_trasera || c.foto_falla_url) && (
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                <FotoGuardada ruta={c.foto_tablero} etiqueta="Tablero" verFoto={verFoto} aviso={aviso} />
+                <FotoGuardada ruta={c.foto_frontal} etiqueta="Frontal" verFoto={verFoto} aviso={aviso} />
+                <FotoGuardada ruta={c.foto_trasera} etiqueta="Trasera" verFoto={verFoto} aviso={aviso} />
+                {c.foto_falla_url && !/^https?:\/\//i.test(c.foto_falla_url) && (
+                  <FotoGuardada ruta={c.foto_falla_url} etiqueta="La falla" verFoto={verFoto} aviso={aviso} />
+                )}
+              </div>
+            )}
             <SelloAnulado registro={c} />
             <div className="flex justify-end pt-1">
               <BotonAnular
@@ -2173,7 +2480,7 @@ function DetalleMoto({ detalle, onVolver, call, aviso, onRecargar }) {
   );
 }
 
-function VistaReporteMotos({ call, aviso }) {
+function VistaReporteMotos({ call, aviso, verFoto }) {
   const [datos, setDatos] = useState(null);
   const [detalle, setDetalle] = useState(null);
   const [abriendo, setAbriendo] = useState(false);
@@ -2218,6 +2525,7 @@ function VistaReporteMotos({ call, aviso }) {
         onVolver={() => { setDetalle(null); cargar(); }}
         call={call}
         aviso={aviso}
+        verFoto={verFoto}
         onRecargar={recargarDetalle}
       />
     );
@@ -3093,6 +3401,42 @@ export default function PurissimaApp() {
     [token, cerrarSesion, aviso],
   );
 
+  /*
+   * Las fotos no pasan por apiFetch: viajan como imagen cruda y no como
+   * JSON, para no cargar con el 33 % que agregaría codificarlas en texto.
+   * Reciben el blob ya comprimido por comprimirFoto.
+   */
+  const subirFoto = useCallback(async (destino, blob) => {
+    const ctrl = new AbortController();
+    const reloj = setTimeout(() => ctrl.abort(), 60000); // subir tarda más que una consulta
+    try {
+      const res = await fetch(`${API_BASE}/api/fotos/${destino}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'image/jpeg', Authorization: `Bearer ${token}` },
+        body: blob,
+        signal: ctrl.signal,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (res.status === 401) { aviso('Su sesión venció. Ingrese nuevamente.', 'error'); cerrarSesion(); }
+        throw new Error(data.error || `Error ${res.status}`);
+      }
+      return data.ruta;
+    } catch (err) {
+      if (err.name === 'AbortError') throw new Error('La foto tardó demasiado en subir. Revise su señal e intente de nuevo.');
+      if (err instanceof TypeError) throw new Error('Sin conexión con el servidor.');
+      throw err;
+    } finally {
+      clearTimeout(reloj);
+    }
+  }, [token, cerrarSesion, aviso]);
+
+  /* Pide el enlace temporal para ver una foto ya guardada */
+  const verFoto = useCallback(
+    async (ruta) => (await call(`/api/fotos/firma${qs({ ruta })}`)).url,
+    [call],
+  );
+
   // Relee los permisos al abrir o recargar: el Master pudo haberlos cambiado
   useEffect(() => {
     if (!token) return undefined;
@@ -3138,7 +3482,7 @@ export default function PurissimaApp() {
   }
 
   const { usuario } = sesion;
-  const props = { usuario, call, aviso };
+  const props = { usuario, call, aviso, subirFoto, verFoto };
 
   return (
     <div className="min-h-screen flex flex-col">

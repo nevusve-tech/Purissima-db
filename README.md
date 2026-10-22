@@ -26,6 +26,7 @@ Al terminar queda un único usuario: se entra con `Master` y PIN `123456`. **Cam
 | `migracion_004_tanda3.sql` | subcategorías de mercancía y costos operativos del cierre en dólares |
 | `migracion_005_permisos.sql` | funciones especiales por empleado (`permisos_especiales`) |
 | `migracion_006_roles.sql` | tabla `roles`: los cargos los crea el Master y cada uno guarda sus permisos |
+| `migracion_007_fotos.sql` | almacén privado de fotos, las tres del checklist de motos y la de la factura |
 
 ## Paso 2: arranque local
 
@@ -44,6 +45,7 @@ Con `npm run build` en `frontend/`, el backend sirve `frontend/dist` y todo qued
 2. Render → **New → Blueprint** y seleccionar el repo (usa `render.yaml`).
 3. Definir `DATABASE_URL` con la cadena de Supabase (se recomienda el *Connection pooler*, puerto 6543). `JWT_SECRET` se genera solo.
 4. Opcional, para correos: `ADMIN_EMAIL` y `SMTP_*`, o `RESEND_API_KEY`.
+5. Para las fotos: `SUPABASE_URL` (Project Settings → Data API → Project URL) y `SUPABASE_SERVICE_KEY` (Project Settings → API Keys → `service_role`, **secreta**). Sin estas dos el sistema funciona igual, sólo que no acepta fotos y lo dice; las tres del checklist dejan de ser obligatorias para no bloquear al motorizado.
 
 El build compila el frontend e instala el backend en los servidores de Render.
 
@@ -78,4 +80,6 @@ Las claves primarias son UUID en las tablas de movimiento (checklist, caja, entr
 - **Cuentas**: el Master puede editar los datos de un empleado, pausarlo (sin acceso temporal) o quitarle el acceso de forma permanente. En ningún caso se borra su historial de gestión.
 - **Anulación** (solo Master): un registro mal hecho no se borra. Se marca como anulado con quién, cuándo y por qué; deja de contar en los totales y libera el día o la fecha para rehacerlo. Aplica a checklists, cierres de caja, entradas de agua y mercancía, solicitudes e incidencias. Si al anular un checklist el kilometraje quedó mal, se corrige en la ficha de la moto, dentro del reporte de motos.
 - **Solicitudes separadas**: "del negocio" (insumos generales, mantenimiento, permisos) y "de productos" (mercancía, agua), cada una con su propio permiso. Las de mercancía se arman eligiendo productos del catálogo e indicando cuántos bultos; las de agua piden litraje y proveedor. En ambas se puede dar de alta un producto o un proveedor sin salir de la pantalla.
+- **Fotos**: no viven en la base (una pesa mil veces más que una fila), sino en el almacén de archivos de Supabase, en el bucket `fotos`, que es **privado**. En la base queda sólo la ruta. El teléfono comprime antes de subir: 1600 px de lado largo y la calidad baja por pasos hasta que la imagen entra en unos 200 kB, así que una foto de 6 MB llega como 200 kB y sube rápido con señal móvil. Se pide la orientación `from-image` para que una foto tomada de lado no salga acostada. El cuerpo viaja como imagen cruda y no como JSON, para no cargar con el 33 % que agregaría codificarla en texto; `express.json` sólo mira las peticiones `application/json`, así que el límite de 50 kb del resto de la API queda intacto y las fotos tienen el suyo de 2 MB. El tipo real se deduce de los primeros bytes y no de la cabecera del navegador, de modo que nadie sube un archivo cualquiera diciendo que es una imagen. Para ver una foto hay que pedirle al backend un enlace firmado que caduca en una hora: no se puede abrir adivinando la dirección. Las rutas se acotan tanto en el backend como con un CHECK en la base, que rechaza mayúsculas, rutas absolutas y cualquier `..`.
+- **Checklist con fotos obligatorias**: tablero (que se lea el kilometraje), frontal y contrapicado trasero. Se exigen sólo cuando el almacén está configurado; si faltan las variables de entorno, el checklist se guarda sin fotos y lo advierte, porque es peor dejar al motorizado sin poder registrar. Los checklists anteriores a esto siguen siendo válidos sin fotos.
 - **API pública cerrada**: Supabase expone el esquema `public` por REST con las llaves `anon` y `authenticated`. El esquema activa RLS sin políticas y revoca privilegios a esos roles, así que la única vía de entrada es el backend (que conecta con el rol `postgres` y omite RLS). Sin esto, cualquiera con la llave pública podría leer la caja y los usuarios.

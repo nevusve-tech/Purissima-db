@@ -168,6 +168,9 @@ const COLUMNAS_REQUERIDAS = [
   ['usuarios', 'permisos_especiales'],
   ['roles', 'clave'],
   ['roles', 'es_master'],
+  ['checklist_motos', 'foto_tablero'],
+  ['checklist_motos', 'foto_frontal'],
+  ['checklist_motos', 'foto_trasera'],
   ['solicitudes', 'titulo'],
   ['solicitudes', 'descripcion'],
   ['solicitudes', 'notas_admin'],
@@ -1041,10 +1044,203 @@ app.delete('/api/roles/:clave', autenticar, soloAdmin, asyncH(async (req, res) =
 }));
 
 /* ------------------------------------------------------------------ */
+/* Fotos                                                               */
+/*                                                                     */
+/* Las fotos NO viven en la base de datos: una pesa mil veces más que  */
+/* una fila. Viven en el almacén de archivos de Supabase, que es        */
+/* PRIVADO, y en la base sólo se guarda su ruta.                        */
+/*                                                                     */
+/* El teléfono las comprime antes de subir, así que lo que llega aquí   */
+/* ronda los 200 kB. El tope de 2 MB es un techo de seguridad.          */
+/*                                                                     */
+/* Nadie puede abrir una foto adivinando su dirección: para verla hay   */
+/* que pedirle al backend un enlace firmado, que caduca en una hora.    */
+/* ------------------------------------------------------------------ */
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const BUCKET_FOTOS = 'fotos';
+const FOTOS_HABILITADAS = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
+const FOTO_MAX_BYTES = 2 * 1024 * 1024;
+const FOTO_FIRMA_SEG = 3600;
+const TIPOS_FOTO = Object.freeze(['image/jpeg', 'image/webp', 'image/png']);
+
+/* Qué se puede fotografiar, en qué carpeta cae y qué módulo hace falta */
+const DESTINOS_FOTO = Object.freeze({
+  tablero: { carpeta: 'motos', modulo: 'motos' },
+  frontal: { carpeta: 'motos', modulo: 'motos' },
+  trasera: { carpeta: 'motos', modulo: 'motos' },
+  falla: { carpeta: 'motos', modulo: 'motos' },
+  factura: { carpeta: 'facturas', modulo: 'recepcion' },
+});
+/* Para mirar una foto basta tener el módulo de donde salió */
+const MODULO_POR_CARPETA = Object.freeze({ motos: 'motos', facturas: 'recepcion' });
+
+const RUTA_FOTO = /^[a-z0-9][a-z0-9/_.-]{3,250}$/;
+
+/**
+ * Valida una ruta del almacén. El patrón por sí solo aceptaría "..", que
+ * serviría para salirse de la carpeta, así que se prohíbe aparte.
+ */
+function validarRutaFoto(valor, etiqueta = 'Ruta de la foto') {
+  const r = texto(valor, etiqueta, { requerido: true, max: 260 });
+  if (!RUTA_FOTO.test(r) || r.includes('..')) throw bad(`${etiqueta} no es válida`);
+  return r;
+}
+
+/** Acepta las dos formas: un enlace pegado a mano o una ruta del almacén. */
+function validarFotoOEnlace(valor, etiqueta) {
+  const v = texto(valor, etiqueta, { max: 500 });
+  if (!v) return null;
+  if (/^https?:\/\//i.test(v)) return v;
+  return validarRutaFoto(v, etiqueta);
+}
+
+/**
+ * El tipo real se deduce de los primeros bytes y no de la cabecera que
+ * manda el navegador: así nadie sube un archivo cualquiera diciendo que
+ * es una imagen.
+ */
+function tipoImagenReal(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf[0] === 0x89 && buf.toString('latin1', 1, 4) === 'PNG') return 'image/png';
+  if (buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP') return 'image/webp';
+  return null;
+}
+
+const extensionDe = (tipo) => ({ 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' }[tipo] || 'jpg');
+
+function exigirFotosHabilitadas() {
+  if (!FOTOS_HABILITADAS) {
+    throw new HttpError(503, 'Las fotos no están configuradas todavía. Avise al Master.');
+  }
+}
+
+async function subirFoto(ruta, bytes, tipo) {
+  exigirFotosHabilitadas();
+  let res;
+  try {
+    res = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET_FOTOS}/${ruta}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+        'Content-Type': tipo,
+        'Cache-Control': 'max-age=31536000',
+      },
+      body: bytes,
+      signal: AbortSignal.timeout(25000),
+    });
+  } catch (err) {
+    console.error('[fotos] No se pudo contactar el almacén:', err.message);
+    throw new HttpError(502, 'No se pudo guardar la foto. Intente de nuevo.');
+  }
+  if (!res.ok) {
+    // El detalle queda en el registro del servidor, no se le manda al cliente
+    const detalle = await res.text().catch(() => '');
+    console.error(`[fotos] El almacén rechazó la subida (${res.status}):`, detalle.slice(0, 300));
+    throw new HttpError(502, 'El almacén rechazó la foto. Intente de nuevo.');
+  }
+}
+
+async function firmarFoto(ruta) {
+  exigirFotosHabilitadas();
+  let res;
+  try {
+    res = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/${BUCKET_FOTOS}/${ruta}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ expiresIn: FOTO_FIRMA_SEG }),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (err) {
+    console.error('[fotos] No se pudo contactar el almacén para firmar:', err.message);
+    throw new HttpError(502, 'No se pudo abrir la foto. Intente de nuevo.');
+  }
+  if (!res.ok) {
+    if (res.status === 404) throw new HttpError(404, 'Esa foto ya no está en el almacén');
+    const detalle = await res.text().catch(() => '');
+    console.error(`[fotos] Firma rechazada (${res.status}):`, detalle.slice(0, 300));
+    throw new HttpError(502, 'No se pudo abrir la foto. Intente de nuevo.');
+  }
+  const d = await res.json().catch(() => ({}));
+  // Según la versión, el campo viene como signedURL o signedUrl
+  const relativa = d.signedURL || d.signedUrl;
+  if (!relativa) {
+    console.error('[fotos] El almacén no devolvió enlace firmado:', JSON.stringify(d).slice(0, 200));
+    throw new HttpError(502, 'No se pudo abrir la foto. Intente de nuevo.');
+  }
+  return `${SUPABASE_URL}/storage/v1${relativa.startsWith('/') ? '' : '/'}${relativa}`;
+}
+
+app.get('/api/fotos/config', autenticar, (req, res) => {
+  res.json({
+    habilitadas: FOTOS_HABILITADAS,
+    max_bytes: FOTO_MAX_BYTES,
+    tipos: TIPOS_FOTO,
+    destinos: Object.keys(DESTINOS_FOTO),
+  });
+});
+
+/**
+ * Sube una foto y devuelve su ruta, que es lo que después se guarda con
+ * el checklist o la entrada de mercancía.
+ *
+ * El cuerpo llega como imagen cruda, no como JSON: así se evita el 33 %
+ * que agregaría codificarla en texto. El límite de 50 kb del resto de la
+ * API no se toca, porque express.json sólo mira las peticiones de tipo
+ * application/json y deja pasar las imágenes intactas.
+ */
+app.post(
+  '/api/fotos/:destino',
+  autenticar,
+  express.raw({ type: TIPOS_FOTO, limit: FOTO_MAX_BYTES }),
+  asyncH(async (req, res) => {
+    exigirFotosHabilitadas();
+    const destino = unoDe(req.params.destino, Object.keys(DESTINOS_FOTO), 'Destino');
+    const { carpeta, modulo } = DESTINOS_FOTO[destino];
+    if (!tieneModulo(req.usuario, modulo)) {
+      throw new HttpError(403, `No tiene acceso al módulo "${modulo}"`);
+    }
+
+    const bytes = req.body;
+    if (!Buffer.isBuffer(bytes) || !bytes.length) {
+      throw bad('No llegó ninguna imagen. Vuelva a tomar la foto.');
+    }
+    const tipo = tipoImagenReal(bytes);
+    if (!tipo) throw bad('El archivo no es una imagen válida');
+
+    const ruta = `${carpeta}/${hoyCaracas()}/${destino}-${crypto.randomBytes(8).toString('hex')}.${extensionDe(tipo)}`;
+    await subirFoto(ruta, bytes, tipo);
+    console.log(`[fotos] ${req.usuario.usuario} subió ${ruta} (${bytes.length} bytes)`);
+    res.status(201).json({ ruta, bytes: bytes.length });
+  }),
+);
+
+/**
+ * Devuelve un enlace temporal para ver una foto. Se pide con el token en
+ * la cabecera, como todo lo demás; el enlace firmado que sale de aquí es
+ * el que se le pone a la imagen.
+ */
+app.get('/api/fotos/firma', autenticar, asyncH(async (req, res) => {
+  const ruta = validarRutaFoto(req.query.ruta);
+  const carpeta = ruta.split('/')[0];
+  const modulo = MODULO_POR_CARPETA[carpeta];
+  if (!modulo) throw bad('Ruta de foto no reconocida');
+  if (!tieneModulo(req.usuario, modulo) && !tienePermiso(req.usuario, 'ver_de_todos')) {
+    throw new HttpError(403, 'No tiene acceso a esa foto');
+  }
+  res.set('Cache-Control', 'no-store');
+  res.json({ url: await firmarFoto(ruta), vence_en: FOTO_FIRMA_SEG });
+}));
+
+/* ------------------------------------------------------------------ */
 /* Motos                                                               */
 /* ------------------------------------------------------------------ */
 app.get('/api/motos/config', autenticar, requiereModulo('motos'), (req, res) => {
-  res.json({ checklists: CHECKLISTS });
+  res.json({ checklists: CHECKLISTS, fotos_habilitadas: FOTOS_HABILITADAS });
 });
 
 app.get('/api/motos', autenticar, requiereModulo('motos'), asyncH(async (req, res) => {
@@ -1194,16 +1390,36 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
     if (tieneFalla && !obs) throw bad('Debe describir la falla en la observación');
 
     const cambioAceite = Boolean(b.cambio_aceite_realizado);
-    const foto = texto(b.foto_falla_url, 'URL de la foto', { max: 500 });
-    if (foto && !/^https?:\/\//i.test(foto)) throw bad('La URL de la foto debe empezar por http:// o https://');
+    const foto = validarFotoOEnlace(b.foto_falla_url, 'Foto de la falla');
+
+    /*
+     * Las tres fotos del día son obligatorias, pero sólo se exigen cuando
+     * el almacén está configurado: así el sistema sigue funcionando
+     * mientras falten las variables de entorno, en vez de dejar al
+     * motorizado sin poder registrar nada.
+     */
+    const ETIQUETA_FOTO = { tablero: 'del tablero', frontal: 'frontal', trasera: 'trasera (contrapicado)' };
+    const fotos = {};
+    for (const clave of ['tablero', 'frontal', 'trasera']) {
+      const valor = b[`foto_${clave}`];
+      const vacia = valor === undefined || valor === null || valor === '';
+      if (vacia) {
+        if (FOTOS_HABILITADAS) throw bad(`Falta la foto ${ETIQUETA_FOTO[clave]}`);
+        fotos[clave] = null;
+      } else {
+        fotos[clave] = validarRutaFoto(valor, `Foto ${ETIQUETA_FOTO[clave]}`);
+      }
+    }
 
     const ins = await c.query(
       `INSERT INTO checklist_motos
          (moto_id, usuario_id, se_uso_hoy, kilometraje_inicial, cambio_aceite_realizado,
-          detalles_items, tiene_falla, observacion_falla, foto_falla_url)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9) RETURNING *`,
+          detalles_items, tiene_falla, observacion_falla, foto_falla_url,
+          foto_tablero, foto_frontal, foto_trasera)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12) RETURNING *`,
       [id, req.usuario.id, seUso, km, cambioAceite, JSON.stringify(items),
-        tieneFalla, tieneFalla ? obs : null, foto || null],
+        tieneFalla, tieneFalla ? obs : null, foto || null,
+        fotos.tablero, fotos.frontal, fotos.trasera],
     );
 
     // Actualiza kilometraje y, si corresponde, el km del cambio de aceite
@@ -1590,8 +1806,8 @@ app.post('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asy
   const ids = items.map((i) => i.producto_id);
   if (new Set(ids).size !== ids.length) throw bad('Hay productos repetidos en la entrada');
 
-  const foto = texto(b.foto_factura_url, 'URL de la factura', { max: 500 });
-  if (foto && !/^https?:\/\//i.test(foto)) throw bad('La URL de la factura debe empezar por http:// o https://');
+  // La factura es opcional: se recibe mercancía igual aunque no la traigan
+  const foto = validarFotoOEnlace(b.foto_factura_url, 'Foto de la factura');
 
   const entrada = await withTx(async (c) => {
     const { rows: prods } = await c.query(
@@ -2060,7 +2276,15 @@ if (DIST) {
 
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
-  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Solicitud demasiado grande (máx. 50kb)' });
+  if (err.type === 'entity.too.large') {
+    // Hay dos límites: 2 MB para una foto y 50 kb para todo lo demás
+    const esFoto = req.path.startsWith('/api/fotos/');
+    return res.status(413).json({
+      error: esFoto
+        ? `La foto es demasiado grande (máx. ${Math.round(FOTO_MAX_BYTES / (1024 * 1024))} MB). Vuelva a tomarla.`
+        : 'Solicitud demasiado grande (máx. 50kb)',
+    });
+  }
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'JSON inválido' });
   if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
   switch (err.code) {
