@@ -1,0 +1,48 @@
+# Purissima Cloud - Blueprint de Render
+#
+# La base de datos NO se crea aquí: se usa el proyecto Supabase existente
+# ("Purissima DB"), que ya contiene los usuarios, motos e historial.
+# Por eso DATABASE_URL se define a mano (sync: false) y PGSSL queda en true.
+#
+# El esquema database/schema.sql debe aplicarse en Supabase ANTES del primer
+# despliegue. El backend lo verifica al arrancar y deja un mensaje claro en
+# los logs si falta alguna columna.
+
+services:
+  - type: web
+    name: purissima-cloud
+    runtime: node
+    plan: starter
+    region: oregon
+    rootDir: .
+    buildCommand: >-
+      npm --prefix frontend install --include=dev &&
+      npm --prefix frontend run build &&
+      npm --prefix backend install --omit=dev
+    startCommand: npm --prefix backend start
+    healthCheckPath: /api/salud
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PGSSL
+        value: "true"
+      # Supabase -> Project Settings -> Database -> Connection string.
+      # Se recomienda el "Connection pooler" (puerto 6543, modo transaction).
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false

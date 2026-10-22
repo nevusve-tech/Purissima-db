@@ -1,171 +1,300 @@
--- Habilitar pgcrypto para hashing seguro de PINs (Bcrypt)
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+-- =====================================================================
+-- Purissima Cloud - Esquema completo (instalación desde cero)
+--
+-- ATENCIÓN: este script BORRA las tablas existentes y las vuelve a crear.
+-- Pensado para arrancar limpio, sin los datos de pruebas anteriores.
+--
+-- Zona horaria: America/Caracas
+-- Probado contra PostgreSQL 17 (Supabase).
+-- =====================================================================
 
--- Forzar zona horaria operativa para que CURRENT_DATE refleje la hora local y no UTC
-ALTER DATABASE postgres SET timezone TO 'America/Caracas';
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- =========================================================================
--- 1. Tabla de Usuarios (Con hashing real y protección contra fuerza bruta)
--- =========================================================================
+SET timezone TO 'America/Caracas';
+
+DO $$
+BEGIN
+  EXECUTE format('ALTER DATABASE %I SET timezone TO %L', current_database(), 'America/Caracas');
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'No se pudo fijar la zona horaria de la base: %', SQLERRM;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- Limpieza (el orden no importa por el CASCADE)
+-- ---------------------------------------------------------------------
+DROP TABLE IF EXISTS checklist_motos    CASCADE;
+DROP TABLE IF EXISTS entradas_agua      CASCADE;
+DROP TABLE IF EXISTS entradas_mercancia CASCADE;
+DROP TABLE IF EXISTS incidencias        CASCADE;
+DROP TABLE IF EXISTS solicitudes        CASCADE;
+DROP TABLE IF EXISTS cierres_caja       CASCADE;
+DROP TABLE IF EXISTS productos          CASCADE;
+DROP TABLE IF EXISTS proveedores        CASCADE;
+DROP TABLE IF EXISTS motos              CASCADE;
+DROP TABLE IF EXISTS usuarios           CASCADE;
+DROP FUNCTION IF EXISTS set_actualizado_en() CASCADE;
+
+-- ---------------------------------------------------------------------
+-- Utilidad: mantener la columna actualizado_en
+-- ---------------------------------------------------------------------
+CREATE FUNCTION set_actualizado_en() RETURNS trigger AS $fn$
+BEGIN
+  NEW.actualizado_en = now();
+  RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+-- =====================================================================
+-- USUARIOS
+-- modulos_permitidos (JSONB) controla de forma dinámica qué formularios
+-- ve y puede llenar cada empleado. El Master lo edita desde "Accesos".
+-- =====================================================================
 CREATE TABLE usuarios (
-    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    nombre VARCHAR(100) NOT NULL,
-    rol VARCHAR(50) NOT NULL CHECK (rol IN ('motorizados', 'tienda', 'admin')),
-    pin_hash VARCHAR(255) NOT NULL,
-    intentos_fallidos SMALLINT NOT NULL DEFAULT 0 CHECK (intentos_fallidos >= 0),
-    bloqueado_hasta TIMESTAMPTZ,
-    activo BOOLEAN NOT NULL DEFAULT TRUE,
-    creado_en TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+  id                  integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  nombre              varchar(80)  NOT NULL CHECK (length(trim(nombre)) >= 2),
+  rol                 varchar(20)  NOT NULL CHECK (rol IN ('motorizados', 'tienda', 'admin')),
+  pin_hash            varchar(120) NOT NULL,
+  modulos_permitidos  jsonb        NOT NULL DEFAULT '[]'::jsonb
+                                   CHECK (jsonb_typeof(modulos_permitidos) = 'array'),
+  intentos_fallidos   smallint     NOT NULL DEFAULT 0 CHECK (intentos_fallidos >= 0),
+  bloqueado_hasta     timestamptz,
+  activo              boolean      NOT NULL DEFAULT TRUE,
+  creado_en           timestamptz  NOT NULL DEFAULT now(),
+  actualizado_en      timestamptz  NOT NULL DEFAULT now()
 );
+-- El login busca por lower(nombre): el índice único evita ambigüedad
+CREATE UNIQUE INDEX ux_usuarios_nombre_lower ON usuarios (lower(nombre));
+CREATE INDEX ix_usuarios_rol ON usuarios (rol);
 
--- Precargar usuarios con PINs hasheados usando Bcrypt (PINs: 1234, 5678, 0000 -> CAMBIAR EN PRODUCCIÓN)
-INSERT INTO usuarios (nombre, rol, pin_hash) VALUES 
-('Gerente de Motorizados', 'motorizados', crypt('1234', gen_salt('bf', 10))),
-('Gerente de Tienda', 'tienda', crypt('5678', gen_salt('bf', 10))),
-('Administrador General', 'admin', crypt('0000', gen_salt('bf', 10)));
+CREATE TRIGGER trg_usuarios_actualizado BEFORE UPDATE ON usuarios
+  FOR EACH ROW EXECUTE FUNCTION set_actualizado_en();
 
--- =========================================================================
--- 2. Tabla de Motos (Flota)
--- =========================================================================
+-- =====================================================================
+-- MOTOS
+-- =====================================================================
 CREATE TABLE motos (
-    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    nombre VARCHAR(100) NOT NULL,
-    color VARCHAR(50) NOT NULL,
-    placa VARCHAR(50) NOT NULL UNIQUE,
-    tipo_modelo VARCHAR(50) NOT NULL CHECK (tipo_modelo IN ('carguera_200cc', 'sbr_150cc', 'otro')),
-    ultimo_kilometraje INT NOT NULL DEFAULT 0 CHECK (ultimo_kilometraje >= 0),
-    ultimo_cambio_aceite_km INT NOT NULL DEFAULT 0 CHECK (ultimo_cambio_aceite_km >= 0),
-    activa BOOLEAN NOT NULL DEFAULT TRUE,
-    CONSTRAINT chk_aceite_vs_kilometraje CHECK (ultimo_cambio_aceite_km <= ultimo_kilometraje)
+  id                       integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  nombre                   varchar(80) NOT NULL CHECK (length(trim(nombre)) >= 2),
+  color                    varchar(40) NOT NULL CHECK (length(trim(color)) >= 2),
+  placa                    varchar(20) NOT NULL CHECK (length(trim(placa)) >= 3),
+  tipo_modelo              varchar(20) NOT NULL
+                           CHECK (tipo_modelo IN ('sbr_150cc', 'carguera_200cc', 'otro')),
+  ultimo_kilometraje       integer     NOT NULL DEFAULT 0 CHECK (ultimo_kilometraje >= 0),
+  ultimo_cambio_aceite_km  integer     NOT NULL DEFAULT 0 CHECK (ultimo_cambio_aceite_km >= 0),
+  activa                   boolean     NOT NULL DEFAULT TRUE,
+  CONSTRAINT ck_motos_aceite_le_km CHECK (ultimo_cambio_aceite_km <= ultimo_kilometraje)
 );
+CREATE UNIQUE INDEX ux_motos_placa ON motos (placa);
+CREATE INDEX ix_motos_activa ON motos (activa);
 
-INSERT INTO motos (nombre, color, placa, tipo_modelo, ultimo_kilometraje, ultimo_cambio_aceite_km) VALUES 
-('Moto 1 - Bera Carguera 200cc', 'Azul', 'POR-DEFINIR-1', 'carguera_200cc', 0, 0),
-('Moto 2 - Bera SBR 150cc', 'Gris', 'POR-DEFINIR-2', 'sbr_150cc', 0, 0);
-
--- =========================================================================
--- 3. Tabla de Checklist de Motos
--- =========================================================================
+-- =====================================================================
+-- CHECKLIST DE MOTOS
+-- Reglas: si se usó hoy, el kilometraje inicial es obligatorio.
+--         si tiene falla, la observación es obligatoria.
+--         un solo checklist por moto por día (fecha local de Caracas).
+-- =====================================================================
 CREATE TABLE checklist_motos (
-    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    moto_id INT NOT NULL REFERENCES motos(id) ON DELETE RESTRICT,
-    usuario_id INT NOT NULL REFERENCES usuarios(id) ON DELETE RESTRICT,
-    fecha TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    se_uso_hoy BOOLEAN NOT NULL,
-    kilometraje_inicial INT CHECK (kilometraje_inicial >= 0),
-    cambio_aceite_realizado BOOLEAN NOT NULL DEFAULT FALSE,
-    detalles_items JSONB CHECK (detalles_items IS NULL OR jsonb_typeof(detalles_items) IN ('object', 'array')),
-    tiene_falla BOOLEAN NOT NULL DEFAULT FALSE,
-    observacion_falla TEXT,
-    foto_falla_url TEXT CHECK (foto_falla_url IS NULL OR foto_falla_url ~* '^https?://'),
-    CONSTRAINT chk_uso_requiere_km CHECK (NOT se_uso_hoy OR kilometraje_inicial IS NOT NULL),
-    CONSTRAINT chk_falla_requiere_observacion CHECK (NOT tiene_falla OR (observacion_falla IS NOT NULL AND length(trim(observacion_falla)) > 0))
+  id                       uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  moto_id                  integer     NOT NULL REFERENCES motos (id),
+  usuario_id               integer     NOT NULL REFERENCES usuarios (id),
+  fecha                    timestamptz NOT NULL DEFAULT now(),
+  se_uso_hoy               boolean     NOT NULL DEFAULT TRUE,
+  kilometraje_inicial      integer     CHECK (kilometraje_inicial IS NULL OR kilometraje_inicial >= 0),
+  cambio_aceite_realizado  boolean     NOT NULL DEFAULT FALSE,
+  detalles_items           jsonb       CHECK (detalles_items IS NULL
+                                              OR jsonb_typeof(detalles_items) IN ('object', 'array')),
+  tiene_falla              boolean     NOT NULL DEFAULT FALSE,
+  observacion_falla        text,
+  foto_falla_url           text        CHECK (foto_falla_url IS NULL OR foto_falla_url ~* '^https?://'),
+  CONSTRAINT ck_checklist_km_si_uso CHECK (NOT se_uso_hoy OR kilometraje_inicial IS NOT NULL),
+  CONSTRAINT ck_checklist_obs_si_falla CHECK (
+    NOT tiene_falla OR (observacion_falla IS NOT NULL AND length(trim(observacion_falla)) > 0)
+  )
 );
+-- timezone(text, timestamptz) es IMMUTABLE, así que sirve en un índice
+CREATE UNIQUE INDEX ux_checklist_moto_dia
+  ON checklist_motos (moto_id, ((fecha AT TIME ZONE 'America/Caracas')::date));
+CREATE INDEX ix_checklist_fecha ON checklist_motos (fecha);
+CREATE INDEX ix_checklist_usuario ON checklist_motos (usuario_id);
+CREATE INDEX ix_checklist_falla ON checklist_motos (tiene_falla) WHERE tiene_falla;
 
--- =========================================================================
--- 4. Tabla de Proveedores
--- =========================================================================
+-- =====================================================================
+-- PROVEEDORES Y PRODUCTOS
+-- =====================================================================
 CREATE TABLE proveedores (
-    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    nombre VARCHAR(100) NOT NULL UNIQUE,
-    tipo VARCHAR(50) NOT NULL CHECK (tipo IN ('agua', 'mercancia', 'ambos')),
-    contacto VARCHAR(100),
-    activo BOOLEAN NOT NULL DEFAULT TRUE
+  id        integer      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  nombre    varchar(120) NOT NULL CHECK (length(trim(nombre)) >= 2),
+  tipo      varchar(20)  NOT NULL CHECK (tipo IN ('agua', 'mercancia', 'ambos')),
+  contacto  varchar(120),
+  rif       varchar(20),
+  telefono  varchar(30),
+  activo    boolean      NOT NULL DEFAULT TRUE
 );
+CREATE UNIQUE INDEX ux_proveedores_nombre ON proveedores (lower(nombre));
 
--- =========================================================================
--- 5. Tabla de Productos
--- =========================================================================
 CREATE TABLE productos (
-    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    nombre VARCHAR(150) NOT NULL UNIQUE,
-    categoria VARCHAR(50) NOT NULL CHECK (categoria IN ('mercancia', 'insumo_tienda', 'agua')),
-    proveedor_habitual_id INT REFERENCES proveedores(id) ON DELETE SET NULL,
-    activo BOOLEAN NOT NULL DEFAULT TRUE
+  id                     integer       GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  nombre                 varchar(120)  NOT NULL CHECK (length(trim(nombre)) >= 2),
+  categoria              varchar(20)   NOT NULL
+                         CHECK (categoria IN ('mercancia', 'insumo_tienda', 'agua')),
+  proveedor_habitual_id  integer       REFERENCES proveedores (id),
+  sku                    varchar(40),
+  unidad                 varchar(20)   NOT NULL DEFAULT 'unidad',
+  precio_usd             numeric(12,2) NOT NULL DEFAULT 0 CHECK (precio_usd >= 0),
+  stock                  numeric(14,2) NOT NULL DEFAULT 0 CHECK (stock >= 0),
+  activo                 boolean       NOT NULL DEFAULT TRUE
 );
+CREATE UNIQUE INDEX ux_productos_nombre ON productos (lower(nombre));
+CREATE UNIQUE INDEX ux_productos_sku ON productos (sku) WHERE sku IS NOT NULL;
+CREATE INDEX ix_productos_proveedor ON productos (proveedor_habitual_id);
 
--- =========================================================================
--- 6. Bitácora de Llegada de Agua
--- =========================================================================
+-- =====================================================================
+-- ENTRADAS DE AGUA Y MERCANCÍA
+-- =====================================================================
 CREATE TABLE entradas_agua (
-    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    proveedor_id INT NOT NULL REFERENCES proveedores(id) ON DELETE RESTRICT,
-    usuario_id INT NOT NULL REFERENCES usuarios(id) ON DELETE RESTRICT,
-    fecha_hora TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    litraje NUMERIC(10,2) NOT NULL CHECK (litraje > 0),
-    observaciones TEXT,
-    tiene_incidencia BOOLEAN NOT NULL DEFAULT FALSE,
-    CONSTRAINT chk_incidencia_agua_obs CHECK (NOT tiene_incidencia OR (observaciones IS NOT NULL AND length(trim(observaciones)) > 0))
+  id                uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
+  proveedor_id      integer       NOT NULL REFERENCES proveedores (id),
+  usuario_id        integer       NOT NULL REFERENCES usuarios (id),
+  fecha_hora        timestamptz   NOT NULL DEFAULT now(),
+  litraje           numeric(12,2) NOT NULL CHECK (litraje > 0),
+  observaciones     text,
+  tiene_incidencia  boolean       NOT NULL DEFAULT FALSE
 );
+CREATE INDEX ix_entradas_agua_fecha ON entradas_agua (fecha_hora);
+CREATE INDEX ix_entradas_agua_usuario ON entradas_agua (usuario_id);
+CREATE INDEX ix_entradas_agua_proveedor ON entradas_agua (proveedor_id);
 
--- =========================================================================
--- 7. Recepción de Mercancía
--- =========================================================================
 CREATE TABLE entradas_mercancia (
-    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    proveedor_id INT NOT NULL REFERENCES proveedores(id) ON DELETE RESTRICT,
-    usuario_id INT NOT NULL REFERENCES usuarios(id) ON DELETE RESTRICT,
-    fecha_hora TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    items_recibidos JSONB NOT NULL CHECK (jsonb_typeof(items_recibidos) IN ('array', 'object')),
-    foto_factura_url TEXT CHECK (foto_factura_url IS NULL OR foto_factura_url ~* '^https?://'),
-    observaciones TEXT
+  id                uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  proveedor_id      integer     NOT NULL REFERENCES proveedores (id),
+  usuario_id        integer     NOT NULL REFERENCES usuarios (id),
+  fecha_hora        timestamptz NOT NULL DEFAULT now(),
+  items_recibidos   jsonb       NOT NULL CHECK (jsonb_typeof(items_recibidos) IN ('array', 'object')),
+  foto_factura_url  text        CHECK (foto_factura_url IS NULL OR foto_factura_url ~* '^https?://'),
+  observaciones     text
 );
+CREATE INDEX ix_entradas_merc_fecha ON entradas_mercancia (fecha_hora);
+CREATE INDEX ix_entradas_merc_usuario ON entradas_mercancia (usuario_id);
+CREATE INDEX ix_entradas_merc_proveedor ON entradas_mercancia (proveedor_id);
 
--- =========================================================================
--- 8. Solicitudes Internas
--- =========================================================================
-CREATE TABLE solicitudes (
-    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    tipo_solicitud VARCHAR(50) NOT NULL CHECK (tipo_solicitud IN ('mercancia', 'agua', 'insumos_generales')),
-    usuario_id INT NOT NULL REFERENCES usuarios(id) ON DELETE RESTRICT,
-    fecha_hora TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    estado VARCHAR(20) NOT NULL DEFAULT 'pendiente' CHECK (estado IN ('pendiente', 'aprobada', 'en_proceso', 'completada', 'rechazada')),
-    detalle_items JSONB NOT NULL CHECK (jsonb_typeof(detalle_items) IN ('array', 'object'))
-);
-
--- =========================================================================
--- 9. Cierres de Caja Financieros (Con Idempotencia de Fecha única Cloud)
--- =========================================================================
+-- =====================================================================
+-- CIERRES DE CAJA
+-- Idempotencia estricta: un único cierre por fecha.
+-- Cuadre: total_cierre_bs = pago móvil + efectivo + punto de venta.
+-- total_ingreso_dolar lo calcula el backend como
+--   total_cierre_bs / tasa_dolar + dolares_vendidos
+-- =====================================================================
 CREATE TABLE cierres_caja (
-    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    usuario_id INT NOT NULL REFERENCES usuarios(id) ON DELETE RESTRICT,
-    fecha DATE NOT NULL DEFAULT CURRENT_DATE,
-    creado_en TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    pago_movil_bs NUMERIC(14,2) NOT NULL CHECK (pago_movil_bs >= 0),
-    efectivo_bs NUMERIC(14,2) NOT NULL CHECK (efectivo_bs >= 0),
-    punto_venta_bs NUMERIC(14,2) NOT NULL CHECK (punto_venta_bs >= 0),
-    total_cierre_bs NUMERIC(14,2) NOT NULL CHECK (total_cierre_bs >= 0),
-    tasa_dolar NUMERIC(12,4) NOT NULL CHECK (tasa_dolar > 0),
-    dolares_vendidos NUMERIC(12,2) NOT NULL CHECK (dolares_vendidos >= 0),
-    total_ingreso_dolar NUMERIC(12,2) NOT NULL CHECK (total_ingreso_dolar >= 0),
-    impuestos_fiscales_bs NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK (impuestos_fiscales_bs >= 0),
-    costos_operativos_bs NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK (costos_operativos_bs >= 0),
-    CONSTRAINT chk_cuadre_caja_bs CHECK (total_cierre_bs = (pago_movil_bs + efectivo_bs + punto_venta_bs))
+  id                     uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
+  usuario_id             integer       NOT NULL REFERENCES usuarios (id),
+  fecha                  date          NOT NULL DEFAULT ((now() AT TIME ZONE 'America/Caracas')::date),
+  creado_en              timestamptz   NOT NULL DEFAULT now(),
+  pago_movil_bs          numeric(14,2) NOT NULL DEFAULT 0 CHECK (pago_movil_bs >= 0),
+  efectivo_bs            numeric(14,2) NOT NULL DEFAULT 0 CHECK (efectivo_bs >= 0),
+  punto_venta_bs         numeric(14,2) NOT NULL DEFAULT 0 CHECK (punto_venta_bs >= 0),
+  total_cierre_bs        numeric(14,2) NOT NULL CHECK (total_cierre_bs >= 0),
+  tasa_dolar             numeric(14,4) NOT NULL CHECK (tasa_dolar > 0),
+  dolares_vendidos       numeric(14,2) NOT NULL DEFAULT 0 CHECK (dolares_vendidos >= 0),
+  total_ingreso_dolar    numeric(14,2) NOT NULL DEFAULT 0 CHECK (total_ingreso_dolar >= 0),
+  impuestos_fiscales_bs  numeric(14,2) NOT NULL DEFAULT 0 CHECK (impuestos_fiscales_bs >= 0),
+  costos_operativos_bs   numeric(14,2) NOT NULL DEFAULT 0 CHECK (costos_operativos_bs >= 0),
+  observacion            text,
+  CONSTRAINT ck_cierre_total_cuadra CHECK (
+    total_cierre_bs = pago_movil_bs + efectivo_bs + punto_venta_bs
+  )
 );
+CREATE UNIQUE INDEX ux_cierres_fecha ON cierres_caja (fecha);
+CREATE INDEX ix_cierres_usuario ON cierres_caja (usuario_id);
 
--- EVITA DUPLICADOS: Solo permite un cierre de caja por día calendario (Idempotencia Cloud)
-CREATE UNIQUE INDEX idx_unico_cierre_por_dia ON cierres_caja (fecha);
+-- =====================================================================
+-- SOLICITUDES
+-- =====================================================================
+CREATE TABLE solicitudes (
+  id              uuid         PRIMARY KEY DEFAULT gen_random_uuid(),
+  usuario_id      integer      NOT NULL REFERENCES usuarios (id),
+  tipo_solicitud  varchar(30)  NOT NULL CHECK (tipo_solicitud IN
+                               ('mercancia', 'agua', 'insumos_generales',
+                                'mantenimiento', 'permiso', 'otro')),
+  titulo          varchar(120) NOT NULL CHECK (length(trim(titulo)) >= 3),
+  descripcion     text         NOT NULL DEFAULT '',
+  detalle_items   jsonb        NOT NULL DEFAULT '[]'::jsonb
+                               CHECK (jsonb_typeof(detalle_items) IN ('array', 'object')),
+  estado          varchar(20)  NOT NULL DEFAULT 'pendiente' CHECK (estado IN
+                               ('pendiente', 'aprobada', 'en_proceso', 'completada', 'rechazada')),
+  notas_admin     text,
+  fecha_hora      timestamptz  NOT NULL DEFAULT now(),
+  actualizado_en  timestamptz  NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_solicitudes_fecha ON solicitudes (fecha_hora);
+CREATE INDEX ix_solicitudes_usuario ON solicitudes (usuario_id);
+CREATE INDEX ix_solicitudes_estado ON solicitudes (estado);
+CREATE INDEX ix_solicitudes_tipo_estado ON solicitudes (tipo_solicitud, estado);
 
--- =========================================================================
--- 10. Incidencias
--- =========================================================================
+CREATE TRIGGER trg_solicitudes_actualizado BEFORE UPDATE ON solicitudes
+  FOR EACH ROW EXECUTE FUNCTION set_actualizado_en();
+
+-- =====================================================================
+-- INCIDENCIAS
+-- =====================================================================
 CREATE TABLE incidencias (
-    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    tipo VARCHAR(50) NOT NULL CHECK (tipo IN ('financiera_caja', 'cliente', 'operativa_tienda')),
-    cierre_caja_id UUID REFERENCES cierres_caja(id) ON DELETE RESTRICT,
-    usuario_id INT NOT NULL REFERENCES usuarios(id) ON DELETE RESTRICT,
-    fecha_hora TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    descripcion TEXT NOT NULL CHECK (length(trim(descripcion)) > 0),
-    CONSTRAINT chk_incidencia_financiera_requiere_cierre CHECK (tipo <> 'financiera_caja' OR cierre_caja_id IS NOT NULL)
+  id              uuid         PRIMARY KEY DEFAULT gen_random_uuid(),
+  usuario_id      integer      NOT NULL REFERENCES usuarios (id),
+  tipo            varchar(30)  NOT NULL CHECK (tipo IN
+                               ('financiera_caja', 'cliente', 'operativa_tienda',
+                                'moto', 'agua', 'seguridad', 'otro')),
+  titulo          varchar(120) NOT NULL CHECK (length(trim(titulo)) >= 3),
+  descripcion     text         NOT NULL CHECK (length(trim(descripcion)) > 0),
+  severidad       varchar(10)  NOT NULL DEFAULT 'media' CHECK (severidad IN ('baja', 'media', 'alta')),
+  estado          varchar(20)  NOT NULL DEFAULT 'abierta'
+                               CHECK (estado IN ('abierta', 'en_revision', 'cerrada')),
+  moto_id         integer      REFERENCES motos (id),
+  cierre_caja_id  uuid         REFERENCES cierres_caja (id),
+  notas_admin     text,
+  fecha_hora      timestamptz  NOT NULL DEFAULT now(),
+  actualizado_en  timestamptz  NOT NULL DEFAULT now()
 );
+CREATE INDEX ix_incidencias_fecha ON incidencias (fecha_hora);
+CREATE INDEX ix_incidencias_usuario ON incidencias (usuario_id);
+CREATE INDEX ix_incidencias_estado ON incidencias (estado);
+CREATE INDEX ix_incidencias_tipo_estado ON incidencias (tipo, estado);
+CREATE INDEX ix_incidencias_moto ON incidencias (moto_id);
+CREATE INDEX ix_incidencias_cierre ON incidencias (cierre_caja_id);
 
--- =========================================================================
--- 11. Índices de Rendimiento Cloud
--- =========================================================================
-CREATE INDEX idx_checklist_moto_fecha ON checklist_motos(moto_id, fecha DESC);
-CREATE INDEX idx_checklist_usuario ON checklist_motos(usuario_id);
-CREATE INDEX idx_entradas_agua_fecha ON entradas_agua(fecha_hora DESC);
-CREATE INDEX idx_entradas_mercancia_fecha ON entradas_mercancia(fecha_hora DESC);
-CREATE INDEX idx_solicitudes_estado_fecha ON solicitudes(estado, fecha_hora DESC);
-CREATE INDEX idx_cierres_caja_fecha ON cierres_caja(fecha DESC);
-CREATE INDEX idx_incidencias_tipo_fecha ON incidencias(tipo, fecha_hora DESC);
+CREATE TRIGGER trg_incidencias_actualizado BEFORE UPDATE ON incidencias
+  FOR EACH ROW EXECUTE FUNCTION set_actualizado_en();
+
+-- =====================================================================
+-- SEGURIDAD: cerrar la puerta de la API pública de Supabase
+--
+-- Supabase expone el esquema "public" por REST con las llaves anon y
+-- authenticated. Esta aplicación NO usa esa vía: entra por el backend
+-- con el rol "postgres", que omite RLS (BYPASSRLS).
+--
+-- Se activa RLS SIN políticas (todo denegado) y se revocan privilegios
+-- a anon y authenticated, para que nadie con la llave pública pueda
+-- leer ni escribir estas tablas.
+-- =====================================================================
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['usuarios', 'motos', 'checklist_motos', 'proveedores', 'productos',
+                           'entradas_agua', 'entradas_mercancia', 'cierres_caja',
+                           'solicitudes', 'incidencias']
+  LOOP
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    BEGIN
+      EXECUTE format('REVOKE ALL ON TABLE %I FROM anon, authenticated', t);
+    EXCEPTION WHEN undefined_object THEN
+      RAISE NOTICE 'Roles anon/authenticated no existen (fuera de Supabase): se omite el REVOKE';
+    END;
+  END LOOP;
+END $$;
+
+-- =====================================================================
+-- SEMILLA: un único usuario Master
+-- Usuario: Master     PIN: 123456
+-- CAMBIE EL PIN EN EL PRIMER INGRESO (👤 -> Cambiar PIN)
+-- =====================================================================
+INSERT INTO usuarios (nombre, rol, pin_hash, modulos_permitidos)
+VALUES ('Master', 'admin', crypt('123456', gen_salt('bf', 10)),
+        '["motos","caja","recepcion","solicitudes","incidencias"]'::jsonb);

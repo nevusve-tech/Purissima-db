@@ -1,0 +1,15 @@
+{
+  "name": "Purissima Cloud",
+  "short_name": "Purissima",
+  "description": "Gestión interna de recarga de agua y tienda",
+  "lang": "es-VE",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#ecfeff",
+  "theme_color": "#0891b2",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

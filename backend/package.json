@@ -1,15 +1,19 @@
 {
-  "name": "purissima-backend",
+  "name": "purissima-cloud-backend",
   "version": "1.0.0",
-  "description": "API de Purissima Cloud",
+  "description": "API de Purissima Cloud: gestión interna de recarga de agua y tienda",
   "main": "server.js",
+  "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "nodemailer": "^6.9.11",
-    "pg": "^8.11.3"
+    "express": "^4.21.2",
+    "nodemailer": "^6.9.16",
+    "pg": "^8.13.1"
   }
 }
