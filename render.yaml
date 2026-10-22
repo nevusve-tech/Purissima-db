@@ -18,10 +18,14 @@ services:
     plan: free
     region: oregon
     rootDir: .
+    # TEMPORAL: la última línea imprime el detalle de las vulnerabilidades del
+    # backend en el registro del build, para saber cuáles son. Se quita después.
+    # El "|| true" evita que el informe tumbe el despliegue.
     buildCommand: >-
       npm --prefix frontend install --include=dev &&
       npm --prefix frontend run build &&
-      npm --prefix backend install --omit=dev
+      npm --prefix backend install --omit=dev &&
+      (npm --prefix backend audit --omit=dev || true)
     startCommand: npm --prefix backend start
     healthCheckPath: /api/salud
     envVars:

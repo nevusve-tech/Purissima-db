@@ -154,6 +154,10 @@ CREATE TABLE productos (
   nombre                 varchar(120)  NOT NULL CHECK (length(trim(nombre)) >= 2),
   categoria              varchar(20)   NOT NULL
                          CHECK (categoria IN ('mercancia', 'insumo_tienda', 'agua')),
+  -- Dentro de "mercancía", para describirla mejor. Obligatoria sólo ahí.
+  subcategoria           varchar(20)
+                         CHECK (subcategoria IS NULL OR subcategoria IN
+                                ('bebidas', 'snacks', 'artesanales', 'insumos_agua')),
   proveedor_habitual_id  integer       REFERENCES proveedores (id),
   sku                    varchar(40),
   -- Los productos se piden por bulto: caja, gavera (vidrio) o brazo (snacks)
@@ -162,9 +166,12 @@ CREATE TABLE productos (
   unidades_por_empaquetado integer     NOT NULL DEFAULT 1 CHECK (unidades_por_empaquetado > 0),
   precio_usd             numeric(12,2) NOT NULL DEFAULT 0 CHECK (precio_usd >= 0),
   stock                  numeric(14,2) NOT NULL DEFAULT 0 CHECK (stock >= 0),
-  activo                 boolean       NOT NULL DEFAULT TRUE
+  activo                 boolean       NOT NULL DEFAULT TRUE,
+  CONSTRAINT ck_productos_subcat_mercancia
+    CHECK (categoria <> 'mercancia' OR subcategoria IS NOT NULL)
 );
 CREATE UNIQUE INDEX ux_productos_nombre ON productos (lower(nombre));
+CREATE INDEX ix_productos_subcategoria ON productos (subcategoria);
 CREATE UNIQUE INDEX ux_productos_sku ON productos (sku) WHERE sku IS NOT NULL;
 CREATE INDEX ix_productos_proveedor ON productos (proveedor_habitual_id);
 
@@ -217,6 +224,9 @@ CREATE TABLE cierres_caja (
   dolares_vendidos       numeric(14,2) NOT NULL DEFAULT 0 CHECK (dolares_vendidos >= 0),
   total_ingreso_dolar    numeric(14,2) NOT NULL DEFAULT 0 CHECK (total_ingreso_dolar >= 0),
   impuestos_fiscales_bs  numeric(14,2) NOT NULL DEFAULT 0 CHECK (impuestos_fiscales_bs >= 0),
+  -- Los costos operativos se escriben en dólares; la columna en bolívares
+  -- guarda el equivalente (USD x tasa del día), que es lo que resta al neto.
+  costos_operativos_usd  numeric(14,2) NOT NULL DEFAULT 0 CHECK (costos_operativos_usd >= 0),
   costos_operativos_bs   numeric(14,2) NOT NULL DEFAULT 0 CHECK (costos_operativos_bs >= 0),
   observacion            text,
   CONSTRAINT ck_cierre_total_cuadra CHECK (

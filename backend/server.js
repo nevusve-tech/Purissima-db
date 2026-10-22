@@ -91,6 +91,8 @@ const TIPOS_PROVEEDOR = ['agua', 'mercancia', 'ambos'];
 const CATEGORIAS_PRODUCTO = ['mercancia', 'insumo_tienda', 'agua'];
 /* Los productos se piden por bulto, no por unidad suelta */
 const EMPAQUETADOS = ['caja', 'gavera', 'brazo'];
+/* Subcategorías dentro de "mercancía", para describirla mejor */
+const SUBCATEGORIAS = ['bebidas', 'snacks', 'artesanales', 'insumos_agua'];
 
 /* ------------------------------------------------------------------ */
 /* Base de datos                                                       */
@@ -150,6 +152,8 @@ const COLUMNAS_REQUERIDAS = [
   ['proveedores', 'telefono'],
   ['productos', 'empaquetado'],
   ['productos', 'unidades_por_empaquetado'],
+  ['productos', 'subcategoria'],
+  ['cierres_caja', 'costos_operativos_usd'],
   ['solicitudes', 'proveedor_id'],
   ['checklist_motos', 'anulado'],
   ['cierres_caja', 'anulado'],
@@ -281,6 +285,12 @@ function texto(valor, nombre, { min = 0, max = 2000, requerido = false } = {}) {
 function unoDe(valor, lista, nombre) {
   if (!lista.includes(valor)) throw bad(`${nombre} inválido (valores: ${lista.join(', ')})`);
   return valor;
+}
+
+/** La subcategoría sólo aplica a la mercancía, y ahí es obligatoria. */
+function leerSubcategoria(valor, categoria) {
+  if (categoria !== 'mercancia') return null;
+  return unoDe(valor, SUBCATEGORIAS, 'Subcategoría');
 }
 
 const esPinValido = (pin) => typeof pin === 'string' && /^\d{4,8}$/.test(pin);
@@ -906,18 +916,22 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
 /* ------------------------------------------------------------------ */
 /**
  * Reglas de cuadre:
- *   total_cierre_bs     = pago_movil_bs + efectivo_bs + punto_venta_bs   (CHECK en la BD)
- *   total_ingreso_dolar = total_cierre_bs / tasa_dolar + dolares_vendidos
- * Ambos se calculan en el servidor; si el cliente los envía, deben coincidir al centavo.
+ *   total_cierre_bs      = pago_movil_bs + efectivo_bs + punto_venta_bs   (CHECK en la BD)
+ *   total_ingreso_dolar  = total_cierre_bs / tasa_dolar
+ *   costos_operativos_bs = costos_operativos_usd * tasa_dolar
+ *   neto en bolívares    = total_cierre_bs - impuestos - costos_operativos_bs
+ *
+ * Los costos operativos se escriben en DÓLARES; su equivalente en bolívares
+ * se calcula aquí para que el neto cuadre. Todo se calcula en el servidor;
+ * si el cliente envía los totales, deben coincidir al centavo.
  */
 function leerMontosCaja(b) {
   const pagoMovil = monto(b.pago_movil_bs, 'Pago móvil');
   const efectivo = monto(b.efectivo_bs, 'Efectivo');
   const punto = monto(b.punto_venta_bs, 'Punto de venta');
   const tasa = montoTasa(b.tasa_dolar, 'Tasa del dólar');
-  const dolares = monto(b.dolares_vendidos, 'Dólares vendidos');
   const impuestos = monto(b.impuestos_fiscales_bs, 'Impuestos fiscales');
-  const costos = monto(b.costos_operativos_bs, 'Costos operativos');
+  const costosUsd = monto(b.costos_operativos_usd, 'Costos operativos (USD)');
 
   const totalBs = redondearMoneda(pagoMovil + efectivo + punto);
   if (b.total_cierre_bs !== undefined && b.total_cierre_bs !== null && b.total_cierre_bs !== '') {
@@ -927,7 +941,7 @@ function leerMontosCaja(b) {
     }
   }
 
-  const totalUsd = redondearMoneda(redondearMoneda(totalBs / tasa) + dolares);
+  const totalUsd = redondearMoneda(totalBs / tasa);
   if (b.total_ingreso_dolar !== undefined && b.total_ingreso_dolar !== null && b.total_ingreso_dolar !== '') {
     const recibido = monto(b.total_ingreso_dolar, 'Total de ingreso en dólares');
     if (aCentavos(recibido) !== aCentavos(totalUsd)) {
@@ -935,7 +949,9 @@ function leerMontosCaja(b) {
     }
   }
 
-  return { pagoMovil, efectivo, punto, tasa, dolares, impuestos, costos, totalBs, totalUsd };
+  const costosBs = redondearMoneda(costosUsd * tasa);
+
+  return { pagoMovil, efectivo, punto, tasa, impuestos, costosUsd, costosBs, totalBs, totalUsd };
 }
 
 app.get('/api/caja/hoy', autenticar, requiereModulo('caja'), asyncH(async (req, res) => {
@@ -981,10 +997,10 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
       `INSERT INTO cierres_caja
          (fecha, usuario_id, pago_movil_bs, efectivo_bs, punto_venta_bs, total_cierre_bs,
           tasa_dolar, dolares_vendidos, total_ingreso_dolar,
-          impuestos_fiscales_bs, costos_operativos_bs, observacion)
-       VALUES ($1::date, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+          impuestos_fiscales_bs, costos_operativos_usd, costos_operativos_bs, observacion)
+       VALUES ($1::date, $2, $3, $4, $5, $6, $7, 0, $8, $9, $10, $11, $12) RETURNING *`,
       [fecha, req.usuario.id, m.pagoMovil, m.efectivo, m.punto, m.totalBs,
-        m.tasa, m.dolares, m.totalUsd, m.impuestos, m.costos, obs || null],
+        m.tasa, m.totalUsd, m.impuestos, m.costosUsd, m.costosBs, obs || null],
     );
     return rows[0];
   });
@@ -996,9 +1012,9 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
     'Punto de venta (Bs)': cierre.punto_venta_bs.toFixed(2),
     'Total (Bs)': cierre.total_cierre_bs.toFixed(2),
     'Tasa del día': cierre.tasa_dolar.toFixed(4),
-    'Dólares vendidos': cierre.dolares_vendidos.toFixed(2),
     'Ingreso total (USD)': cierre.total_ingreso_dolar.toFixed(2),
     'Impuestos (Bs)': cierre.impuestos_fiscales_bs.toFixed(2),
+    'Costos operativos (USD)': cierre.costos_operativos_usd.toFixed(2),
     'Costos operativos (Bs)': cierre.costos_operativos_bs.toFixed(2),
   });
   res.status(201).json({ cierre });
@@ -1013,11 +1029,12 @@ app.put('/api/caja/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
     if (!rows[0]) throw new HttpError(404, 'Cierre no encontrado');
     const r = await c.query(
       `UPDATE cierres_caja SET pago_movil_bs=$2, efectivo_bs=$3, punto_venta_bs=$4, total_cierre_bs=$5,
-              tasa_dolar=$6, dolares_vendidos=$7, total_ingreso_dolar=$8,
-              impuestos_fiscales_bs=$9, costos_operativos_bs=$10, observacion=$11
+              tasa_dolar=$6, dolares_vendidos=0, total_ingreso_dolar=$7,
+              impuestos_fiscales_bs=$8, costos_operativos_usd=$9, costos_operativos_bs=$10,
+              observacion=$11
        WHERE id=$1 RETURNING *`,
-      [id, m.pagoMovil, m.efectivo, m.punto, m.totalBs, m.tasa, m.dolares, m.totalUsd,
-        m.impuestos, m.costos, obs || null],
+      [id, m.pagoMovil, m.efectivo, m.punto, m.totalBs, m.tasa, m.totalUsd,
+        m.impuestos, m.costosUsd, m.costosBs, obs || null],
     );
     return r.rows[0];
   });
@@ -1033,9 +1050,19 @@ const accesoProveedores = (req, res, next) => {
   return next(new HttpError(403, 'No tiene acceso a los proveedores'));
 };
 
+/**
+ * Con ?tipo=agua o ?tipo=mercancia devuelve sólo los de ese rubro, más los
+ * marcados como "ambos". Así al registrar agua no aparecen los de mercancía.
+ */
 app.get('/api/proveedores', autenticar, accesoProveedores, asyncH(async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM proveedores WHERE activo ORDER BY nombre');
-  res.json({ proveedores: rows, tipos: TIPOS_PROVEEDOR });
+  const tipo = req.query.tipo ? unoDe(req.query.tipo, ['agua', 'mercancia'], 'tipo') : null;
+  const { rows } = await pool.query(
+    `SELECT * FROM proveedores
+      WHERE activo AND ($1::text IS NULL OR tipo = $1 OR tipo = 'ambos')
+      ORDER BY nombre`,
+    [tipo],
+  );
+  res.json({ proveedores: rows, tipos: TIPOS_PROVEEDOR, filtrado_por: tipo });
 }));
 
 app.post('/api/proveedores', autenticar, accesoProveedores, asyncH(async (req, res) => {
@@ -1082,9 +1109,14 @@ app.get('/api/productos', autenticar, (req, res, next) => {
   const { rows } = await pool.query(
     `SELECT p.*, pr.nombre AS proveedor FROM productos p
        LEFT JOIN proveedores pr ON pr.id = p.proveedor_habitual_id
-      WHERE p.activo ORDER BY p.nombre`,
+      WHERE p.activo ORDER BY p.subcategoria NULLS FIRST, p.nombre`,
   );
-  res.json({ productos: rows, categorias: CATEGORIAS_PRODUCTO, empaquetados: EMPAQUETADOS });
+  res.json({
+    productos: rows,
+    categorias: CATEGORIAS_PRODUCTO,
+    empaquetados: EMPAQUETADOS,
+    subcategorias: SUBCATEGORIAS,
+  });
 }));
 
 /* Se puede crear un producto desde Recepción o desde una solicitud de productos */
@@ -1093,12 +1125,15 @@ app.post('/api/productos', autenticar, (req, res, next) => {
   return next(new HttpError(403, 'No tiene acceso para registrar productos'));
 }, asyncH(async (req, res) => {
   const b = req.body || {};
+  const categoria = unoDe(b.categoria, CATEGORIAS_PRODUCTO, 'Categoría');
   const { rows } = await pool.query(
     `INSERT INTO productos
-       (nombre, categoria, proveedor_habitual_id, sku, empaquetado, unidades_por_empaquetado, precio_usd, stock)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+       (nombre, categoria, subcategoria, proveedor_habitual_id, sku,
+        empaquetado, unidades_por_empaquetado, precio_usd, stock)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
     [texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 120 }),
-      unoDe(b.categoria, CATEGORIAS_PRODUCTO, 'Categoría'),
+      categoria,
+      leerSubcategoria(b.subcategoria, categoria),
       entero(b.proveedor_habitual_id, 'Proveedor', { min: 1, requerido: false }),
       texto(b.sku, 'SKU', { max: 40 }) || null,
       unoDe(b.empaquetado === undefined ? 'caja' : b.empaquetado, EMPAQUETADOS, 'Empaquetado'),
@@ -1113,20 +1148,30 @@ app.put('/api/productos/:id', autenticar, soloAdmin, asyncH(async (req, res) => 
   const id = entero(req.params.id, 'id', { min: 1 });
   const b = req.body || {};
   const producto = await withTx(async (c) => {
-    const { rows } = await c.query('SELECT id FROM productos WHERE id = $1 FOR UPDATE', [id]);
-    if (!rows[0]) throw new HttpError(404, 'Producto no encontrado');
+    const { rows } = await c.query('SELECT * FROM productos WHERE id = $1 FOR UPDATE', [id]);
+    const actual = rows[0];
+    if (!actual) throw new HttpError(404, 'Producto no encontrado');
+    const categoria = unoDe(b.categoria, CATEGORIAS_PRODUCTO, 'Categoría');
+
+    // Lo que el formulario no envía se conserva: el precio ya no se edita
+    // desde la aplicación, pero no debe perderse al guardar otros campos.
+    const precio = b.precio_usd === undefined ? actual.precio_usd : monto(b.precio_usd, 'Precio USD');
+    const sku = b.sku === undefined ? actual.sku : (texto(b.sku, 'SKU', { max: 40 }) || null);
+
     const r = await c.query(
       `UPDATE productos SET nombre=$2, categoria=$3, proveedor_habitual_id=$4, sku=$5,
-              empaquetado=$6, unidades_por_empaquetado=$7, precio_usd=$8, stock=$9, activo=$10
+              empaquetado=$6, unidades_por_empaquetado=$7, precio_usd=$8, stock=$9, activo=$10,
+              subcategoria=$11
         WHERE id=$1 RETURNING *`,
       [id, texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 120 }),
-        unoDe(b.categoria, CATEGORIAS_PRODUCTO, 'Categoría'),
+        categoria,
         entero(b.proveedor_habitual_id, 'Proveedor', { min: 1, requerido: false }),
-        texto(b.sku, 'SKU', { max: 40 }) || null,
+        sku,
         unoDe(b.empaquetado, EMPAQUETADOS, 'Empaquetado'),
         entero(b.unidades_por_empaquetado, 'Unidades por empaque', { min: 1, max: 100000 }),
-        monto(b.precio_usd, 'Precio USD'), monto(b.stock, 'Stock'),
-        b.activo === undefined ? true : Boolean(b.activo)],
+        precio, monto(b.stock, 'Stock'),
+        b.activo === undefined ? true : Boolean(b.activo),
+        leerSubcategoria(b.subcategoria, categoria)],
     );
     return r.rows[0];
   });
@@ -1450,6 +1495,7 @@ const COLS_SUMA = `
   COALESCE(SUM(dolares_vendidos), 0)::numeric(16,2)      AS dolares_vendidos,
   COALESCE(SUM(total_ingreso_dolar), 0)::numeric(16,2)   AS total_usd,
   COALESCE(SUM(impuestos_fiscales_bs), 0)::numeric(16,2) AS impuestos_bs,
+  COALESCE(SUM(costos_operativos_usd), 0)::numeric(16,2) AS costos_usd,
   COALESCE(SUM(costos_operativos_bs), 0)::numeric(16,2)  AS costos_bs,
   COALESCE(SUM(total_cierre_bs - impuestos_fiscales_bs - costos_operativos_bs), 0)::numeric(16,2) AS neto_bs,
   ROUND(AVG(tasa_dolar), 4)                              AS tasa_promedio,

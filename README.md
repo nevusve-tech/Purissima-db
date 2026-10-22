@@ -23,6 +23,7 @@ Al terminar queda un único usuario: se entra con `Master` y PIN `123456`. **Cam
 |---|---|
 | `migracion_002_tanda1.sql` | `usuario` de ingreso, `apellido` y `estado` en la tabla de usuarios |
 | `migracion_003_tanda2.sql` | anulación de reportes, empaquetado de productos, proveedor en solicitudes y permisos de solicitudes separados |
+| `migracion_004_tanda3.sql` | subcategorías de mercancía y costos operativos del cierre en dólares |
 
 ## Paso 2: arranque local
 
@@ -52,7 +53,7 @@ El build compila el frontend e instala el backend en los servidores de Render.
 | `motos` | `tipo_modelo`: `sbr_150cc`, `carguera_200cc` u `otro`. CHECK: el km del último aceite nunca supera el kilometraje |
 | `checklist_motos` | un único checklist por moto y día, con índice único sobre la fecha local de Caracas |
 | `cierres_caja` | un único cierre por fecha. Incluye tasa del día, dólares vendidos, impuestos y costos operativos |
-| `productos` | `empaquetado` (`caja`, `gavera` o `brazo`) y `unidades_por_empaquetado`: los pedidos se hacen por bulto, no por unidad suelta |
+| `productos` | `empaquetado` (`caja`, `gavera` o `brazo`) y `unidades_por_empaquetado`: los pedidos se hacen por bulto, no por unidad suelta. `subcategoria` (`bebidas`, `snacks`, `artesanales`, `insumos_agua`) es obligatoria cuando la categoría es mercancía |
 | `solicitudes`, `incidencias` | con estado, tipo y notas del Master, para los reportes operativos |
 | los seis registros | `anulado`, `anulado_por`, `anulado_en` y `motivo_anulacion`. Los índices únicos de checklist y caja son **parciales** (`WHERE NOT anulado`), así que anular libera el día |
 
@@ -63,7 +64,8 @@ Las claves primarias son UUID en las tablas de movimiento (checklist, caja, entr
 - **Seguridad**: JWT HS256 firmado a mano con `crypto.createHmac` y comparado con `timingSafeEqual`; límite de 10 intentos por IP; bloqueo de 15 minutos por usuario; hash de relleno para igualar tiempos cuando el usuario no existe; payload máximo 50 kb; `trust proxy`; PIN con Bcrypt vía `crypt()` de pgcrypto.
 - **Permisos dinámicos**: `modulos_permitidos` se relee de la base en cada petición, nunca del token, así que quitar un permiso surte efecto de inmediato. El menú del frontend se construye desde ese arreglo; el Master añade Reportes, Finanzas y Accesos.
 - **Transaccionalidad**: `BEGIN/COMMIT/ROLLBACK` con `FOR UPDATE` en motos, caja y stock. El cierre de caja usa además `pg_advisory_xact_lock` y el índice único por fecha.
-- **Contabilidad**: `redondearMoneda` corrige el error de punto flotante IEEE 754. `total_cierre_bs` debe cuadrar al centavo con pago móvil + efectivo + punto, validado en la API y por un CHECK en la base. `total_ingreso_dolar` se calcula en el servidor como `total_cierre_bs / tasa_dolar + dolares_vendidos`. La tasa se guarda con 4 decimales.
+- **Contabilidad**: `redondearMoneda` corrige el error de punto flotante IEEE 754. `total_cierre_bs` debe cuadrar al centavo con pago móvil + efectivo + punto, validado en la API y por un CHECK en la base. `total_ingreso_dolar` se calcula en el servidor como `total_cierre_bs / tasa_dolar`. Los costos operativos se escriben en dólares y su equivalente en bolívares (`USD × tasa`) es lo que resta al neto. La tasa se guarda con 4 decimales.
+- **Proveedores por rubro**: los de agua sólo aparecen al registrar o pedir agua, los de mercancía sólo en mercancía, y los marcados como "ambos" en las dos.
 - **Checklists**: listas exactas por `tipo_modelo`, validadas en el servidor. Una falla genera automáticamente una incidencia de tipo `moto` con severidad alta y dispara un correo.
 - **Reporte de motos** (solo Master): historial por moto de checklists, cambios de aceite e incidencias, con un aviso al entrar si hay incidencias sin cerrar, puntos marcados como negativos en los últimos 30 días o el cambio de aceite vencido (umbral `KM_AVISO_ACEITE`, por defecto 3000 km).
 - **Cuentas**: el Master puede editar los datos de un empleado, pausarlo (sin acceso temporal) o quitarle el acceso de forma permanente. En ningún caso se borra su historial de gestión.

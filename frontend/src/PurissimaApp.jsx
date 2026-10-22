@@ -45,6 +45,25 @@ const TIPOS_SOLICITUD = [...TIPOS_SOLICITUD_PRODUCTOS, ...TIPOS_SOLICITUD_NEGOCI
 
 /* Los productos se piden por bulto */
 const EMPAQUETADOS = [['caja', 'Caja'], ['gavera', 'Gavera'], ['brazo', 'Brazo']];
+/* Subcategorías dentro de "mercancía", para describirla mejor */
+const SUBCATEGORIAS = [
+  ['bebidas', 'Bebidas'], ['snacks', 'Snacks'],
+  ['artesanales', 'Artesanales'], ['insumos_agua', 'Insumos de agua'],
+];
+/* Un proveedor de agua no debe aparecer al registrar mercancía, ni al revés */
+const filtrarProveedores = (lista, tipo) =>
+  (lista || []).filter((p) => p.tipo === tipo || p.tipo === 'ambos');
+
+/* La lista de productos se agrupa por subcategoría para que no sea una lista plana */
+function agruparProductos(productos) {
+  const texto = (p) => `${p.nombre} — ${etiquetaDe(EMPAQUETADOS, p.empaquetado)} de ${p.unidades_por_empaquetado}`;
+  const grupos = SUBCATEGORIAS
+    .map(([v, l]) => [l, (productos || []).filter((p) => p.subcategoria === v).map((p) => [String(p.id), texto(p)])])
+    .filter(([, items]) => items.length > 0);
+  const otros = (productos || []).filter((p) => !p.subcategoria).map((p) => [String(p.id), texto(p)]);
+  if (otros.length) grupos.push(['Otros', otros]);
+  return grupos;
+}
 const EMPAQUETADO_PLURAL = { caja: 'cajas', gavera: 'gaveras', brazo: 'brazos' };
 const ESTADOS_SOLICITUD = ['pendiente', 'aprobada', 'en_proceso', 'completada', 'rechazada'];
 
@@ -164,11 +183,17 @@ function Campo({ etiqueta, children }) {
   );
 }
 
-function Select({ valor, onChange, opciones, vacio, ...rest }) {
+function Select({ valor, onChange, opciones, grupos, vacio, ...rest }) {
   return (
     <select className="campo" value={valor} onChange={(e) => onChange(e.target.value)} {...rest}>
       {vacio !== undefined && <option value="">{vacio}</option>}
-      {opciones.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+      {grupos
+        ? grupos.map(([etiqueta, items]) => (
+          <optgroup key={etiqueta} label={etiqueta}>
+            {items.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+          </optgroup>
+        ))
+        : (opciones || []).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
     </select>
   );
 }
@@ -512,7 +537,7 @@ function VistaCaja({ usuario, call, aviso }) {
   const [historial, setHistorial] = useState([]);
   const [f, setF] = useState({
     pago_movil_bs: '', efectivo_bs: '', punto_venta_bs: '', tasa_dolar: '',
-    dolares_vendidos: '', impuestos_fiscales_bs: '', costos_operativos_bs: '', observacion: '',
+    impuestos_fiscales_bs: '', costos_operativos_usd: '', observacion: '',
   });
   const [enviando, setEnviando] = useState(false);
 
@@ -535,12 +560,17 @@ function VistaCaja({ usuario, call, aviso }) {
   );
   const tasa = redondearTasa(f.tasa_dolar);
   const totalUsd = useMemo(
-    () => (tasa > 0 ? redondear(redondear(totalBs / tasa) + redondear(f.dolares_vendidos)) : 0),
-    [totalBs, tasa, f.dolares_vendidos],
+    () => (tasa > 0 ? redondear(totalBs / tasa) : 0),
+    [totalBs, tasa],
+  );
+  // Los costos se escriben en dólares; su equivalente en bolívares es lo que resta al neto
+  const costosBs = useMemo(
+    () => (tasa > 0 ? redondear(redondear(f.costos_operativos_usd) * tasa) : 0),
+    [tasa, f.costos_operativos_usd],
   );
   const netoBs = useMemo(
-    () => redondear(totalBs - redondear(f.impuestos_fiscales_bs) - redondear(f.costos_operativos_bs)),
-    [totalBs, f.impuestos_fiscales_bs, f.costos_operativos_bs],
+    () => redondear(totalBs - redondear(f.impuestos_fiscales_bs) - costosBs),
+    [totalBs, f.impuestos_fiscales_bs, costosBs],
   );
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
 
@@ -558,10 +588,9 @@ function VistaCaja({ usuario, call, aviso }) {
           punto_venta_bs: redondear(f.punto_venta_bs),
           total_cierre_bs: totalBs,
           tasa_dolar: tasa,
-          dolares_vendidos: redondear(f.dolares_vendidos),
           total_ingreso_dolar: totalUsd,
           impuestos_fiscales_bs: redondear(f.impuestos_fiscales_bs),
-          costos_operativos_bs: redondear(f.costos_operativos_bs),
+          costos_operativos_usd: redondear(f.costos_operativos_usd),
           observacion: f.observacion,
         },
       });
@@ -589,10 +618,10 @@ function VistaCaja({ usuario, call, aviso }) {
           <p className="text-lg">Total: <b>{fmtBs(c.total_cierre_bs)}</b></p>
           <hr className="my-1" />
           <p>Tasa del día: <b>{fmtTasa(c.tasa_dolar)}</b></p>
-          <p>Dólares vendidos: <b>{fmtUsd(c.dolares_vendidos)}</b></p>
           <p>Ingreso total: <b>{fmtUsd(c.total_ingreso_dolar)}</b></p>
           <p>Impuestos: <b>{fmtBs(c.impuestos_fiscales_bs)}</b></p>
-          <p>Costos operativos: <b>{fmtBs(c.costos_operativos_bs)}</b></p>
+          <p>Costos operativos: <b>{fmtUsd(c.costos_operativos_usd)}</b> <span className="text-slate-500">({fmtBs(c.costos_operativos_bs)})</span></p>
+          <p>Neto en Bs: <b>{fmtBs(redondear(c.total_cierre_bs - c.impuestos_fiscales_bs - c.costos_operativos_bs))}</b></p>
           {c.observacion && <p className="text-sm text-slate-600">Nota: {c.observacion}</p>}
           <p className="text-sm text-slate-500">Registrado por {c.usuario}</p>
         </div>
@@ -609,15 +638,21 @@ function VistaCaja({ usuario, call, aviso }) {
           <Campo etiqueta="Tasa del dólar del día (obligatoria)">
             <NumInput value={f.tasa_dolar} onChange={set('tasa_dolar')} placeholder="0.0000" required />
           </Campo>
-          <Campo etiqueta="Dólares vendidos (USD)"><NumInput value={f.dolares_vendidos} onChange={set('dolares_vendidos')} placeholder="0.00" /></Campo>
           <div className="rounded-xl bg-emerald-50 border border-emerald-200 p-3">
             <p className="text-sm text-slate-600">Ingreso total en dólares (calculado)</p>
             <p className="text-xl font-extrabold text-emerald-800">{fmtUsd(totalUsd)}</p>
-            <p className="text-xs text-slate-500">Total Bs ÷ tasa + dólares vendidos</p>
+            <p className="text-xs text-slate-500">Total Bs ÷ tasa del día</p>
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <Campo etiqueta="Impuestos (Bs)"><NumInput value={f.impuestos_fiscales_bs} onChange={set('impuestos_fiscales_bs')} placeholder="0.00" /></Campo>
-            <Campo etiqueta="Costos oper. (Bs)"><NumInput value={f.costos_operativos_bs} onChange={set('costos_operativos_bs')} placeholder="0.00" /></Campo>
+          <Campo etiqueta="Impuestos fiscales (Bs)">
+            <NumInput value={f.impuestos_fiscales_bs} onChange={set('impuestos_fiscales_bs')} placeholder="0.00" />
+          </Campo>
+          <Campo etiqueta="Costos operativos (USD)">
+            <NumInput value={f.costos_operativos_usd} onChange={set('costos_operativos_usd')} placeholder="0.00" />
+          </Campo>
+          <div className="rounded-xl bg-slate-50 border border-slate-200 p-3">
+            <p className="text-sm text-slate-600">Equivalen a</p>
+            <p className="text-lg font-bold text-slate-800">{fmtBs(costosBs)}</p>
+            <p className="text-xs text-slate-500">Costos en $ × tasa del día</p>
           </div>
           <div className="rounded-xl bg-slate-50 border border-slate-200 p-3">
             <p className="text-sm text-slate-600">Neto en Bs (total − impuestos − costos)</p>
@@ -709,9 +744,9 @@ function VistaRecepcion({ usuario, call, aviso }) {
 }
 
 /** Botón simple para quien no es Master: agregar un proveedor que falte en la lista. */
-function AgregarProveedorRapido({ call, aviso, onListo }) {
+function AgregarProveedorRapido({ call, aviso, onListo, tipoPorDefecto = 'ambos' }) {
   const [abierto, setAbierto] = useState(false);
-  const [f, setF] = useState({ nombre: '', tipo: 'ambos', telefono: '' });
+  const [f, setF] = useState({ nombre: '', tipo: tipoPorDefecto, telefono: '' });
   const [enviando, setEnviando] = useState(false);
 
   const enviar = async (e) => {
@@ -720,7 +755,7 @@ function AgregarProveedorRapido({ call, aviso, onListo }) {
     try {
       await call('/api/proveedores', { method: 'POST', body: f });
       aviso('Proveedor agregado', 'ok');
-      setF({ nombre: '', tipo: 'ambos', telefono: '' });
+      setF({ nombre: '', tipo: tipoPorDefecto, telefono: '' });
       setAbierto(false);
       onListo();
     } catch (err) {
@@ -801,16 +836,16 @@ function EntradaAgua({ call, aviso, datos, onListo, esAdmin }) {
     <div className="space-y-4">
       <form onSubmit={enviar} className="card space-y-3">
         <Campo etiqueta="Litros recibidos"><NumInput value={litraje} onChange={setLitraje} required placeholder="0" /></Campo>
-        <Campo etiqueta="Proveedor (obligatorio)">
+        <Campo etiqueta="Proveedor de agua (obligatorio)">
           <Select
             valor={proveedor}
             onChange={setProveedor}
-            opciones={datos.proveedores.map((p) => [String(p.id), p.nombre])}
+            opciones={filtrarProveedores(datos.proveedores, 'agua').map((p) => [String(p.id), p.nombre])}
             vacio="Seleccione…"
             required
           />
         </Campo>
-        {!esAdmin && <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} />}
+        {!esAdmin && <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} tipoPorDefecto="agua" />}
         <Campo etiqueta="Observaciones (opcional)">
           <textarea className="campo" rows={2} maxLength={500} value={obs} onChange={(e) => setObs(e.target.value)} />
         </Campo>
@@ -887,16 +922,16 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
   return (
     <div className="space-y-4">
       <form onSubmit={enviar} className="card space-y-3">
-        <Campo etiqueta="Proveedor (obligatorio)">
+        <Campo etiqueta="Proveedor de mercancía (obligatorio)">
           <Select
             valor={proveedor}
             onChange={setProveedor}
-            opciones={datos.proveedores.map((p) => [String(p.id), p.nombre])}
+            opciones={filtrarProveedores(datos.proveedores, 'mercancia').map((p) => [String(p.id), p.nombre])}
             vacio="Seleccione…"
             required
           />
         </Campo>
-        {!esAdmin && <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} />}
+        {!esAdmin && <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} tipoPorDefecto="mercancia" />}
         {filas.map((f, i) => (
           <div key={i} className="rounded-xl border border-slate-200 p-3 space-y-2">
             <Campo etiqueta={`Producto ${i + 1}`}>
@@ -949,8 +984,9 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
 function Catalogo({ call, aviso, datos, onListo }) {
   const [prov, setProv] = useState({ nombre: '', tipo: 'ambos', contacto: '', rif: '', telefono: '' });
   const [prod, setProd] = useState({
-    nombre: '', categoria: 'mercancia', empaquetado: 'caja', unidades_por_empaquetado: '1',
-    precio_usd: '', stock: '', proveedor_habitual_id: '',
+    nombre: '', categoria: 'mercancia', subcategoria: 'bebidas',
+    empaquetado: 'caja', unidades_por_empaquetado: '1',
+    stock: '', proveedor_habitual_id: '',
   });
   const [guardando, setGuardando] = useState(false);
 
@@ -995,20 +1031,26 @@ function Catalogo({ call, aviso, datos, onListo }) {
           guardar('/api/productos', {
             nombre: prod.nombre,
             categoria: prod.categoria,
+            subcategoria: prod.subcategoria,
             empaquetado: prod.empaquetado,
             unidades_por_empaquetado: Number(prod.unidades_por_empaquetado || 1),
-            precio_usd: Number(prod.precio_usd || 0),
             stock: Number(prod.stock || 0),
             proveedor_habitual_id: prod.proveedor_habitual_id ? Number(prod.proveedor_habitual_id) : undefined,
           }, () => setProd({
-            nombre: '', categoria: 'mercancia', empaquetado: 'caja', unidades_por_empaquetado: '1',
-            precio_usd: '', stock: '', proveedor_habitual_id: '',
+            nombre: '', categoria: 'mercancia', subcategoria: 'bebidas',
+            empaquetado: 'caja', unidades_por_empaquetado: '1',
+            stock: '', proveedor_habitual_id: '',
           }));
         }}
       >
         <h3 className="font-bold">Nuevo producto</h3>
         <Campo etiqueta="Nombre"><input className="campo" value={prod.nombre} onChange={(e) => setProd({ ...prod, nombre: e.target.value })} required minLength={2} /></Campo>
         <Campo etiqueta="Categoría"><Select valor={prod.categoria} onChange={(v) => setProd({ ...prod, categoria: v })} opciones={CATEGORIAS_PRODUCTO} /></Campo>
+        {prod.categoria === 'mercancia' && (
+          <Campo etiqueta="Tipo de mercancía">
+            <Select valor={prod.subcategoria} onChange={(v) => setProd({ ...prod, subcategoria: v })} opciones={SUBCATEGORIAS} />
+          </Campo>
+        )}
         <div className="grid grid-cols-2 gap-2">
           <Campo etiqueta="Viene en">
             <Select valor={prod.empaquetado} onChange={(v) => setProd({ ...prod, empaquetado: v })} opciones={EMPAQUETADOS} />
@@ -1016,7 +1058,6 @@ function Catalogo({ call, aviso, datos, onListo }) {
           <Campo etiqueta="Unidades por empaque">
             <NumInput value={prod.unidades_por_empaquetado} onChange={(v) => setProd({ ...prod, unidades_por_empaquetado: v })} step="1" />
           </Campo>
-          <Campo etiqueta="Precio USD"><NumInput value={prod.precio_usd} onChange={(v) => setProd({ ...prod, precio_usd: v })} /></Campo>
           <Campo etiqueta="Stock inicial"><NumInput value={prod.stock} onChange={(v) => setProd({ ...prod, stock: v })} /></Campo>
         </div>
         <Campo etiqueta="Proveedor habitual">
@@ -1053,9 +1094,9 @@ function ProductoEditable({ producto, datos, call, aviso, onListo }) {
   const [f, setF] = useState({
     nombre: producto.nombre,
     categoria: producto.categoria,
+    subcategoria: producto.subcategoria || 'bebidas',
     empaquetado: producto.empaquetado,
     unidades_por_empaquetado: String(producto.unidades_por_empaquetado),
-    precio_usd: String(producto.precio_usd),
     stock: String(producto.stock),
     proveedor_habitual_id: producto.proveedor_habitual_id ? String(producto.proveedor_habitual_id) : '',
     activo: producto.activo,
@@ -1070,7 +1111,6 @@ function ProductoEditable({ producto, datos, call, aviso, onListo }) {
         body: {
           ...f,
           unidades_por_empaquetado: Number(f.unidades_por_empaquetado || 1),
-          precio_usd: Number(f.precio_usd || 0),
           stock: Number(f.stock || 0),
           proveedor_habitual_id: f.proveedor_habitual_id ? Number(f.proveedor_habitual_id) : undefined,
         },
@@ -1113,15 +1153,17 @@ function ProductoEditable({ producto, datos, call, aviso, onListo }) {
       <Campo etiqueta="Categoría">
         <Select valor={f.categoria} onChange={(v) => setF({ ...f, categoria: v })} opciones={CATEGORIAS_PRODUCTO} />
       </Campo>
+      {f.categoria === 'mercancia' && (
+        <Campo etiqueta="Tipo de mercancía">
+          <Select valor={f.subcategoria} onChange={(v) => setF({ ...f, subcategoria: v })} opciones={SUBCATEGORIAS} />
+        </Campo>
+      )}
       <div className="grid grid-cols-2 gap-2">
         <Campo etiqueta="Viene en">
           <Select valor={f.empaquetado} onChange={(v) => setF({ ...f, empaquetado: v })} opciones={EMPAQUETADOS} />
         </Campo>
         <Campo etiqueta="Unidades por empaque">
           <NumInput value={f.unidades_por_empaquetado} onChange={(v) => setF({ ...f, unidades_por_empaquetado: v })} step="1" />
-        </Campo>
-        <Campo etiqueta="Precio USD">
-          <NumInput value={f.precio_usd} onChange={(v) => setF({ ...f, precio_usd: v })} />
         </Campo>
         <Campo etiqueta="Stock">
           <NumInput value={f.stock} onChange={(v) => setF({ ...f, stock: v })} />
@@ -1296,7 +1338,8 @@ function SelloAnulado({ registro }) {
 function AgregarProductoRapido({ call, aviso, onListo }) {
   const [abierto, setAbierto] = useState(false);
   const [f, setF] = useState({
-    nombre: '', categoria: 'mercancia', empaquetado: 'caja', unidades_por_empaquetado: '1',
+    nombre: '', categoria: 'mercancia', subcategoria: 'bebidas',
+    empaquetado: 'caja', unidades_por_empaquetado: '1',
   });
   const [enviando, setEnviando] = useState(false);
 
@@ -1308,7 +1351,10 @@ function AgregarProductoRapido({ call, aviso, onListo }) {
         body: { ...f, unidades_por_empaquetado: Number(f.unidades_por_empaquetado || 1) },
       });
       aviso('Producto agregado al catálogo', 'ok');
-      setF({ nombre: '', categoria: 'mercancia', empaquetado: 'caja', unidades_por_empaquetado: '1' });
+      setF({
+        nombre: '', categoria: 'mercancia', subcategoria: 'bebidas',
+        empaquetado: 'caja', unidades_por_empaquetado: '1',
+      });
       setAbierto(false);
       onListo();
     } catch (err) {
@@ -1338,6 +1384,11 @@ function AgregarProductoRapido({ call, aviso, onListo }) {
       <Campo etiqueta="Categoría">
         <Select valor={f.categoria} onChange={(v) => setF({ ...f, categoria: v })} opciones={CATEGORIAS_PRODUCTO} />
       </Campo>
+      {f.categoria === 'mercancia' && (
+        <Campo etiqueta="Tipo de mercancía">
+          <Select valor={f.subcategoria} onChange={(v) => setF({ ...f, subcategoria: v })} opciones={SUBCATEGORIAS} />
+        </Campo>
+      )}
       <div className="grid grid-cols-2 gap-2">
         <Campo etiqueta="Viene en">
           <Select valor={f.empaquetado} onChange={(v) => setF({ ...f, empaquetado: v })} opciones={EMPAQUETADOS} />
@@ -1596,10 +1647,7 @@ function FormSolicitudMercancia({ datos, call, aviso, onListo }) {
               <Select
                 valor={f.producto_id}
                 onChange={(v) => setFila(i, 'producto_id', v)}
-                opciones={datos.productos.map((x) => [
-                  String(x.id),
-                  `${x.nombre} — ${etiquetaDe(EMPAQUETADOS, x.empaquetado)} de ${x.unidades_por_empaquetado}`,
-                ])}
+                grupos={agruparProductos(datos.productos)}
                 vacio="Seleccione…"
                 required
               />
@@ -1679,16 +1727,16 @@ function FormSolicitudAgua({ datos, call, aviso, onListo }) {
       <Campo etiqueta="Litros a solicitar">
         <NumInput value={litraje} onChange={setLitraje} required placeholder="0" />
       </Campo>
-      <Campo etiqueta="Proveedor (obligatorio)">
+      <Campo etiqueta="Proveedor de agua (obligatorio)">
         <Select
           valor={proveedor}
           onChange={setProveedor}
-          opciones={datos.proveedores.map((p) => [String(p.id), p.nombre])}
+          opciones={filtrarProveedores(datos.proveedores, 'agua').map((p) => [String(p.id), p.nombre])}
           vacio="Seleccione…"
           required
         />
       </Campo>
-      <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} />
+      <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} tipoPorDefecto="agua" />
       <Campo etiqueta="Nota (opcional)">
         <textarea className="campo" rows={2} maxLength={2000} value={descripcion} onChange={(e) => setDescripcion(e.target.value)} />
       </Campo>
@@ -2243,7 +2291,7 @@ function TablaPeriodos({ filas, formato }) {
             <span>Punto: {fmtBs(r.punto_venta_bs)}</span>
             <span>Dólares: {fmtUsd(r.total_usd)}</span>
             <span>Impuestos: {fmtBs(r.impuestos_bs)}</span>
-            <span>Costos: {fmtBs(r.costos_bs)}</span>
+            <span>Costos: {fmtUsd(r.costos_usd)}</span>
           </div>
           <div className="flex justify-between mt-1 pt-1 border-t border-slate-100">
             <span className="text-slate-500">Neto</span>
@@ -2299,9 +2347,8 @@ function VistaFinanzas({ call, aviso }) {
             <Tarjeta titulo="Pago móvil" valor={fmtBs(t.pago_movil_bs)} />
             <Tarjeta titulo="Efectivo" valor={fmtBs(t.efectivo_bs)} />
             <Tarjeta titulo="Punto de venta" valor={fmtBs(t.punto_venta_bs)} />
-            <Tarjeta titulo="Dólares vendidos" valor={fmtUsd(t.dolares_vendidos)} />
             <Tarjeta titulo="Impuestos fiscales" valor={fmtBs(t.impuestos_bs)} />
-            <Tarjeta titulo="Costos operativos" valor={fmtBs(t.costos_bs)} />
+            <Tarjeta titulo="Costos operativos" valor={fmtUsd(t.costos_usd)} nota={`${fmtBs(t.costos_bs)} a la tasa de cada día`} />
           </div>
           <div className="grid grid-cols-2 gap-3">
             <Tarjeta titulo="Neto en Bs" valor={fmtBs(t.neto_bs)} nota="Total − impuestos − costos" />
