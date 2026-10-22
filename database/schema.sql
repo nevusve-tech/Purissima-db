@@ -130,9 +130,7 @@ CREATE TABLE checklist_motos (
     NOT tiene_falla OR (observacion_falla IS NOT NULL AND length(trim(observacion_falla)) > 0)
   )
 );
--- timezone(text, timestamptz) es IMMUTABLE, así que sirve en un índice
-CREATE UNIQUE INDEX ux_checklist_moto_dia
-  ON checklist_motos (moto_id, ((fecha AT TIME ZONE 'America/Caracas')::date));
+-- El índice único por día se crea más abajo, junto con la anulación
 CREATE INDEX ix_checklist_fecha ON checklist_motos (fecha);
 CREATE INDEX ix_checklist_usuario ON checklist_motos (usuario_id);
 CREATE INDEX ix_checklist_falla ON checklist_motos (tiene_falla) WHERE tiene_falla;
@@ -158,7 +156,10 @@ CREATE TABLE productos (
                          CHECK (categoria IN ('mercancia', 'insumo_tienda', 'agua')),
   proveedor_habitual_id  integer       REFERENCES proveedores (id),
   sku                    varchar(40),
-  unidad                 varchar(20)   NOT NULL DEFAULT 'unidad',
+  -- Los productos se piden por bulto: caja, gavera (vidrio) o brazo (snacks)
+  empaquetado            varchar(10)   NOT NULL DEFAULT 'caja'
+                                       CHECK (empaquetado IN ('caja', 'gavera', 'brazo')),
+  unidades_por_empaquetado integer     NOT NULL DEFAULT 1 CHECK (unidades_por_empaquetado > 0),
   precio_usd             numeric(12,2) NOT NULL DEFAULT 0 CHECK (precio_usd >= 0),
   stock                  numeric(14,2) NOT NULL DEFAULT 0 CHECK (stock >= 0),
   activo                 boolean       NOT NULL DEFAULT TRUE
@@ -222,7 +223,7 @@ CREATE TABLE cierres_caja (
     total_cierre_bs = pago_movil_bs + efectivo_bs + punto_venta_bs
   )
 );
-CREATE UNIQUE INDEX ux_cierres_fecha ON cierres_caja (fecha);
+-- El índice único por fecha se crea más abajo, junto con la anulación
 CREATE INDEX ix_cierres_usuario ON cierres_caja (usuario_id);
 
 -- =====================================================================
@@ -241,10 +242,12 @@ CREATE TABLE solicitudes (
   estado          varchar(20)  NOT NULL DEFAULT 'pendiente' CHECK (estado IN
                                ('pendiente', 'aprobada', 'en_proceso', 'completada', 'rechazada')),
   notas_admin     text,
+  proveedor_id    integer      REFERENCES proveedores (id),
   fecha_hora      timestamptz  NOT NULL DEFAULT now(),
   actualizado_en  timestamptz  NOT NULL DEFAULT now()
 );
 CREATE INDEX ix_solicitudes_fecha ON solicitudes (fecha_hora);
+CREATE INDEX ix_solicitudes_proveedor ON solicitudes (proveedor_id);
 CREATE INDEX ix_solicitudes_usuario ON solicitudes (usuario_id);
 CREATE INDEX ix_solicitudes_estado ON solicitudes (estado);
 CREATE INDEX ix_solicitudes_tipo_estado ON solicitudes (tipo_solicitud, estado);
@@ -283,6 +286,35 @@ CREATE TRIGGER trg_incidencias_actualizado BEFORE UPDATE ON incidencias
   FOR EACH ROW EXECUTE FUNCTION set_actualizado_en();
 
 -- =====================================================================
+-- ANULACIÓN DE REPORTES (exclusiva del Master)
+--
+-- Un registro mal hecho no se borra: se marca como anulado, con quién lo
+-- anuló, cuándo y por qué. Deja de contar en los totales y libera el día
+-- para que se pueda rehacer.
+-- =====================================================================
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['checklist_motos', 'cierres_caja', 'entradas_agua',
+                           'entradas_mercancia', 'solicitudes', 'incidencias']
+  LOOP
+    EXECUTE format('ALTER TABLE %I ADD COLUMN anulado boolean NOT NULL DEFAULT false', t);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN anulado_por integer REFERENCES usuarios (id)', t);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN anulado_en timestamptz', t);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN motivo_anulacion text', t);
+    EXECUTE format('CREATE INDEX ix_%s_anulado ON %I (anulado) WHERE anulado', t, t);
+  END LOOP;
+END $$;
+
+-- Índices únicos PARCIALES: lo anulado deja de ocupar el lugar.
+-- timezone(text, timestamptz) es IMMUTABLE, así que sirve en un índice.
+CREATE UNIQUE INDEX ux_checklist_moto_dia
+  ON checklist_motos (moto_id, ((fecha AT TIME ZONE 'America/Caracas')::date))
+  WHERE NOT anulado;
+
+CREATE UNIQUE INDEX ux_cierres_fecha ON cierres_caja (fecha) WHERE NOT anulado;
+
+-- =====================================================================
 -- SEGURIDAD: cerrar la puerta de la API pública de Supabase
 --
 -- Supabase expone el esquema "public" por REST con las llaves anon y
@@ -316,4 +348,4 @@ END $$;
 -- =====================================================================
 INSERT INTO usuarios (usuario, nombre, apellido, rol, pin_hash, modulos_permitidos)
 VALUES ('Master', 'Master', '', 'admin', crypt('123456', gen_salt('bf', 10)),
-        '["motos","caja","recepcion","solicitudes","incidencias"]'::jsonb);
+        '["motos","caja","recepcion","solicitudes_negocio","solicitudes_productos","incidencias"]'::jsonb);

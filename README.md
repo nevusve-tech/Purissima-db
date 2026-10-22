@@ -22,6 +22,7 @@ Al terminar queda un único usuario: se entra con `Master` y PIN `123456`. **Cam
 | Archivo | Qué agrega |
 |---|---|
 | `migracion_002_tanda1.sql` | `usuario` de ingreso, `apellido` y `estado` en la tabla de usuarios |
+| `migracion_003_tanda2.sql` | anulación de reportes, empaquetado de productos, proveedor en solicitudes y permisos de solicitudes separados |
 
 ## Paso 2: arranque local
 
@@ -51,7 +52,9 @@ El build compila el frontend e instala el backend en los servidores de Render.
 | `motos` | `tipo_modelo`: `sbr_150cc`, `carguera_200cc` u `otro`. CHECK: el km del último aceite nunca supera el kilometraje |
 | `checklist_motos` | un único checklist por moto y día, con índice único sobre la fecha local de Caracas |
 | `cierres_caja` | un único cierre por fecha. Incluye tasa del día, dólares vendidos, impuestos y costos operativos |
+| `productos` | `empaquetado` (`caja`, `gavera` o `brazo`) y `unidades_por_empaquetado`: los pedidos se hacen por bulto, no por unidad suelta |
 | `solicitudes`, `incidencias` | con estado, tipo y notas del Master, para los reportes operativos |
+| los seis registros | `anulado`, `anulado_por`, `anulado_en` y `motivo_anulacion`. Los índices únicos de checklist y caja son **parciales** (`WHERE NOT anulado`), así que anular libera el día |
 
 Las claves primarias son UUID en las tablas de movimiento (checklist, caja, entradas, solicitudes, incidencias) y enteras en las de catálogo (usuarios, motos, proveedores, productos).
 
@@ -64,4 +67,6 @@ Las claves primarias son UUID en las tablas de movimiento (checklist, caja, entr
 - **Checklists**: listas exactas por `tipo_modelo`, validadas en el servidor. Una falla genera automáticamente una incidencia de tipo `moto` con severidad alta y dispara un correo.
 - **Reporte de motos** (solo Master): historial por moto de checklists, cambios de aceite e incidencias, con un aviso al entrar si hay incidencias sin cerrar, puntos marcados como negativos en los últimos 30 días o el cambio de aceite vencido (umbral `KM_AVISO_ACEITE`, por defecto 3000 km).
 - **Cuentas**: el Master puede editar los datos de un empleado, pausarlo (sin acceso temporal) o quitarle el acceso de forma permanente. En ningún caso se borra su historial de gestión.
+- **Anulación** (solo Master): un registro mal hecho no se borra. Se marca como anulado con quién, cuándo y por qué; deja de contar en los totales y libera el día o la fecha para rehacerlo. Aplica a checklists, cierres de caja, entradas de agua y mercancía, solicitudes e incidencias. Si al anular un checklist el kilometraje quedó mal, se corrige en la ficha de la moto, dentro del reporte de motos.
+- **Solicitudes separadas**: "del negocio" (insumos generales, mantenimiento, permisos) y "de productos" (mercancía, agua), cada una con su propio permiso. Las de mercancía se arman eligiendo productos del catálogo e indicando cuántos bultos; las de agua piden litraje y proveedor. En ambas se puede dar de alta un producto o un proveedor sin salir de la pantalla.
 - **API pública cerrada**: Supabase expone el esquema `public` por REST con las llaves `anon` y `authenticated`. El esquema activa RLS sin políticas y revoca privilegios a esos roles, así que la única vía de entrada es el backend (que conecta con el rol `postgres` y omite RLS). Sin esto, cualquiera con la llave pública podría leer la caja y los usuarios.

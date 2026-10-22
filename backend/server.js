@@ -40,8 +40,20 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
   console.warn('[aviso] JWT_SECRET no definido: se usa un secreto efímero (las sesiones se pierden al reiniciar).');
 }
 
-const MODULOS_VALIDOS = Object.freeze(['motos', 'caja', 'recepcion', 'solicitudes', 'incidencias']);
+const MODULOS_VALIDOS = Object.freeze([
+  'motos', 'caja', 'recepcion', 'solicitudes_negocio', 'solicitudes_productos', 'incidencias',
+]);
 const ESTADOS_USUARIO = Object.freeze(['activo', 'pausado', 'eliminado']);
+
+/* Registros que el Master puede anular, con el nombre de su tabla */
+const ANULABLES = Object.freeze({
+  checklist: 'checklist_motos',
+  caja: 'cierres_caja',
+  'entrada-agua': 'entradas_agua',
+  'entrada-mercancia': 'entradas_mercancia',
+  solicitud: 'solicitudes',
+  incidencia: 'incidencias',
+});
 
 /* Listas exactas e inmodificables, indexadas por motos.tipo_modelo */
 const CHECKLISTS = Object.freeze({
@@ -66,12 +78,19 @@ const CHECKLISTS = Object.freeze({
 const TIPOS_MOTO = Object.keys(CHECKLISTS);
 
 const TIPOS_SOLICITUD = ['mercancia', 'agua', 'insumos_generales', 'mantenimiento', 'permiso', 'otro'];
+/* Las solicitudes van en dos secciones separadas, cada una con su permiso */
+const TIPOS_SOLICITUD_PRODUCTOS = ['mercancia', 'agua'];
+const TIPOS_SOLICITUD_NEGOCIO = ['insumos_generales', 'mantenimiento', 'permiso', 'otro'];
+const moduloDeSolicitud = (tipo) =>
+  (TIPOS_SOLICITUD_PRODUCTOS.includes(tipo) ? 'solicitudes_productos' : 'solicitudes_negocio');
 const ESTADOS_SOLICITUD = ['pendiente', 'aprobada', 'en_proceso', 'completada', 'rechazada'];
 const TIPOS_INCIDENCIA = ['financiera_caja', 'cliente', 'operativa_tienda', 'moto', 'agua', 'seguridad', 'otro'];
 const ESTADOS_INCIDENCIA = ['abierta', 'en_revision', 'cerrada'];
 const SEVERIDADES = ['baja', 'media', 'alta'];
 const TIPOS_PROVEEDOR = ['agua', 'mercancia', 'ambos'];
 const CATEGORIAS_PRODUCTO = ['mercancia', 'insumo_tienda', 'agua'];
+/* Los productos se piden por bulto, no por unidad suelta */
+const EMPAQUETADOS = ['caja', 'gavera', 'brazo'];
 
 /* ------------------------------------------------------------------ */
 /* Base de datos                                                       */
@@ -92,9 +111,8 @@ const pool = new Pool({
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
 });
-pool.on('connect', (client) => {
-  client.query(`SET TIME ZONE '${TZ}'`).catch(() => {});
-});
+// La zona horaria se fija a nivel de base de datos (ALTER DATABASE ... SET timezone),
+// así que no hace falta ajustarla en cada conexión. Se comprueba al arrancar.
 pool.on('error', (err) => console.error('[pg] error en cliente inactivo:', err.message));
 
 async function withTx(fn) {
@@ -129,8 +147,16 @@ const COLUMNAS_REQUERIDAS = [
   ['cierres_caja', 'observacion'],
   ['productos', 'stock'],
   ['productos', 'precio_usd'],
-  ['productos', 'unidad'],
   ['proveedores', 'telefono'],
+  ['productos', 'empaquetado'],
+  ['productos', 'unidades_por_empaquetado'],
+  ['solicitudes', 'proveedor_id'],
+  ['checklist_motos', 'anulado'],
+  ['cierres_caja', 'anulado'],
+  ['entradas_agua', 'anulado'],
+  ['entradas_mercancia', 'anulado'],
+  ['solicitudes', 'anulado'],
+  ['incidencias', 'anulado'],
 ];
 
 async function verificarEsquema() {
@@ -148,7 +174,13 @@ async function verificarEsquema() {
     console.error('=============================================================\n');
     return false;
   }
-  console.log('[esquema] Verificado: todas las columnas requeridas están presentes.');
+  const { rows: tz } = await pool.query("SELECT current_setting('TimeZone') AS zona");
+  if (tz[0].zona !== TZ) {
+    console.error(`\n[esquema] AVISO: la base responde en zona "${tz[0].zona}" y no en ${TZ}.`);
+    console.error(`[esquema] Corrija con: ALTER DATABASE <base> SET timezone TO '${TZ}';\n`);
+  }
+
+  console.log(`[esquema] Verificado: columnas completas, zona horaria ${tz[0].zona}.`);
   return true;
 }
 
@@ -420,10 +452,20 @@ async function autenticar(req, res, next) {
 const soloAdmin = (req, res, next) =>
   (req.usuario.rol === 'admin' ? next() : next(new HttpError(403, 'Acceso exclusivo del Master')));
 
+const tieneModulo = (u, modulo) =>
+  u.rol === 'admin' || (Array.isArray(u.modulos_permitidos) && u.modulos_permitidos.includes(modulo));
+
 const requiereModulo = (modulo) => (req, res, next) => {
-  const u = req.usuario;
-  if (u.rol === 'admin' || (Array.isArray(u.modulos_permitidos) && u.modulos_permitidos.includes(modulo))) return next();
+  if (tieneModulo(req.usuario, modulo)) return next();
   return next(new HttpError(403, `No tiene acceso al módulo "${modulo}"`));
+};
+
+/** Para las solicitudes: basta con tener acceso a alguna de las dos secciones. */
+const requiereAlgunaSolicitud = (req, res, next) => {
+  if (tieneModulo(req.usuario, 'solicitudes_negocio') || tieneModulo(req.usuario, 'solicitudes_productos')) {
+    return next();
+  }
+  return next(new HttpError(403, 'No tiene acceso a las solicitudes'));
 };
 
 const nombreCompleto = (u) => `${u.nombre || ''} ${u.apellido || ''}`.trim();
@@ -679,6 +721,7 @@ app.get('/api/motos', autenticar, requiereModulo('motos'), asyncH(async (req, re
               SELECT 1 FROM checklist_motos c
                WHERE c.moto_id = m.id
                  AND (c.fecha AT TIME ZONE 'America/Caracas')::date = $1::date
+                 AND NOT c.anulado
             ) AS checklist_hoy
        FROM motos m
       WHERE ($2::boolean OR m.activa)
@@ -754,6 +797,7 @@ app.get('/api/motos/checklists', autenticar, requiereModulo('motos'), asyncH(asy
       WHERE (c.fecha AT TIME ZONE 'America/Caracas')::date BETWEEN $1::date AND $2::date
         AND ($3::int IS NULL OR c.usuario_id = $3)
         AND (NOT $4::boolean OR c.tiene_falla)
+        AND NOT c.anulado
       ORDER BY c.fecha DESC
       LIMIT 300`,
     [desde, hasta, propios, soloFallas],
@@ -775,7 +819,8 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
     // Un checklist por moto por día (validado aquí: el historial impide el índice único)
     const ya = await c.query(
       `SELECT 1 FROM checklist_motos
-        WHERE moto_id = $1 AND (fecha AT TIME ZONE 'America/Caracas')::date = $2::date`,
+        WHERE moto_id = $1 AND (fecha AT TIME ZONE 'America/Caracas')::date = $2::date
+          AND NOT anulado`,
       [id, hoy],
     );
     if (ya.rowCount) throw new HttpError(409, 'Esta moto ya tiene checklist registrado hoy');
@@ -897,7 +942,7 @@ app.get('/api/caja/hoy', autenticar, requiereModulo('caja'), asyncH(async (req, 
   const hoy = hoyCaracas();
   const { rows } = await pool.query(
     `SELECT c.*, trim(u.nombre || ' ' || u.apellido) AS usuario FROM cierres_caja c
-       JOIN usuarios u ON u.id = c.usuario_id WHERE c.fecha = $1::date`,
+       JOIN usuarios u ON u.id = c.usuario_id WHERE c.fecha = $1::date AND NOT c.anulado`,
     [hoy],
   );
   res.json({ fecha: hoy, cierre: rows[0] || null });
@@ -909,7 +954,8 @@ app.get('/api/caja', autenticar, requiereModulo('caja'), asyncH(async (req, res)
   const hasta = leerFecha(req.query.hasta, hoy, 'hasta');
   const { rows } = await pool.query(
     `SELECT c.*, trim(u.nombre || ' ' || u.apellido) AS usuario FROM cierres_caja c JOIN usuarios u ON u.id = c.usuario_id
-      WHERE c.fecha BETWEEN $1::date AND $2::date ORDER BY c.fecha DESC LIMIT 200`,
+      WHERE c.fecha BETWEEN $1::date AND $2::date AND NOT c.anulado
+      ORDER BY c.fecha DESC LIMIT 200`,
     [desde, hasta],
   );
   res.json({ cierres: rows });
@@ -929,7 +975,7 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
 
   const cierre = await withTx(async (c) => {
     await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`caja:${fecha}`]);
-    const previos = await c.query('SELECT id FROM cierres_caja WHERE fecha = $1::date FOR UPDATE', [fecha]);
+    const previos = await c.query('SELECT id FROM cierres_caja WHERE fecha = $1::date AND NOT anulado FOR UPDATE', [fecha]);
     if (previos.rowCount) throw new HttpError(409, `La caja del ${fecha} ya fue cerrada`);
     const { rows } = await c.query(
       `INSERT INTO cierres_caja
@@ -981,12 +1027,18 @@ app.put('/api/caja/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* Inventario: proveedores, productos, entradas                        */
 /* ------------------------------------------------------------------ */
-app.get('/api/proveedores', autenticar, requiereModulo('recepcion'), asyncH(async (req, res) => {
+/* La lista de proveedores también hace falta al pedir agua */
+const accesoProveedores = (req, res, next) => {
+  if (tieneModulo(req.usuario, 'recepcion') || tieneModulo(req.usuario, 'solicitudes_productos')) return next();
+  return next(new HttpError(403, 'No tiene acceso a los proveedores'));
+};
+
+app.get('/api/proveedores', autenticar, accesoProveedores, asyncH(async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM proveedores WHERE activo ORDER BY nombre');
   res.json({ proveedores: rows, tipos: TIPOS_PROVEEDOR });
 }));
 
-app.post('/api/proveedores', autenticar, requiereModulo('recepcion'), asyncH(async (req, res) => {
+app.post('/api/proveedores', autenticar, accesoProveedores, asyncH(async (req, res) => {
   const b = req.body || {};
   const { rows } = await pool.query(
     'INSERT INTO proveedores (nombre, tipo, contacto, rif, telefono) VALUES ($1, $2, $3, $4, $5) RETURNING *',
@@ -1023,25 +1075,35 @@ app.delete('/api/proveedores/:id', autenticar, soloAdmin, asyncH(async (req, res
   res.json({ ok: true });
 }));
 
-app.get('/api/productos', autenticar, requiereModulo('recepcion'), asyncH(async (req, res) => {
+app.get('/api/productos', autenticar, (req, res, next) => {
+  if (tieneModulo(req.usuario, 'recepcion') || tieneModulo(req.usuario, 'solicitudes_productos')) return next();
+  return next(new HttpError(403, 'No tiene acceso al catálogo de productos'));
+}, asyncH(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT p.*, pr.nombre AS proveedor FROM productos p
        LEFT JOIN proveedores pr ON pr.id = p.proveedor_habitual_id
       WHERE p.activo ORDER BY p.nombre`,
   );
-  res.json({ productos: rows, categorias: CATEGORIAS_PRODUCTO });
+  res.json({ productos: rows, categorias: CATEGORIAS_PRODUCTO, empaquetados: EMPAQUETADOS });
 }));
 
-app.post('/api/productos', autenticar, requiereModulo('recepcion'), asyncH(async (req, res) => {
+/* Se puede crear un producto desde Recepción o desde una solicitud de productos */
+app.post('/api/productos', autenticar, (req, res, next) => {
+  if (tieneModulo(req.usuario, 'recepcion') || tieneModulo(req.usuario, 'solicitudes_productos')) return next();
+  return next(new HttpError(403, 'No tiene acceso para registrar productos'));
+}, asyncH(async (req, res) => {
   const b = req.body || {};
   const { rows } = await pool.query(
-    `INSERT INTO productos (nombre, categoria, proveedor_habitual_id, sku, unidad, precio_usd, stock)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+    `INSERT INTO productos
+       (nombre, categoria, proveedor_habitual_id, sku, empaquetado, unidades_por_empaquetado, precio_usd, stock)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
     [texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 120 }),
       unoDe(b.categoria, CATEGORIAS_PRODUCTO, 'Categoría'),
       entero(b.proveedor_habitual_id, 'Proveedor', { min: 1, requerido: false }),
       texto(b.sku, 'SKU', { max: 40 }) || null,
-      texto(b.unidad, 'Unidad', { max: 20 }) || 'unidad',
+      unoDe(b.empaquetado === undefined ? 'caja' : b.empaquetado, EMPAQUETADOS, 'Empaquetado'),
+      entero(b.unidades_por_empaquetado === undefined ? 1 : b.unidades_por_empaquetado,
+        'Unidades por empaque', { min: 1, max: 100000 }),
       monto(b.precio_usd, 'Precio USD'), monto(b.stock, 'Stock')],
   );
   res.status(201).json({ producto: rows[0] });
@@ -1055,12 +1117,14 @@ app.put('/api/productos/:id', autenticar, soloAdmin, asyncH(async (req, res) => 
     if (!rows[0]) throw new HttpError(404, 'Producto no encontrado');
     const r = await c.query(
       `UPDATE productos SET nombre=$2, categoria=$3, proveedor_habitual_id=$4, sku=$5,
-              unidad=$6, precio_usd=$7, stock=$8, activo=$9 WHERE id=$1 RETURNING *`,
+              empaquetado=$6, unidades_por_empaquetado=$7, precio_usd=$8, stock=$9, activo=$10
+        WHERE id=$1 RETURNING *`,
       [id, texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 120 }),
         unoDe(b.categoria, CATEGORIAS_PRODUCTO, 'Categoría'),
         entero(b.proveedor_habitual_id, 'Proveedor', { min: 1, requerido: false }),
         texto(b.sku, 'SKU', { max: 40 }) || null,
-        texto(b.unidad, 'Unidad', { max: 20 }) || 'unidad',
+        unoDe(b.empaquetado, EMPAQUETADOS, 'Empaquetado'),
+        entero(b.unidades_por_empaquetado, 'Unidades por empaque', { min: 1, max: 100000 }),
         monto(b.precio_usd, 'Precio USD'), monto(b.stock, 'Stock'),
         b.activo === undefined ? true : Boolean(b.activo)],
     );
@@ -1086,6 +1150,7 @@ app.get('/api/entradas/agua', autenticar, requiereModulo('recepcion'), asyncH(as
        FROM entradas_agua e JOIN usuarios u ON u.id = e.usuario_id
        JOIN proveedores p ON p.id = e.proveedor_id
       WHERE (e.fecha_hora AT TIME ZONE 'America/Caracas')::date BETWEEN $1::date AND $2::date
+        AND NOT e.anulado
       ORDER BY e.fecha_hora DESC LIMIT 200`,
     [desde, hasta],
   );
@@ -1116,6 +1181,7 @@ app.get('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asyn
        FROM entradas_mercancia e JOIN usuarios u ON u.id = e.usuario_id
        JOIN proveedores p ON p.id = e.proveedor_id
       WHERE (e.fecha_hora AT TIME ZONE 'America/Caracas')::date BETWEEN $1::date AND $2::date
+        AND NOT e.anulado
       ORDER BY e.fecha_hora DESC LIMIT 200`,
     [desde, hasta],
   );
@@ -1168,29 +1234,104 @@ app.post('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asy
 /* ------------------------------------------------------------------ */
 /* Solicitudes                                                         */
 /* ------------------------------------------------------------------ */
-app.get('/api/solicitudes', autenticar, requiereModulo('solicitudes'), asyncH(async (req, res) => {
+app.get('/api/solicitudes', autenticar, requiereAlgunaSolicitud, asyncH(async (req, res) => {
+  const categoria = req.query.categoria || 'todas';
+  unoDe(categoria, ['negocio', 'productos', 'todas'], 'categoria');
+
+  // Cada sección exige su propio permiso
+  let tipos = TIPOS_SOLICITUD;
+  if (categoria === 'negocio') {
+    if (!tieneModulo(req.usuario, 'solicitudes_negocio')) throw new HttpError(403, 'No tiene acceso a las solicitudes del negocio');
+    tipos = TIPOS_SOLICITUD_NEGOCIO;
+  } else if (categoria === 'productos') {
+    if (!tieneModulo(req.usuario, 'solicitudes_productos')) throw new HttpError(403, 'No tiene acceso a las solicitudes de productos');
+    tipos = TIPOS_SOLICITUD_PRODUCTOS;
+  }
+
   const propios = req.usuario.rol === 'admin' ? null : req.usuario.id;
+  const verAnuladas = req.usuario.rol === 'admin' && req.query.anuladas === 'true';
   const { rows } = await pool.query(
-    `SELECT s.*, trim(u.nombre || ' ' || u.apellido) AS usuario FROM solicitudes s JOIN usuarios u ON u.id = s.usuario_id
-      WHERE ($1::int IS NULL OR s.usuario_id = $1) ORDER BY s.fecha_hora DESC LIMIT 200`,
-    [propios],
+    `SELECT s.*, trim(u.nombre || ' ' || u.apellido) AS usuario,
+            p.nombre AS proveedor,
+            trim(a.nombre || ' ' || a.apellido) AS anulado_por_nombre
+       FROM solicitudes s
+       JOIN usuarios u ON u.id = s.usuario_id
+       LEFT JOIN proveedores p ON p.id = s.proveedor_id
+       LEFT JOIN usuarios a ON a.id = s.anulado_por
+      WHERE ($1::int IS NULL OR s.usuario_id = $1)
+        AND s.tipo_solicitud = ANY($2::text[])
+        AND ($3::boolean OR NOT s.anulado)
+      ORDER BY s.fecha_hora DESC LIMIT 200`,
+    [propios, tipos, verAnuladas],
   );
-  res.json({ solicitudes: rows, tipos: TIPOS_SOLICITUD, estados: ESTADOS_SOLICITUD });
+  res.json({
+    solicitudes: rows,
+    tipos,
+    estados: ESTADOS_SOLICITUD,
+    categoria,
+  });
 }));
 
-app.post('/api/solicitudes', autenticar, requiereModulo('solicitudes'), asyncH(async (req, res) => {
+app.post('/api/solicitudes', autenticar, requiereAlgunaSolicitud, asyncH(async (req, res) => {
   const b = req.body || {};
   const tipo = unoDe(b.tipo_solicitud, TIPOS_SOLICITUD, 'Tipo de solicitud');
+  const modulo = moduloDeSolicitud(tipo);
+  if (!tieneModulo(req.usuario, modulo)) throw new HttpError(403, `No tiene acceso al módulo "${modulo}"`);
+
   const titulo = texto(b.titulo, 'Título', { requerido: true, min: 3, max: 120 });
-  const detalle = Array.isArray(b.detalle_items) ? b.detalle_items.slice(0, 100) : [];
+  let proveedor = entero(b.proveedor_id, 'Proveedor', { min: 1, requerido: false });
+  let detalle = [];
+
+  if (tipo === 'mercancia') {
+    // Lista de productos con la cantidad de bultos pedidos
+    if (!Array.isArray(b.detalle_items) || b.detalle_items.length === 0 || b.detalle_items.length > 100) {
+      throw bad('Debe pedir entre 1 y 100 productos');
+    }
+    const ids = b.detalle_items.map((it, i) => entero(it && it.producto_id, `Producto del ítem ${i + 1}`, { min: 1 }));
+    if (new Set(ids).size !== ids.length) throw bad('Hay productos repetidos en la solicitud');
+    const { rows: prods } = await pool.query(
+      `SELECT id, nombre, empaquetado, unidades_por_empaquetado
+         FROM productos WHERE id = ANY($1::int[]) AND activo`,
+      [ids],
+    );
+    if (prods.length !== ids.length) throw bad('Algún producto no existe o está inactivo');
+    const porId = Object.fromEntries(prods.map((p) => [p.id, p]));
+    detalle = b.detalle_items.map((it, i) => {
+      const cantidad = entero(it && it.cantidad_empaques, `Cantidad del ítem ${i + 1}`, { min: 1, max: 100000 });
+      const p = porId[Number(it.producto_id)];
+      return {
+        producto_id: p.id,
+        nombre: p.nombre,
+        empaquetado: p.empaquetado,
+        unidades_por_empaquetado: p.unidades_por_empaquetado,
+        cantidad_empaques: cantidad,
+        unidades_totales: cantidad * p.unidades_por_empaquetado,
+      };
+    });
+  } else if (tipo === 'agua') {
+    const litraje = monto(b.litraje, 'Litraje', { requerido: true });
+    if (litraje <= 0) throw bad('El litraje debe ser mayor a 0');
+    proveedor = entero(b.proveedor_id, 'Proveedor', { min: 1 }); // obligatorio para agua
+    detalle = [{ litraje }];
+  } else if (Array.isArray(b.detalle_items)) {
+    detalle = b.detalle_items.slice(0, 100);
+  }
+
   const { rows } = await pool.query(
-    `INSERT INTO solicitudes (tipo_solicitud, usuario_id, titulo, descripcion, detalle_items)
-     VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING *`,
-    [tipo, req.usuario.id, titulo, texto(b.descripcion, 'Descripción', { max: 2000 }), JSON.stringify(detalle)],
+    `INSERT INTO solicitudes (tipo_solicitud, usuario_id, titulo, descripcion, detalle_items, proveedor_id)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6) RETURNING *`,
+    [tipo, req.usuario.id, titulo, texto(b.descripcion, 'Descripción', { max: 2000 }),
+      JSON.stringify(detalle), proveedor],
   );
+
+  const resumen = tipo === 'agua'
+    ? `${detalle[0].litraje} L`
+    : detalle.map((d) => `${d.nombre} x${d.cantidad_empaques} ${d.empaquetado}`).join(', ');
   notificar('Nueva solicitud', {
-    Usuario: nombreCompleto(req.usuario), Tipo: rows[0].tipo_solicitud,
-    'Título': rows[0].titulo, 'Descripción': rows[0].descripcion,
+    Usuario: nombreCompleto(req.usuario),
+    Tipo: rows[0].tipo_solicitud,
+    'Título': rows[0].titulo,
+    Detalle: resumen || rows[0].descripcion,
   });
   res.status(201).json({ solicitud: rows[0] });
 }));
@@ -1215,7 +1356,8 @@ app.get('/api/incidencias', autenticar, requiereModulo('incidencias'), asyncH(as
   const { rows } = await pool.query(
     `SELECT i.*, trim(u.nombre || ' ' || u.apellido) AS usuario, m.placa, m.nombre AS moto FROM incidencias i
        JOIN usuarios u ON u.id = i.usuario_id LEFT JOIN motos m ON m.id = i.moto_id
-      WHERE ($1::int IS NULL OR i.usuario_id = $1) ORDER BY i.fecha_hora DESC LIMIT 200`,
+      WHERE ($1::int IS NULL OR i.usuario_id = $1) AND NOT i.anulado
+      ORDER BY i.fecha_hora DESC LIMIT 200`,
     [propios],
   );
   res.json({ incidencias: rows, tipos: TIPOS_INCIDENCIA, estados: ESTADOS_INCIDENCIA, severidades: SEVERIDADES });
@@ -1253,6 +1395,51 @@ app.put('/api/incidencias/:id', autenticar, soloAdmin, asyncH(async (req, res) =
 }));
 
 /* ------------------------------------------------------------------ */
+/* Anulación de reportes (exclusiva del Master)                        */
+/*                                                                     */
+/* Anular no borra: marca el registro, guarda quién, cuándo y por qué, */
+/* lo saca de los totales y libera el día para rehacerlo.              */
+/* ------------------------------------------------------------------ */
+app.put('/api/anular/:recurso/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const { recurso } = req.params;
+  const tabla = ANULABLES[recurso]; // lista blanca: nunca llega texto del usuario al SQL
+  if (!tabla) throw bad(`Tipo de registro no anulable (${Object.keys(ANULABLES).join(', ')})`);
+  const id = uuid(req.params.id, 'id');
+  const b = req.body || {};
+  const anular = b.anulado === undefined ? true : Boolean(b.anulado);
+  const motivo = texto(b.motivo_anulacion, 'Motivo', { max: 500 });
+  if (anular && !motivo) throw bad('Debe indicar por qué se anula el registro');
+
+  try {
+    const fila = await withTx(async (c) => {
+      const { rows } = await c.query(`SELECT * FROM ${tabla} WHERE id = $1 FOR UPDATE`, [id]);
+      if (!rows[0]) throw new HttpError(404, 'Registro no encontrado');
+      if (rows[0].anulado === anular) {
+        throw bad(anular ? 'Ese registro ya estaba anulado' : 'Ese registro no está anulado');
+      }
+      const r = await c.query(
+        `UPDATE ${tabla} SET anulado = $2,
+                anulado_por = CASE WHEN $2 THEN $3::int ELSE NULL END,
+                anulado_en  = CASE WHEN $2 THEN now() ELSE NULL END,
+                motivo_anulacion = CASE WHEN $2 THEN $4::text ELSE NULL END
+          WHERE id = $1 RETURNING *`,
+        [id, anular, req.usuario.id, motivo || null],
+      );
+      return r.rows[0];
+    });
+    res.json({ recurso, registro: fila });
+  } catch (err) {
+    // Al reactivar puede chocar con el que ya ocupa ese día o esa fecha
+    if (err.code === '23505') {
+      throw new HttpError(409, recurso === 'caja'
+        ? 'No se puede reactivar: ya hay otro cierre de caja vigente para esa fecha'
+        : 'No se puede reactivar: ya hay otro registro vigente para ese día');
+    }
+    throw err;
+  }
+}));
+
+/* ------------------------------------------------------------------ */
 /* Reportes Master                                                     */
 /* ------------------------------------------------------------------ */
 const COLS_SUMA = `
@@ -1271,7 +1458,7 @@ const COLS_SUMA = `
 async function agrupar(unidad, desde, hasta, limite) {
   const { rows } = await pool.query(
     `SELECT date_trunc('${unidad}', fecha::timestamp)::date AS periodo, ${COLS_SUMA}
-       FROM cierres_caja WHERE fecha BETWEEN $1::date AND $2::date
+       FROM cierres_caja WHERE fecha BETWEEN $1::date AND $2::date AND NOT anulado
       GROUP BY 1 ORDER BY 1 DESC LIMIT ${Number(limite)}`,
     [desde, hasta],
   );
@@ -1288,7 +1475,7 @@ app.get('/api/reportes/financieros', autenticar, soloAdmin, asyncH(async (req, r
 
   const out = { desde, hasta };
   const t = await pool.query(
-    `SELECT ${COLS_SUMA} FROM cierres_caja WHERE fecha BETWEEN $1::date AND $2::date`,
+    `SELECT ${COLS_SUMA} FROM cierres_caja WHERE fecha BETWEEN $1::date AND $2::date AND NOT anulado`,
     [desde, hasta],
   );
   out.totales = t.rows[0];
@@ -1316,7 +1503,7 @@ app.get('/api/reportes/operativos', autenticar, soloAdmin, asyncH(async (req, re
   if (tipo === 'solicitudes' || tipo === 'todos') {
     const filtro = `(s.fecha_hora AT TIME ZONE 'America/Caracas')::date BETWEEN $1::date AND $2::date
         AND ($3::text IS NULL OR s.estado = $3) AND ($4::text IS NULL OR s.tipo_solicitud = $4)
-        AND ($5::int IS NULL OR s.usuario_id = $5)`;
+        AND ($5::int IS NULL OR s.usuario_id = $5) AND NOT s.anulado`;
     const lista = await pool.query(
       `SELECT s.*, trim(u.nombre || ' ' || u.apellido) AS usuario FROM solicitudes s JOIN usuarios u ON u.id = s.usuario_id
         WHERE ${filtro} ORDER BY s.fecha_hora DESC LIMIT 500`, base);
@@ -1332,7 +1519,7 @@ app.get('/api/reportes/operativos', autenticar, soloAdmin, asyncH(async (req, re
   if (tipo === 'incidencias' || tipo === 'todos') {
     const filtro = `(i.fecha_hora AT TIME ZONE 'America/Caracas')::date BETWEEN $1::date AND $2::date
         AND ($3::text IS NULL OR i.estado = $3) AND ($4::text IS NULL OR i.tipo = $4)
-        AND ($5::int IS NULL OR i.usuario_id = $5)`;
+        AND ($5::int IS NULL OR i.usuario_id = $5) AND NOT i.anulado`;
     const lista = await pool.query(
       `SELECT i.*, trim(u.nombre || ' ' || u.apellido) AS usuario, m.placa, m.nombre AS moto FROM incidencias i
          JOIN usuarios u ON u.id = i.usuario_id LEFT JOIN motos m ON m.id = i.moto_id
@@ -1361,13 +1548,13 @@ app.get('/api/reportes/motos', autenticar, soloAdmin, asyncH(async (req, res) =>
     `SELECT m.id, m.nombre, m.color, m.placa, m.tipo_modelo, m.activa,
             m.ultimo_kilometraje, m.ultimo_cambio_aceite_km,
             (m.ultimo_kilometraje - m.ultimo_cambio_aceite_km) AS km_desde_aceite,
-            (SELECT count(*) FROM checklist_motos c WHERE c.moto_id = m.id) AS checklists_total,
-            (SELECT count(*) FROM checklist_motos c WHERE c.moto_id = m.id AND c.tiene_falla) AS checklists_con_falla,
-            (SELECT count(*) FROM incidencias i WHERE i.moto_id = m.id AND i.estado <> 'cerrada') AS incidencias_abiertas,
-            (SELECT max(c.fecha) FROM checklist_motos c WHERE c.moto_id = m.id) AS ultimo_checklist,
+            (SELECT count(*) FROM checklist_motos c WHERE c.moto_id = m.id AND NOT c.anulado) AS checklists_total,
+            (SELECT count(*) FROM checklist_motos c WHERE c.moto_id = m.id AND c.tiene_falla AND NOT c.anulado) AS checklists_con_falla,
+            (SELECT count(*) FROM incidencias i WHERE i.moto_id = m.id AND i.estado <> 'cerrada' AND NOT i.anulado) AS incidencias_abiertas,
+            (SELECT max(c.fecha) FROM checklist_motos c WHERE c.moto_id = m.id AND NOT c.anulado) AS ultimo_checklist,
             (SELECT max(c.fecha) FROM checklist_motos c
-              WHERE c.moto_id = m.id AND c.cambio_aceite_realizado) AS ultimo_cambio_aceite,
-            EXISTS (SELECT 1 FROM checklist_motos c WHERE c.moto_id = m.id
+              WHERE c.moto_id = m.id AND c.cambio_aceite_realizado AND NOT c.anulado) AS ultimo_cambio_aceite,
+            EXISTS (SELECT 1 FROM checklist_motos c WHERE c.moto_id = m.id AND NOT c.anulado
                      AND (c.fecha AT TIME ZONE 'America/Caracas')::date = $1::date) AS checklist_hoy
        FROM motos m
       WHERE (m.activa OR $2::boolean)
@@ -1382,7 +1569,7 @@ app.get('/api/reportes/motos', autenticar, soloAdmin, asyncH(async (req, res) =>
        FROM incidencias i
        JOIN motos m ON m.id = i.moto_id
        JOIN usuarios u ON u.id = i.usuario_id
-      WHERE i.estado <> 'cerrada'
+      WHERE i.estado <> 'cerrada' AND NOT i.anulado
       ORDER BY i.fecha_hora DESC LIMIT 100`,
   );
 
@@ -1397,6 +1584,7 @@ app.get('/api/reportes/motos', autenticar, soloAdmin, asyncH(async (req, res) =>
       WHERE c.detalles_items IS NOT NULL
         AND jsonb_typeof(c.detalles_items) = 'object'
         AND kv.value = 'false'::jsonb
+        AND NOT c.anulado
         AND c.fecha > now() - interval '30 days'
       ORDER BY c.fecha DESC LIMIT 200`,
   );
@@ -1427,10 +1615,14 @@ app.get('/api/reportes/motos/:id', autenticar, soloAdmin, asyncH(async (req, res
   const moto = await pool.query('SELECT * FROM motos WHERE id = $1', [id]);
   if (!moto.rows[0]) throw new HttpError(404, 'Moto no encontrada');
 
+  // El historial SÍ muestra lo anulado, marcado como tal: es parte de la historia
   const checklists = await pool.query(
     `SELECT c.*, trim(u.nombre || ' ' || u.apellido) AS usuario,
+            trim(a.nombre || ' ' || a.apellido) AS anulado_por_nombre,
             (c.fecha AT TIME ZONE 'America/Caracas')::date AS fecha_local
-       FROM checklist_motos c JOIN usuarios u ON u.id = c.usuario_id
+       FROM checklist_motos c
+       JOIN usuarios u ON u.id = c.usuario_id
+       LEFT JOIN usuarios a ON a.id = c.anulado_por
       WHERE c.moto_id = $1
         AND (c.fecha AT TIME ZONE 'America/Caracas')::date BETWEEN $2::date AND $3::date
       ORDER BY c.fecha DESC LIMIT 400`,
@@ -1438,14 +1630,18 @@ app.get('/api/reportes/motos/:id', autenticar, soloAdmin, asyncH(async (req, res
   );
 
   const incidencias = await pool.query(
-    `SELECT i.*, trim(u.nombre || ' ' || u.apellido) AS usuario
-       FROM incidencias i JOIN usuarios u ON u.id = i.usuario_id
+    `SELECT i.*, trim(u.nombre || ' ' || u.apellido) AS usuario,
+            trim(a.nombre || ' ' || a.apellido) AS anulado_por_nombre
+       FROM incidencias i
+       JOIN usuarios u ON u.id = i.usuario_id
+       LEFT JOIN usuarios a ON a.id = i.anulado_por
       WHERE i.moto_id = $1 ORDER BY i.fecha_hora DESC LIMIT 200`,
     [id],
   );
 
+  // Los cambios de aceite anulados no cuentan
   const cambiosAceite = checklists.rows
-    .filter((c) => c.cambio_aceite_realizado)
+    .filter((c) => c.cambio_aceite_realizado && !c.anulado)
     .map((c) => ({ fecha: c.fecha, kilometraje: c.kilometraje_inicial, usuario: c.usuario }));
 
   res.json({

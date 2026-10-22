@@ -20,7 +20,8 @@ const MODULOS = {
   motos: { etiqueta: 'Motos', icono: '🏍️' },
   caja: { etiqueta: 'Caja', icono: '💵' },
   recepcion: { etiqueta: 'Recepción', icono: '📦' },
-  solicitudes: { etiqueta: 'Solicitudes', icono: '📝' },
+  solicitudes_negocio: { etiqueta: 'Solicitudes negocio', icono: '📝' },
+  solicitudes_productos: { etiqueta: 'Solicitudes productos', icono: '🧃' },
   incidencias: { etiqueta: 'Incidencias', icono: '⚠️' },
 };
 const VISTAS_MASTER = {
@@ -34,10 +35,17 @@ const ROL_ETIQUETA = { admin: 'Master', motorizados: 'Motorizado', tienda: 'Tien
 const ESTADO_USUARIO_ETIQUETA = { activo: 'Activo', pausado: 'Pausado', eliminado: 'Sin acceso' };
 const TONO_ESTADO_USUARIO = { activo: 'verde', pausado: 'ambar', eliminado: 'rojo' };
 
-const TIPOS_SOLICITUD = [
-  ['mercancia', 'Mercancía'], ['agua', 'Agua'], ['insumos_generales', 'Insumos generales'],
-  ['mantenimiento', 'Mantenimiento'], ['permiso', 'Permiso'], ['otro', 'Otro'],
+/* Las solicitudes van en dos secciones separadas */
+const TIPOS_SOLICITUD_PRODUCTOS = [['mercancia', 'Mercancía'], ['agua', 'Agua']];
+const TIPOS_SOLICITUD_NEGOCIO = [
+  ['insumos_generales', 'Insumos generales'], ['mantenimiento', 'Mantenimiento'],
+  ['permiso', 'Permiso'], ['otro', 'Otro'],
 ];
+const TIPOS_SOLICITUD = [...TIPOS_SOLICITUD_PRODUCTOS, ...TIPOS_SOLICITUD_NEGOCIO];
+
+/* Los productos se piden por bulto */
+const EMPAQUETADOS = [['caja', 'Caja'], ['gavera', 'Gavera'], ['brazo', 'Brazo']];
+const EMPAQUETADO_PLURAL = { caja: 'cajas', gavera: 'gaveras', brazo: 'brazos' };
 const ESTADOS_SOLICITUD = ['pendiente', 'aprobada', 'en_proceso', 'completada', 'rechazada'];
 
 const TIPOS_INCIDENCIA = [
@@ -498,7 +506,8 @@ function VistaMotos({ usuario, call, aviso }) {
 /* ------------------------------------------------------------------ */
 /* Caja                                                                */
 /* ------------------------------------------------------------------ */
-function VistaCaja({ call, aviso }) {
+function VistaCaja({ usuario, call, aviso }) {
+  const esAdmin = usuario.rol === 'admin';
   const [hoy, setHoy] = useState(null);
   const [historial, setHistorial] = useState([]);
   const [f, setF] = useState({
@@ -626,9 +635,24 @@ function VistaCaja({ call, aviso }) {
         {historial.length === 0 ? <Vacio texto="Sin cierres recientes" /> : (
           <div className="space-y-2">
             {historial.map((h) => (
-              <div key={h.id} className="card !p-3 flex justify-between text-sm">
-                <span className="font-semibold">{fmtFecha(h.fecha)}</span>
-                <span>{fmtBs(h.total_cierre_bs)} · {fmtUsd(h.total_ingreso_dolar)}</span>
+              <div key={h.id} className="card !p-3 text-sm">
+                <div className="flex justify-between items-center">
+                  <span className="font-semibold">{fmtFecha(h.fecha)}</span>
+                  <span>{fmtBs(h.total_cierre_bs)} · {fmtUsd(h.total_ingreso_dolar)}</span>
+                </div>
+                {esAdmin && (
+                  <div className="mt-2 flex justify-end">
+                    <BotonAnular
+                      recurso="caja"
+                      id={h.id}
+                      anulado={h.anulado}
+                      call={call}
+                      aviso={aviso}
+                      onListo={cargar}
+                      etiqueta={`el cierre del ${fmtFecha(h.fecha)}`}
+                    />
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -800,9 +824,16 @@ function EntradaAgua({ call, aviso, datos, onListo, esAdmin }) {
       </form>
       <h3 className="font-bold">Últimos 30 días</h3>
       {datos.agua.length === 0 ? <Vacio texto="Sin entradas de agua" /> : datos.agua.map((e) => (
-        <div key={e.id} className="card !p-3 flex justify-between text-sm">
-          <span className="truncate">{fmtFecha(e.fecha)} · {e.proveedor}{e.tiene_incidencia ? ' ⚠️' : ''}</span>
-          <b className="shrink-0">{nf.format(e.litraje)} L</b>
+        <div key={e.id} className="card !p-3 text-sm">
+          <div className="flex justify-between items-center">
+            <span className="truncate">{fmtFecha(e.fecha)} · {e.proveedor}{e.tiene_incidencia ? ' ⚠️' : ''}</span>
+            <b className="shrink-0">{nf.format(e.litraje)} L</b>
+          </div>
+          {esAdmin && (
+            <div className="mt-2 flex justify-end">
+              <BotonAnular recurso="entrada-agua" id={e.id} anulado={e.anulado} call={call} aviso={aviso} onListo={onListo} etiqueta="esta entrada de agua" />
+            </div>
+          )}
         </div>
       ))}
     </div>
@@ -812,7 +843,7 @@ function EntradaAgua({ call, aviso, datos, onListo, esAdmin }) {
 function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
   const [proveedor, setProveedor] = useState('');
   const [obs, setObs] = useState('');
-  const [filas, setFilas] = useState([{ producto_id: '', cantidad: '', costo_usd: '' }]);
+  const [filas, setFilas] = useState([{ producto_id: '', cantidad: '' }]);
   const [enviando, setEnviando] = useState(false);
 
   const setFila = (i, k, v) => setFilas((p) => p.map((f, idx) => (idx === i ? { ...f, [k]: v } : f)));
@@ -827,12 +858,12 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
           proveedor_id: Number(proveedor),
           observaciones: obs,
           items: filas.map((f) => ({
-            producto_id: Number(f.producto_id), cantidad: Number(f.cantidad), costo_usd: Number(f.costo_usd || 0),
+            producto_id: Number(f.producto_id), cantidad: Number(f.cantidad),
           })),
         },
       });
       aviso('Mercancía recibida y stock actualizado', 'ok');
-      setFilas([{ producto_id: '', cantidad: '', costo_usd: '' }]);
+      setFilas([{ producto_id: '', cantidad: '' }]);
       setObs('');
       onListo();
     } catch (err) {
@@ -877,10 +908,9 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
                 required
               />
             </Campo>
-            <div className="grid grid-cols-2 gap-2">
-              <Campo etiqueta="Cantidad"><NumInput value={f.cantidad} onChange={(v) => setFila(i, 'cantidad', v)} required /></Campo>
-              <Campo etiqueta="Costo USD (unit.)"><NumInput value={f.costo_usd} onChange={(v) => setFila(i, 'costo_usd', v)} /></Campo>
-            </div>
+            <Campo etiqueta="Cantidad recibida">
+              <NumInput value={f.cantidad} onChange={(v) => setFila(i, 'cantidad', v)} required />
+            </Campo>
             {filas.length > 1 && (
               <button type="button" className="text-sm text-red-600 font-semibold" onClick={() => setFilas((p) => p.filter((_, idx) => idx !== i))}>
                 Quitar ítem
@@ -888,7 +918,7 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
             )}
           </div>
         ))}
-        <button type="button" className="btn-sec w-full" onClick={() => setFilas((p) => [...p, { producto_id: '', cantidad: '', costo_usd: '' }])}>
+        <button type="button" className="btn-sec w-full" onClick={() => setFilas((p) => [...p, { producto_id: '', cantidad: '' }])}>
           + Agregar ítem
         </button>
         <Campo etiqueta="Observaciones (opcional)">
@@ -905,6 +935,11 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
               <li key={i}>{it.nombre || `Producto #${it.producto_id}`}: {nf.format(it.cantidad)}</li>
             ))}
           </ul>
+          {esAdmin && (
+            <div className="mt-2 flex justify-end">
+              <BotonAnular recurso="entrada-mercancia" id={e.id} anulado={e.anulado} call={call} aviso={aviso} onListo={onListo} etiqueta="esta entrada de mercancía" />
+            </div>
+          )}
         </div>
       ))}
     </div>
@@ -913,7 +948,10 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
 
 function Catalogo({ call, aviso, datos, onListo }) {
   const [prov, setProv] = useState({ nombre: '', tipo: 'ambos', contacto: '', rif: '', telefono: '' });
-  const [prod, setProd] = useState({ nombre: '', categoria: 'mercancia', unidad: 'unidad', precio_usd: '', stock: '', proveedor_habitual_id: '' });
+  const [prod, setProd] = useState({
+    nombre: '', categoria: 'mercancia', empaquetado: 'caja', unidades_por_empaquetado: '1',
+    precio_usd: '', stock: '', proveedor_habitual_id: '',
+  });
   const [guardando, setGuardando] = useState(false);
 
   const guardar = async (ruta, body, reset) => {
@@ -955,28 +993,40 @@ function Catalogo({ call, aviso, datos, onListo }) {
         onSubmit={(e) => {
           e.preventDefault();
           guardar('/api/productos', {
-            nombre: prod.nombre, categoria: prod.categoria, unidad: prod.unidad,
-            precio_usd: Number(prod.precio_usd || 0), stock: Number(prod.stock || 0),
+            nombre: prod.nombre,
+            categoria: prod.categoria,
+            empaquetado: prod.empaquetado,
+            unidades_por_empaquetado: Number(prod.unidades_por_empaquetado || 1),
+            precio_usd: Number(prod.precio_usd || 0),
+            stock: Number(prod.stock || 0),
             proveedor_habitual_id: prod.proveedor_habitual_id ? Number(prod.proveedor_habitual_id) : undefined,
-          }, () => setProd({ nombre: '', categoria: 'mercancia', unidad: 'unidad', precio_usd: '', stock: '', proveedor_habitual_id: '' }));
+          }, () => setProd({
+            nombre: '', categoria: 'mercancia', empaquetado: 'caja', unidades_por_empaquetado: '1',
+            precio_usd: '', stock: '', proveedor_habitual_id: '',
+          }));
         }}
       >
         <h3 className="font-bold">Nuevo producto</h3>
         <Campo etiqueta="Nombre"><input className="campo" value={prod.nombre} onChange={(e) => setProd({ ...prod, nombre: e.target.value })} required minLength={2} /></Campo>
         <Campo etiqueta="Categoría"><Select valor={prod.categoria} onChange={(v) => setProd({ ...prod, categoria: v })} opciones={CATEGORIAS_PRODUCTO} /></Campo>
         <div className="grid grid-cols-2 gap-2">
-          <Campo etiqueta="Unidad"><input className="campo" value={prod.unidad} onChange={(e) => setProd({ ...prod, unidad: e.target.value })} /></Campo>
+          <Campo etiqueta="Viene en">
+            <Select valor={prod.empaquetado} onChange={(v) => setProd({ ...prod, empaquetado: v })} opciones={EMPAQUETADOS} />
+          </Campo>
+          <Campo etiqueta="Unidades por empaque">
+            <NumInput value={prod.unidades_por_empaquetado} onChange={(v) => setProd({ ...prod, unidades_por_empaquetado: v })} step="1" />
+          </Campo>
           <Campo etiqueta="Precio USD"><NumInput value={prod.precio_usd} onChange={(v) => setProd({ ...prod, precio_usd: v })} /></Campo>
           <Campo etiqueta="Stock inicial"><NumInput value={prod.stock} onChange={(v) => setProd({ ...prod, stock: v })} /></Campo>
-          <Campo etiqueta="Proveedor habitual">
-            <Select
-              valor={prod.proveedor_habitual_id}
-              onChange={(v) => setProd({ ...prod, proveedor_habitual_id: v })}
-              opciones={datos.proveedores.map((p) => [String(p.id), p.nombre])}
-              vacio="—"
-            />
-          </Campo>
         </div>
+        <Campo etiqueta="Proveedor habitual">
+          <Select
+            valor={prod.proveedor_habitual_id}
+            onChange={(v) => setProd({ ...prod, proveedor_habitual_id: v })}
+            opciones={datos.proveedores.map((p) => [String(p.id), p.nombre])}
+            vacio="—"
+          />
+        </Campo>
         <button className="btn-primario w-full" disabled={guardando}>Guardar producto</button>
       </form>
 
@@ -986,14 +1036,112 @@ function Catalogo({ call, aviso, datos, onListo }) {
         {datos.proveedores.length === 0 ? <Vacio texto="Sin proveedores" /> : datos.proveedores.map((p) => (
           <ProveedorEditable key={p.id} proveedor={p} call={call} aviso={aviso} onListo={onListo} />
         ))}
-        <h3 className="font-bold mb-2 mt-4">Inventario ({datos.productos.length})</h3>
+
+        <h3 className="font-bold mb-2 mt-4">Productos ({datos.productos.length})</h3>
+        <p className="text-xs text-slate-500 mb-2">Toca un producto para modificarlo.</p>
         {datos.productos.length === 0 ? <Vacio texto="Sin productos" /> : datos.productos.map((p) => (
-          <div key={p.id} className="card !p-3 mb-2 flex justify-between text-sm">
-            <span className="truncate">{p.nombre}{p.proveedor ? <span className="text-slate-400"> · {p.proveedor}</span> : null}</span>
-            <b className="shrink-0">{nf.format(p.stock)} {p.unidad}</b>
-          </div>
+          <ProductoEditable key={p.id} producto={p} datos={datos} call={call} aviso={aviso} onListo={onListo} />
         ))}
       </div>
+    </div>
+  );
+}
+
+/** Producto de la lista; al tocarlo se abre para modificar todos sus datos. */
+function ProductoEditable({ producto, datos, call, aviso, onListo }) {
+  const [abierto, setAbierto] = useState(false);
+  const [f, setF] = useState({
+    nombre: producto.nombre,
+    categoria: producto.categoria,
+    empaquetado: producto.empaquetado,
+    unidades_por_empaquetado: String(producto.unidades_por_empaquetado),
+    precio_usd: String(producto.precio_usd),
+    stock: String(producto.stock),
+    proveedor_habitual_id: producto.proveedor_habitual_id ? String(producto.proveedor_habitual_id) : '',
+    activo: producto.activo,
+  });
+  const [guardando, setGuardando] = useState(false);
+
+  const guardar = async () => {
+    setGuardando(true);
+    try {
+      await call(`/api/productos/${producto.id}`, {
+        method: 'PUT',
+        body: {
+          ...f,
+          unidades_por_empaquetado: Number(f.unidades_por_empaquetado || 1),
+          precio_usd: Number(f.precio_usd || 0),
+          stock: Number(f.stock || 0),
+          proveedor_habitual_id: f.proveedor_habitual_id ? Number(f.proveedor_habitual_id) : undefined,
+        },
+      });
+      aviso('Producto actualizado', 'ok');
+      setAbierto(false);
+      onListo();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setGuardando(false);
+    }
+  };
+
+  if (!abierto) {
+    return (
+      <button
+        type="button"
+        onClick={() => setAbierto(true)}
+        className="card !p-3 mb-2 w-full flex justify-between items-center text-sm text-left"
+      >
+        <span className="truncate">
+          {producto.nombre}
+          <span className="text-slate-400"> · {etiquetaDe(EMPAQUETADOS, producto.empaquetado)} de {producto.unidades_por_empaquetado}</span>
+        </span>
+        <b className="shrink-0">{nf.format(producto.stock)}</b>
+      </button>
+    );
+  }
+
+  return (
+    <div className="card mb-2 space-y-3">
+      <div className="flex items-center justify-between">
+        <h4 className="font-bold">Modificar producto</h4>
+        <button type="button" className="text-slate-500 text-2xl px-2" onClick={() => setAbierto(false)} aria-label="Cerrar">×</button>
+      </div>
+      <Campo etiqueta="Nombre">
+        <input className="campo" value={f.nombre} onChange={(e) => setF({ ...f, nombre: e.target.value })} minLength={2} />
+      </Campo>
+      <Campo etiqueta="Categoría">
+        <Select valor={f.categoria} onChange={(v) => setF({ ...f, categoria: v })} opciones={CATEGORIAS_PRODUCTO} />
+      </Campo>
+      <div className="grid grid-cols-2 gap-2">
+        <Campo etiqueta="Viene en">
+          <Select valor={f.empaquetado} onChange={(v) => setF({ ...f, empaquetado: v })} opciones={EMPAQUETADOS} />
+        </Campo>
+        <Campo etiqueta="Unidades por empaque">
+          <NumInput value={f.unidades_por_empaquetado} onChange={(v) => setF({ ...f, unidades_por_empaquetado: v })} step="1" />
+        </Campo>
+        <Campo etiqueta="Precio USD">
+          <NumInput value={f.precio_usd} onChange={(v) => setF({ ...f, precio_usd: v })} />
+        </Campo>
+        <Campo etiqueta="Stock">
+          <NumInput value={f.stock} onChange={(v) => setF({ ...f, stock: v })} />
+        </Campo>
+      </div>
+      <Campo etiqueta="Proveedor habitual">
+        <Select
+          valor={f.proveedor_habitual_id}
+          onChange={(v) => setF({ ...f, proveedor_habitual_id: v })}
+          opciones={datos.proveedores.map((p) => [String(p.id), p.nombre])}
+          vacio="—"
+        />
+      </Campo>
+      <label className="flex items-center gap-3 min-h-[44px]">
+        <input type="checkbox" className="h-6 w-6" checked={f.activo} onChange={(e) => setF({ ...f, activo: e.target.checked })} />
+        <span className="font-medium">Producto activo</span>
+      </label>
+      <button type="button" className="btn-primario w-full" disabled={guardando} onClick={guardar}>
+        {guardando ? 'Guardando…' : 'Guardar cambios'}
+      </button>
     </div>
   );
 }
@@ -1090,20 +1238,206 @@ function SelectorEstado({ valor, estados, onCambiar }) {
   );
 }
 
-function VistaSolicitudes({ usuario, call, aviso }) {
+/** Botón de anular/reactivar, exclusivo del Master. */
+function BotonAnular({ recurso, id, anulado, call, aviso, onListo, etiqueta = 'este registro' }) {
+  const [enviando, setEnviando] = useState(false);
+
+  const ejecutar = async () => {
+    let motivo = '';
+    if (anulado) {
+      if (!window.confirm(`¿Reactivar ${etiqueta}? Volverá a contar en los totales.`)) return;
+    } else {
+      motivo = window.prompt(`¿Por qué se anula ${etiqueta}?\n\nQuedará registrado junto con tu nombre y la fecha.`) || '';
+      if (!motivo.trim()) return;
+    }
+    setEnviando(true);
+    try {
+      await call(`/api/anular/${recurso}/${id}`, {
+        method: 'PUT',
+        body: { anulado: !anulado, motivo_anulacion: motivo.trim() },
+      });
+      aviso(anulado ? 'Registro reactivado' : 'Registro anulado', 'ok');
+      onListo();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setEnviando(false);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      disabled={enviando}
+      onClick={ejecutar}
+      className={`rounded-lg px-3 py-2 text-sm font-semibold min-h-[40px] ${
+        anulado ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+      }`}
+    >
+      {enviando ? '…' : anulado ? 'Reactivar' : 'Anular'}
+    </button>
+  );
+}
+
+/** Marca visible cuando un registro fue anulado. */
+function SelloAnulado({ registro }) {
+  if (!registro.anulado) return null;
+  return (
+    <p className="text-sm text-red-800 bg-red-50 rounded-lg p-2">
+      <b>Anulado</b>
+      {registro.anulado_por_nombre ? ` por ${registro.anulado_por_nombre}` : ''}
+      {registro.anulado_en ? ` · ${fmtFechaHora(registro.anulado_en)}` : ''}
+      {registro.motivo_anulacion ? ` — ${registro.motivo_anulacion}` : ''}
+    </p>
+  );
+}
+
+/** Alta rápida de un producto que todavía no está en el catálogo. */
+function AgregarProductoRapido({ call, aviso, onListo }) {
+  const [abierto, setAbierto] = useState(false);
+  const [f, setF] = useState({
+    nombre: '', categoria: 'mercancia', empaquetado: 'caja', unidades_por_empaquetado: '1',
+  });
+  const [enviando, setEnviando] = useState(false);
+
+  const enviar = async () => {
+    setEnviando(true);
+    try {
+      await call('/api/productos', {
+        method: 'POST',
+        body: { ...f, unidades_por_empaquetado: Number(f.unidades_por_empaquetado || 1) },
+      });
+      aviso('Producto agregado al catálogo', 'ok');
+      setF({ nombre: '', categoria: 'mercancia', empaquetado: 'caja', unidades_por_empaquetado: '1' });
+      setAbierto(false);
+      onListo();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setEnviando(false);
+    }
+  };
+
+  if (!abierto) {
+    return (
+      <button type="button" className="btn-sec w-full !py-2 !min-h-[40px] !text-sm" onClick={() => setAbierto(true)}>
+        + Agregar un producto que no está en la lista
+      </button>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-agua-200 bg-agua-50 p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <p className="font-semibold text-sm">Producto nuevo</p>
+        <button type="button" className="text-slate-500 text-xl px-2" onClick={() => setAbierto(false)} aria-label="Cerrar">×</button>
+      </div>
+      <Campo etiqueta="Nombre">
+        <input className="campo" value={f.nombre} onChange={(e) => setF({ ...f, nombre: e.target.value })} minLength={2} />
+      </Campo>
+      <Campo etiqueta="Categoría">
+        <Select valor={f.categoria} onChange={(v) => setF({ ...f, categoria: v })} opciones={CATEGORIAS_PRODUCTO} />
+      </Campo>
+      <div className="grid grid-cols-2 gap-2">
+        <Campo etiqueta="Viene en">
+          <Select valor={f.empaquetado} onChange={(v) => setF({ ...f, empaquetado: v })} opciones={EMPAQUETADOS} />
+        </Campo>
+        <Campo etiqueta="Unidades por empaque">
+          <NumInput value={f.unidades_por_empaquetado} onChange={(v) => setF({ ...f, unidades_por_empaquetado: v })} step="1" />
+        </Campo>
+      </div>
+      <button
+        type="button"
+        className="btn-primario w-full !py-2 !min-h-[40px]"
+        disabled={enviando || f.nombre.trim().length < 2}
+        onClick={enviar}
+      >
+        {enviando ? 'Guardando…' : 'Guardar producto'}
+      </button>
+    </div>
+  );
+}
+
+/** Tarjeta común para mostrar una solicitud ya enviada. */
+function TarjetaSolicitud({ s, tipos, esAdmin, call, aviso, onListo }) {
+  const detalle = Array.isArray(s.detalle_items) ? s.detalle_items : [];
+  return (
+    <div className={`card space-y-1 ${s.anulado ? 'opacity-75' : ''}`}>
+      <div className="flex items-start justify-between gap-2">
+        <p className="font-semibold">{s.titulo}</p>
+        <Chip tono={s.anulado ? 'gris' : tonoEstado(s.estado)}>
+          {s.anulado ? 'anulada' : etiquetaEstado(s.estado)}
+        </Chip>
+      </div>
+      <p className="text-sm text-slate-500">
+        {etiquetaDe(tipos, s.tipo_solicitud)}
+        {s.proveedor ? ` · ${s.proveedor}` : ''} · {s.usuario} · {fmtFechaHora(s.fecha_hora)}
+      </p>
+      {s.tipo_solicitud === 'agua' && detalle[0] && detalle[0].litraje !== undefined && (
+        <p className="text-sm font-semibold">{nf.format(detalle[0].litraje)} litros</p>
+      )}
+      {s.tipo_solicitud === 'mercancia' && detalle.length > 0 && (
+        <ul className="list-disc pl-5 text-sm text-slate-600">
+          {detalle.map((d, i) => (
+            <li key={i}>
+              {d.nombre}: <b>{d.cantidad_empaques}</b> {EMPAQUETADO_PLURAL[d.empaquetado] || d.empaquetado}
+              {d.unidades_totales ? ` (${nf0.format(d.unidades_totales)} unidades)` : ''}
+            </li>
+          ))}
+        </ul>
+      )}
+      {s.descripcion && <p className="text-sm">{s.descripcion}</p>}
+      {s.notas_admin && <p className="text-sm text-agua-800 bg-agua-50 rounded-lg p-2">Master: {s.notas_admin}</p>}
+      <SelloAnulado registro={s} />
+      {esAdmin && (
+        <div className="flex items-center gap-2 pt-1">
+          {!s.anulado && (
+            <SelectorEstado
+              valor={s.estado}
+              estados={ESTADOS_SOLICITUD}
+              onCambiar={async (estado) => {
+                try {
+                  await call(`/api/solicitudes/${s.id}`, { method: 'PUT', body: { estado, notas_admin: s.notas_admin || '' } });
+                  aviso('Estado actualizado', 'ok');
+                  onListo();
+                } catch (err) {
+                  aviso(err.message, 'error');
+                }
+              }}
+            />
+          )}
+          <BotonAnular
+            recurso="solicitud"
+            id={s.id}
+            anulado={s.anulado}
+            call={call}
+            aviso={aviso}
+            onListo={onListo}
+            etiqueta="esta solicitud"
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* --------------------- Solicitudes del negocio --------------------- */
+function VistaSolicitudesNegocio({ usuario, call, aviso }) {
   const [lista, setLista] = useState(null);
-  const [f, setF] = useState({ tipo_solicitud: 'mercancia', titulo: '', descripcion: '' });
+  const [verAnuladas, setVerAnuladas] = useState(false);
+  const [f, setF] = useState({ tipo_solicitud: 'insumos_generales', titulo: '', descripcion: '' });
   const [enviando, setEnviando] = useState(false);
   const esAdmin = usuario.rol === 'admin';
 
   const cargar = useCallback(async () => {
     try {
-      setLista((await call('/api/solicitudes')).solicitudes);
+      const d = await call(`/api/solicitudes${qs({ categoria: 'negocio', anuladas: verAnuladas ? 'true' : '' })}`);
+      setLista(d.solicitudes);
     } catch (err) {
       aviso(err.message, 'error');
       setLista([]);
     }
-  }, [call, aviso]);
+  }, [call, aviso, verAnuladas]);
   useEffect(() => { cargar(); }, [cargar]);
 
   const enviar = async (e) => {
@@ -1112,7 +1446,7 @@ function VistaSolicitudes({ usuario, call, aviso }) {
     try {
       await call('/api/solicitudes', { method: 'POST', body: f });
       aviso('Solicitud enviada', 'ok');
-      setF({ tipo_solicitud: 'mercancia', titulo: '', descripcion: '' });
+      setF({ tipo_solicitud: 'insumos_generales', titulo: '', descripcion: '' });
       cargar();
     } catch (err) {
       aviso(err.message, 'error');
@@ -1121,22 +1455,12 @@ function VistaSolicitudes({ usuario, call, aviso }) {
     }
   };
 
-  const cambiarEstado = async (s, estado) => {
-    try {
-      await call(`/api/solicitudes/${s.id}`, { method: 'PUT', body: { estado, notas_admin: s.notas_admin || '' } });
-      aviso('Estado actualizado', 'ok');
-      cargar();
-    } catch (err) {
-      aviso(err.message, 'error');
-    }
-  };
-
   return (
     <div className="space-y-4">
-      <Titulo>Solicitudes</Titulo>
+      <Titulo>Solicitudes del negocio</Titulo>
       <form onSubmit={enviar} className="card space-y-3">
         <Campo etiqueta="Tipo">
-          <Select valor={f.tipo_solicitud} onChange={(v) => setF({ ...f, tipo_solicitud: v })} opciones={TIPOS_SOLICITUD} />
+          <Select valor={f.tipo_solicitud} onChange={(v) => setF({ ...f, tipo_solicitud: v })} opciones={TIPOS_SOLICITUD_NEGOCIO} />
         </Campo>
         <Campo etiqueta="Título">
           <input className="campo" value={f.titulo} onChange={(e) => setF({ ...f, titulo: e.target.value })} minLength={3} maxLength={120} required />
@@ -1146,21 +1470,232 @@ function VistaSolicitudes({ usuario, call, aviso }) {
         </Campo>
         <button className="btn-primario w-full" disabled={enviando}>{enviando ? 'Enviando…' : 'Enviar solicitud'}</button>
       </form>
+
+      {esAdmin && (
+        <label className="card !p-3 flex items-center gap-3 min-h-[44px] text-sm">
+          <input type="checkbox" className="h-5 w-5" checked={verAnuladas} onChange={(e) => setVerAnuladas(e.target.checked)} />
+          <span>Mostrar también las anuladas</span>
+        </label>
+      )}
+
       {lista === null ? <Cargando /> : lista.length === 0 ? <Vacio texto="No hay solicitudes" /> : lista.map((s) => (
-        <div key={s.id} className="card space-y-1">
-          <div className="flex items-start justify-between gap-2">
-            <p className="font-semibold">{s.titulo || etiquetaDe(TIPOS_SOLICITUD, s.tipo_solicitud)}</p>
-            <Chip tono={tonoEstado(s.estado)}>{etiquetaEstado(s.estado)}</Chip>
-          </div>
-          <p className="text-sm text-slate-500">
-            {etiquetaDe(TIPOS_SOLICITUD, s.tipo_solicitud)} · {s.usuario} · {fmtFechaHora(s.fecha_hora)}
-          </p>
-          {s.descripcion && <p className="text-sm">{s.descripcion}</p>}
-          {s.notas_admin && <p className="text-sm text-agua-800 bg-agua-50 rounded-lg p-2">Master: {s.notas_admin}</p>}
-          {esAdmin && <SelectorEstado valor={s.estado} estados={ESTADOS_SOLICITUD} onCambiar={(e) => cambiarEstado(s, e)} />}
-        </div>
+        <TarjetaSolicitud key={s.id} s={s} tipos={TIPOS_SOLICITUD_NEGOCIO} esAdmin={esAdmin} call={call} aviso={aviso} onListo={cargar} />
       ))}
     </div>
+  );
+}
+
+/* ------------------- Solicitudes de productos ---------------------- */
+function VistaSolicitudesProductos({ usuario, call, aviso }) {
+  const [tab, setTab] = useState('mercancia');
+  const [datos, setDatos] = useState(null);
+  const [lista, setLista] = useState(null);
+  const [verAnuladas, setVerAnuladas] = useState(false);
+  const esAdmin = usuario.rol === 'admin';
+
+  const cargar = useCallback(async () => {
+    try {
+      const [pr, pv, so] = await Promise.all([
+        call('/api/productos'),
+        call('/api/proveedores'),
+        call(`/api/solicitudes${qs({ categoria: 'productos', anuladas: verAnuladas ? 'true' : '' })}`),
+      ]);
+      setDatos({ productos: pr.productos, proveedores: pv.proveedores });
+      setLista(so.solicitudes);
+    } catch (err) {
+      aviso(err.message, 'error');
+      setDatos({ productos: [], proveedores: [] });
+      setLista([]);
+    }
+  }, [call, aviso, verAnuladas]);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  if (!datos) return <Cargando />;
+
+  return (
+    <div className="space-y-4">
+      <Titulo>Solicitudes de productos</Titulo>
+      <Pestanas
+        opciones={[['mercancia', 'Mercancía'], ['agua', 'Agua']]}
+        activa={tab}
+        onChange={setTab}
+      />
+      {tab === 'mercancia'
+        ? <FormSolicitudMercancia datos={datos} call={call} aviso={aviso} onListo={cargar} />
+        : <FormSolicitudAgua datos={datos} call={call} aviso={aviso} onListo={cargar} />}
+
+      {esAdmin && (
+        <label className="card !p-3 flex items-center gap-3 min-h-[44px] text-sm">
+          <input type="checkbox" className="h-5 w-5" checked={verAnuladas} onChange={(e) => setVerAnuladas(e.target.checked)} />
+          <span>Mostrar también las anuladas</span>
+        </label>
+      )}
+
+      <h3 className="font-bold">Solicitudes enviadas</h3>
+      {lista === null ? <Cargando /> : lista.length === 0 ? <Vacio texto="Todavía no hay solicitudes" /> : lista
+        .filter((s) => s.tipo_solicitud === tab)
+        .map((s) => (
+          <TarjetaSolicitud key={s.id} s={s} tipos={TIPOS_SOLICITUD_PRODUCTOS} esAdmin={esAdmin} call={call} aviso={aviso} onListo={cargar} />
+        ))}
+    </div>
+  );
+}
+
+function FormSolicitudMercancia({ datos, call, aviso, onListo }) {
+  const [titulo, setTitulo] = useState('Pedido de mercancía');
+  const [descripcion, setDescripcion] = useState('');
+  const [filas, setFilas] = useState([{ producto_id: '', cantidad_empaques: '' }]);
+  const [enviando, setEnviando] = useState(false);
+
+  const setFila = (i, k, v) => setFilas((p) => p.map((f, idx) => (idx === i ? { ...f, [k]: v } : f)));
+  const porId = Object.fromEntries(datos.productos.map((p) => [String(p.id), p]));
+
+  const enviar = async (e) => {
+    e.preventDefault();
+    setEnviando(true);
+    try {
+      await call('/api/solicitudes', {
+        method: 'POST',
+        body: {
+          tipo_solicitud: 'mercancia',
+          titulo,
+          descripcion,
+          detalle_items: filas.map((f) => ({
+            producto_id: Number(f.producto_id),
+            cantidad_empaques: Number(f.cantidad_empaques),
+          })),
+        },
+      });
+      aviso('Solicitud de mercancía enviada', 'ok');
+      setFilas([{ producto_id: '', cantidad_empaques: '' }]);
+      setDescripcion('');
+      onListo();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setEnviando(false);
+    }
+  };
+
+  const completo = filas.every((f) => f.producto_id && Number(f.cantidad_empaques) > 0);
+
+  return (
+    <form onSubmit={enviar} className="card space-y-3">
+      <Campo etiqueta="Título">
+        <input className="campo" value={titulo} onChange={(e) => setTitulo(e.target.value)} minLength={3} maxLength={120} required />
+      </Campo>
+
+      {datos.productos.length === 0 ? (
+        <p className="text-sm text-slate-500">No hay productos en el catálogo todavía. Agrégalos con el botón de abajo.</p>
+      ) : filas.map((f, i) => {
+        const p = porId[f.producto_id];
+        const total = p && f.cantidad_empaques ? Number(f.cantidad_empaques) * p.unidades_por_empaquetado : 0;
+        return (
+          <div key={i} className="rounded-xl border border-slate-200 p-3 space-y-2">
+            <Campo etiqueta={`Producto ${i + 1}`}>
+              <Select
+                valor={f.producto_id}
+                onChange={(v) => setFila(i, 'producto_id', v)}
+                opciones={datos.productos.map((x) => [
+                  String(x.id),
+                  `${x.nombre} — ${etiquetaDe(EMPAQUETADOS, x.empaquetado)} de ${x.unidades_por_empaquetado}`,
+                ])}
+                vacio="Seleccione…"
+                required
+              />
+            </Campo>
+            <Campo etiqueta={p ? `¿Cuántas ${EMPAQUETADO_PLURAL[p.empaquetado]}?` : 'Cantidad de empaques'}>
+              <NumInput value={f.cantidad_empaques} onChange={(v) => setFila(i, 'cantidad_empaques', v)} step="1" required />
+            </Campo>
+            {total > 0 && (
+              <p className="text-sm text-agua-800 bg-agua-50 rounded-lg p-2">
+                Son <b>{nf0.format(total)}</b> unidades en total
+              </p>
+            )}
+            {filas.length > 1 && (
+              <button type="button" className="text-sm text-red-600 font-semibold" onClick={() => setFilas((p2) => p2.filter((_, idx) => idx !== i))}>
+                Quitar producto
+              </button>
+            )}
+          </div>
+        );
+      })}
+
+      {datos.productos.length > 0 && (
+        <button type="button" className="btn-sec w-full" onClick={() => setFilas((p) => [...p, { producto_id: '', cantidad_empaques: '' }])}>
+          + Agregar otro producto al pedido
+        </button>
+      )}
+
+      <AgregarProductoRapido call={call} aviso={aviso} onListo={onListo} />
+
+      <Campo etiqueta="Nota (opcional)">
+        <textarea className="campo" rows={2} maxLength={2000} value={descripcion} onChange={(e) => setDescripcion(e.target.value)} />
+      </Campo>
+      <button className="btn-primario w-full" disabled={enviando || !completo || datos.productos.length === 0}>
+        {enviando ? 'Enviando…' : 'Enviar solicitud'}
+      </button>
+    </form>
+  );
+}
+
+function FormSolicitudAgua({ datos, call, aviso, onListo }) {
+  const [titulo, setTitulo] = useState('Pedido de agua');
+  const [litraje, setLitraje] = useState('');
+  const [proveedor, setProveedor] = useState('');
+  const [descripcion, setDescripcion] = useState('');
+  const [enviando, setEnviando] = useState(false);
+
+  const enviar = async (e) => {
+    e.preventDefault();
+    setEnviando(true);
+    try {
+      await call('/api/solicitudes', {
+        method: 'POST',
+        body: {
+          tipo_solicitud: 'agua',
+          titulo,
+          descripcion,
+          litraje: Number(litraje),
+          proveedor_id: Number(proveedor),
+        },
+      });
+      aviso('Solicitud de agua enviada', 'ok');
+      setLitraje('');
+      setDescripcion('');
+      onListo();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setEnviando(false);
+    }
+  };
+
+  return (
+    <form onSubmit={enviar} className="card space-y-3">
+      <Campo etiqueta="Título">
+        <input className="campo" value={titulo} onChange={(e) => setTitulo(e.target.value)} minLength={3} maxLength={120} required />
+      </Campo>
+      <Campo etiqueta="Litros a solicitar">
+        <NumInput value={litraje} onChange={setLitraje} required placeholder="0" />
+      </Campo>
+      <Campo etiqueta="Proveedor (obligatorio)">
+        <Select
+          valor={proveedor}
+          onChange={setProveedor}
+          opciones={datos.proveedores.map((p) => [String(p.id), p.nombre])}
+          vacio="Seleccione…"
+          required
+        />
+      </Campo>
+      <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} />
+      <Campo etiqueta="Nota (opcional)">
+        <textarea className="campo" rows={2} maxLength={2000} value={descripcion} onChange={(e) => setDescripcion(e.target.value)} />
+      </Campo>
+      <button className="btn-primario w-full" disabled={enviando || !litraje || !proveedor}>
+        {enviando ? 'Enviando…' : 'Enviar solicitud'}
+      </button>
+    </form>
   );
 }
 
@@ -1237,7 +1772,13 @@ function VistaIncidencias({ usuario, call, aviso }) {
           </p>
           {i.descripcion && <p className="text-sm">{i.descripcion}</p>}
           {i.notas_admin && <p className="text-sm text-agua-800 bg-agua-50 rounded-lg p-2">Master: {i.notas_admin}</p>}
-          {esAdmin && <SelectorEstado valor={i.estado} estados={ESTADOS_INCIDENCIA} onCambiar={(e) => cambiarEstado(i, e)} />}
+          <SelloAnulado registro={i} />
+          {esAdmin && (
+            <div className="flex items-center gap-2 pt-1">
+              {!i.anulado && <SelectorEstado valor={i.estado} estados={ESTADOS_INCIDENCIA} onCambiar={(e) => cambiarEstado(i, e)} />}
+              <BotonAnular recurso="incidencia" id={i.id} anulado={i.anulado} call={call} aviso={aviso} onListo={cargar} etiqueta="esta incidencia" />
+            </div>
+          )}
         </div>
       ))}
     </div>
@@ -1342,7 +1883,93 @@ function VistaReportes({ call, aviso }) {
 /* ------------------------------------------------------------------ */
 /* Master: Reporte de motos                                            */
 /* ------------------------------------------------------------------ */
-function DetalleMoto({ detalle, onVolver }) {
+/** Edición de la ficha de la moto. Hace falta para corregir el kilometraje
+ *  cuando se anula un checklist que lo dejó mal. */
+function EditarMoto({ moto, call, aviso, onListo }) {
+  const [abierto, setAbierto] = useState(false);
+  const [f, setF] = useState({
+    nombre: moto.nombre,
+    color: moto.color,
+    placa: moto.placa,
+    tipo_modelo: moto.tipo_modelo,
+    ultimo_kilometraje: String(moto.ultimo_kilometraje),
+    ultimo_cambio_aceite_km: String(moto.ultimo_cambio_aceite_km),
+    activa: moto.activa,
+  });
+  const [guardando, setGuardando] = useState(false);
+
+  const guardar = async () => {
+    setGuardando(true);
+    try {
+      await call(`/api/motos/${moto.id}`, {
+        method: 'PUT',
+        body: {
+          ...f,
+          ultimo_kilometraje: Number(f.ultimo_kilometraje),
+          ultimo_cambio_aceite_km: Number(f.ultimo_cambio_aceite_km),
+        },
+      });
+      aviso('Moto actualizada', 'ok');
+      setAbierto(false);
+      onListo();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setGuardando(false);
+    }
+  };
+
+  if (!abierto) {
+    return (
+      <button type="button" className="btn-sec w-full !py-2 !min-h-[40px] !text-sm" onClick={() => setAbierto(true)}>
+        Corregir datos de la moto
+      </button>
+    );
+  }
+
+  return (
+    <div className="card space-y-3">
+      <div className="flex items-center justify-between">
+        <h4 className="font-bold">Corregir datos</h4>
+        <button type="button" className="text-slate-500 text-2xl px-2" onClick={() => setAbierto(false)} aria-label="Cerrar">×</button>
+      </div>
+      <Campo etiqueta="Nombre">
+        <input className="campo" value={f.nombre} onChange={(e) => setF({ ...f, nombre: e.target.value })} minLength={2} />
+      </Campo>
+      <div className="grid grid-cols-2 gap-2">
+        <Campo etiqueta="Color">
+          <input className="campo" value={f.color} onChange={(e) => setF({ ...f, color: e.target.value })} minLength={2} />
+        </Campo>
+        <Campo etiqueta="Placa">
+          <input className="campo uppercase" value={f.placa} onChange={(e) => setF({ ...f, placa: e.target.value.toUpperCase() })} minLength={3} />
+        </Campo>
+      </div>
+      <Campo etiqueta="Modelo">
+        <Select valor={f.tipo_modelo} onChange={(v) => setF({ ...f, tipo_modelo: v })} opciones={MODELOS} />
+      </Campo>
+      <div className="grid grid-cols-2 gap-2">
+        <Campo etiqueta="Kilometraje actual">
+          <NumInput value={f.ultimo_kilometraje} onChange={(v) => setF({ ...f, ultimo_kilometraje: v })} step="1" />
+        </Campo>
+        <Campo etiqueta="Km del último aceite">
+          <NumInput value={f.ultimo_cambio_aceite_km} onChange={(v) => setF({ ...f, ultimo_cambio_aceite_km: v })} step="1" />
+        </Campo>
+      </div>
+      <p className="text-xs text-slate-500">
+        Si anulaste un checklist con el kilometraje mal escrito, corrígelo aquí antes de que lo vuelvan a hacer.
+      </p>
+      <label className="flex items-center gap-3 min-h-[44px]">
+        <input type="checkbox" className="h-6 w-6" checked={f.activa} onChange={(e) => setF({ ...f, activa: e.target.checked })} />
+        <span className="font-medium">Moto activa</span>
+      </label>
+      <button type="button" className="btn-primario w-full" disabled={guardando} onClick={guardar}>
+        {guardando ? 'Guardando…' : 'Guardar cambios'}
+      </button>
+    </div>
+  );
+}
+
+function DetalleMoto({ detalle, onVolver, call, aviso, onRecargar }) {
   const { moto, checklists, incidencias, cambios_aceite: cambios } = detalle;
   const [tab, setTab] = useState('checklists');
 
@@ -1366,6 +1993,8 @@ function DetalleMoto({ detalle, onVolver }) {
         />
       </div>
 
+      <EditarMoto moto={moto} call={call} aviso={aviso} onListo={onRecargar} />
+
       <Pestanas
         opciones={[
           ['checklists', `Checklists (${checklists.length})`],
@@ -1380,10 +2009,11 @@ function DetalleMoto({ detalle, onVolver }) {
         const items = c.detalles_items && typeof c.detalles_items === 'object' ? c.detalles_items : {};
         const fallas = Object.entries(items).filter(([, ok]) => ok === false).map(([k]) => k);
         return (
-          <div key={c.id} className="card !p-3 mb-2 text-sm space-y-1">
+          <div key={c.id} className={`card !p-3 mb-2 text-sm space-y-1 ${c.anulado ? 'opacity-75' : ''}`}>
             <div className="flex justify-between items-start gap-2">
               <span className="font-semibold">{fmtFecha(c.fecha_local)}</span>
-              <div className="flex gap-1 shrink-0">
+              <div className="flex gap-1 shrink-0 flex-wrap justify-end">
+                {c.anulado && <Chip tono="gris">anulado</Chip>}
                 {c.cambio_aceite_realizado && <Chip tono="azul">Cambio de aceite</Chip>}
                 {c.tiene_falla ? <Chip tono="rojo">Con falla</Chip> : <Chip tono="verde">Sin novedad</Chip>}
               </div>
@@ -1397,6 +2027,18 @@ function DetalleMoto({ detalle, onVolver }) {
               </p>
             )}
             {c.observacion_falla && <p className="text-slate-700">{c.observacion_falla}</p>}
+            <SelloAnulado registro={c} />
+            <div className="flex justify-end pt-1">
+              <BotonAnular
+                recurso="checklist"
+                id={c.id}
+                anulado={c.anulado}
+                call={call}
+                aviso={aviso}
+                onListo={onRecargar}
+                etiqueta={`el checklist del ${fmtFecha(c.fecha_local)}`}
+              />
+            </div>
           </div>
         );
       }))}
@@ -1409,16 +2051,21 @@ function DetalleMoto({ detalle, onVolver }) {
       )))}
 
       {tab === 'incidencias' && (incidencias.length === 0 ? <Vacio texto="Sin incidencias" /> : incidencias.map((i) => (
-        <div key={i.id} className="card !p-3 mb-2 text-sm space-y-1">
+        <div key={i.id} className={`card !p-3 mb-2 text-sm space-y-1 ${i.anulado ? 'opacity-75' : ''}`}>
           <div className="flex justify-between items-start gap-2">
             <span className="font-semibold">{i.titulo}</span>
             <div className="flex gap-1 shrink-0">
+              {i.anulado && <Chip tono="gris">anulada</Chip>}
               <Chip tono={tonoSeveridad(i.severidad)}>{i.severidad}</Chip>
               <Chip tono={tonoEstado(i.estado)}>{etiquetaEstado(i.estado)}</Chip>
             </div>
           </div>
           <p className="text-slate-500">{fmtFechaHora(i.fecha_hora)} · {i.usuario}</p>
           {i.descripcion && <p>{i.descripcion}</p>}
+          <SelloAnulado registro={i} />
+          <div className="flex justify-end pt-1">
+            <BotonAnular recurso="incidencia" id={i.id} anulado={i.anulado} call={call} aviso={aviso} onListo={onRecargar} etiqueta="esta incidencia" />
+          </div>
         </div>
       )))}
     </div>
@@ -1451,8 +2098,29 @@ function VistaReporteMotos({ call, aviso }) {
     }
   };
 
+  const recargarDetalle = useCallback(async () => {
+    if (!detalle) return;
+    try {
+      const fresco = await call(`/api/reportes/motos/${detalle.moto.id}`);
+      setDetalle(fresco);
+      cargar(); // la lista y las alertas también cambian
+    } catch (err) {
+      aviso(err.message, 'error');
+    }
+  }, [detalle, call, aviso, cargar]);
+
   if (datos === null) return <Cargando />;
-  if (detalle) return <DetalleMoto detalle={detalle} onVolver={() => setDetalle(null)} />;
+  if (detalle) {
+    return (
+      <DetalleMoto
+        detalle={detalle}
+        onVolver={() => { setDetalle(null); cargar(); }}
+        call={call}
+        aviso={aviso}
+        onRecargar={recargarDetalle}
+      />
+    );
+  }
 
   const a = datos.alertas;
 
@@ -2087,7 +2755,8 @@ export default function PurissimaApp() {
         {vista === 'motos' && <VistaMotos {...props} />}
         {vista === 'caja' && <VistaCaja {...props} />}
         {vista === 'recepcion' && <VistaRecepcion {...props} />}
-        {vista === 'solicitudes' && <VistaSolicitudes {...props} />}
+        {vista === 'solicitudes_negocio' && <VistaSolicitudesNegocio {...props} />}
+        {vista === 'solicitudes_productos' && <VistaSolicitudesProductos {...props} />}
         {vista === 'incidencias' && <VistaIncidencias {...props} />}
         {vista === 'reportes' && esAdmin && <VistaReportes {...props} />}
         {vista === 'repmotos' && esAdmin && <VistaReporteMotos {...props} />}
