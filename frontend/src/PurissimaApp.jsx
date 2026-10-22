@@ -24,12 +24,17 @@ const MODULOS = {
   solicitudes_productos: { etiqueta: 'Solicitudes productos', icono: '🧃' },
   incidencias: { etiqueta: 'Incidencias', icono: '⚠️' },
 };
+/* Vistas que antes eran sólo del Master: ahora cada una tiene su permiso */
 const VISTAS_MASTER = {
-  reportes: { etiqueta: 'Reportes', icono: '📊' },
-  repmotos: { etiqueta: 'Reporte de motos', icono: '🛠️' },
-  finanzas: { etiqueta: 'Finanzas', icono: '💰' },
-  accesos: { etiqueta: 'Accesos', icono: '🔐' },
+  reportes: { etiqueta: 'Reportes', icono: '📊', permiso: 'ver_reportes' },
+  repmotos: { etiqueta: 'Reporte de motos', icono: '🛠️', permiso: 'ver_reporte_motos' },
+  finanzas: { etiqueta: 'Finanzas', icono: '💰', permiso: 'ver_finanzas' },
+  accesos: { etiqueta: 'Accesos', icono: '🔐', permiso: 'ver_accesos' },
 };
+
+/** ¿Tiene esta función especial? El servidor le manda todas al Master. */
+const puede = (u, clave) =>
+  Boolean(u) && Array.isArray(u.permisos_especiales) && u.permisos_especiales.includes(clave);
 
 const ROL_ETIQUETA = { admin: 'Master', motorizados: 'Motorizado', tienda: 'Tienda' };
 const ESTADO_USUARIO_ETIQUETA = { activo: 'Activo', pausado: 'Pausado', eliminado: 'Sin acceso' };
@@ -476,7 +481,7 @@ function VistaMotos({ usuario, call, aviso }) {
   const [motos, setMotos] = useState(null);
   const [seleccion, setSeleccion] = useState(null);
   const [mostrarForm, setMostrarForm] = useState(false);
-  const esAdmin = usuario.rol === 'admin';
+  const esAdmin = puede(usuario, 'gestionar_motos');
 
   const cargar = useCallback(async () => {
     try {
@@ -532,7 +537,7 @@ function VistaMotos({ usuario, call, aviso }) {
 /* Caja                                                                */
 /* ------------------------------------------------------------------ */
 function VistaCaja({ usuario, call, aviso }) {
-  const esAdmin = usuario.rol === 'admin';
+  const esAdmin = puede(usuario, 'anular_registros');
   const [hoy, setHoy] = useState(null);
   const [historial, setHistorial] = useState([]);
   const [f, setF] = useState({
@@ -722,15 +727,19 @@ function VistaRecepcion({ usuario, call, aviso }) {
 
   useEffect(() => { cargar(); }, [cargar]);
 
-  const esAdmin = usuario.rol === 'admin';
+  const puedeCatalogo = puede(usuario, 'editar_catalogo');
+  const puedeAnular = puede(usuario, 'anular_registros');
+  const puedeEliminar = puede(usuario, 'eliminar_catalogo');
 
-  // "Proveedores y productos" es exclusivo del Master
+  // "Proveedores y productos" lo abre la función "Editar catálogo"
   const pestanas = [['agua', 'Agua'], ['mercancia', 'Mercancía']];
-  if (esAdmin) pestanas.push(['catalogo', 'Proveedores y productos']);
-  const activa = tab === 'catalogo' && !esAdmin ? 'agua' : tab;
+  if (puedeCatalogo) pestanas.push(['catalogo', 'Proveedores y productos']);
+  const activa = tab === 'catalogo' && !puedeCatalogo ? 'agua' : tab;
 
   if (!datos) return <Cargando />;
-  const props = { call, aviso, datos, esAdmin, onListo: cargar };
+  const props = {
+    call, aviso, datos, onListo: cargar, puedeCatalogo, puedeAnular, puedeEliminar,
+  };
 
   return (
     <div>
@@ -738,7 +747,7 @@ function VistaRecepcion({ usuario, call, aviso }) {
       <Pestanas opciones={pestanas} activa={activa} onChange={setTab} />
       {activa === 'agua' && <EntradaAgua {...props} />}
       {activa === 'mercancia' && <EntradaMercancia {...props} />}
-      {activa === 'catalogo' && esAdmin && <Catalogo {...props} />}
+      {activa === 'catalogo' && puedeCatalogo && <Catalogo {...props} />}
     </div>
   );
 }
@@ -805,7 +814,7 @@ function SinProveedores() {
   );
 }
 
-function EntradaAgua({ call, aviso, datos, onListo, esAdmin }) {
+function EntradaAgua({ call, aviso, datos, onListo, puedeCatalogo, puedeAnular }) {
   const [litraje, setLitraje] = useState('');
   const [proveedor, setProveedor] = useState('');
   const [obs, setObs] = useState('');
@@ -830,7 +839,7 @@ function EntradaAgua({ call, aviso, datos, onListo, esAdmin }) {
     }
   };
 
-  if (datos.proveedores.length === 0 && esAdmin) return <SinProveedores />;
+  if (datos.proveedores.length === 0 && puedeCatalogo) return <SinProveedores />;
 
   return (
     <div className="space-y-4">
@@ -845,7 +854,7 @@ function EntradaAgua({ call, aviso, datos, onListo, esAdmin }) {
             required
           />
         </Campo>
-        {!esAdmin && <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} tipoPorDefecto="agua" />}
+        {!puedeCatalogo && <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} tipoPorDefecto="agua" />}
         <Campo etiqueta="Observaciones (opcional)">
           <textarea className="campo" rows={2} maxLength={500} value={obs} onChange={(e) => setObs(e.target.value)} />
         </Campo>
@@ -864,7 +873,7 @@ function EntradaAgua({ call, aviso, datos, onListo, esAdmin }) {
             <span className="truncate">{fmtFecha(e.fecha)} · {e.proveedor}{e.tiene_incidencia ? ' ⚠️' : ''}</span>
             <b className="shrink-0">{nf.format(e.litraje)} L</b>
           </div>
-          {esAdmin && (
+          {puedeAnular && (
             <div className="mt-2 flex justify-end">
               <BotonAnular recurso="entrada-agua" id={e.id} anulado={e.anulado} call={call} aviso={aviso} onListo={onListo} etiqueta="esta entrada de agua" />
             </div>
@@ -875,7 +884,7 @@ function EntradaAgua({ call, aviso, datos, onListo, esAdmin }) {
   );
 }
 
-function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
+function EntradaMercancia({ call, aviso, datos, onListo, puedeCatalogo, puedeAnular }) {
   const [proveedor, setProveedor] = useState('');
   const [obs, setObs] = useState('');
   const [filas, setFilas] = useState([{ producto_id: '', cantidad: '' }]);
@@ -908,13 +917,16 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
     }
   };
 
-  if (datos.proveedores.length === 0 && esAdmin) return <SinProveedores />;
+  if (datos.proveedores.length === 0 && puedeCatalogo) return <SinProveedores />;
   if (datos.productos.length === 0) {
     return (
-      <div className="card text-center text-slate-500">
-        {esAdmin
-          ? 'Primero registre productos en la pestaña “Proveedores y productos”.'
-          : 'Todavía no hay productos cargados. Pídele al Master que los registre.'}
+      <div className="card space-y-3">
+        <p className="text-center text-slate-500">
+          {puedeCatalogo
+            ? 'Primero registre productos en la pestaña “Proveedores y productos”.'
+            : 'Todavía no hay productos cargados. Puedes agregar el primero aquí mismo.'}
+        </p>
+        {!puedeCatalogo && <AgregarProductoRapido call={call} aviso={aviso} onListo={onListo} />}
       </div>
     );
   }
@@ -931,7 +943,7 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
             required
           />
         </Campo>
-        {!esAdmin && <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} tipoPorDefecto="mercancia" />}
+        {!puedeCatalogo && <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} tipoPorDefecto="mercancia" />}
         {filas.map((f, i) => (
           <div key={i} className="rounded-xl border border-slate-200 p-3 space-y-2">
             <Campo etiqueta={`Producto ${i + 1}`}>
@@ -956,6 +968,7 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
         <button type="button" className="btn-sec w-full" onClick={() => setFilas((p) => [...p, { producto_id: '', cantidad: '' }])}>
           + Agregar ítem
         </button>
+        {!puedeCatalogo && <AgregarProductoRapido call={call} aviso={aviso} onListo={onListo} />}
         <Campo etiqueta="Observaciones (opcional)">
           <textarea className="campo" rows={2} maxLength={500} value={obs} onChange={(e) => setObs(e.target.value)} />
         </Campo>
@@ -970,7 +983,7 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
               <li key={i}>{it.nombre || `Producto #${it.producto_id}`}: {nf.format(it.cantidad)}</li>
             ))}
           </ul>
-          {esAdmin && (
+          {puedeAnular && (
             <div className="mt-2 flex justify-end">
               <BotonAnular recurso="entrada-mercancia" id={e.id} anulado={e.anulado} call={call} aviso={aviso} onListo={onListo} etiqueta="esta entrada de mercancía" />
             </div>
@@ -981,7 +994,7 @@ function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
   );
 }
 
-function Catalogo({ call, aviso, datos, onListo }) {
+function Catalogo({ call, aviso, datos, onListo, puedeEliminar }) {
   const [prov, setProv] = useState({ nombre: '', tipo: 'ambos', contacto: '', rif: '', telefono: '' });
   const [prod, setProd] = useState({
     nombre: '', categoria: 'mercancia', subcategoria: 'bebidas',
@@ -1075,13 +1088,13 @@ function Catalogo({ call, aviso, datos, onListo }) {
         <h3 className="font-bold mb-2">Proveedores ({datos.proveedores.length})</h3>
         <p className="text-xs text-slate-500 mb-2">Toca un proveedor para modificar sus datos.</p>
         {datos.proveedores.length === 0 ? <Vacio texto="Sin proveedores" /> : datos.proveedores.map((p) => (
-          <ProveedorEditable key={p.id} proveedor={p} call={call} aviso={aviso} onListo={onListo} />
+          <ProveedorEditable key={p.id} proveedor={p} call={call} aviso={aviso} onListo={onListo} puedeEliminar={puedeEliminar} />
         ))}
 
         <h3 className="font-bold mb-2 mt-4">Productos ({datos.productos.length})</h3>
         <p className="text-xs text-slate-500 mb-2">Toca un producto para modificarlo.</p>
         {datos.productos.length === 0 ? <Vacio texto="Sin productos" /> : datos.productos.map((p) => (
-          <ProductoEditable key={p.id} producto={p} datos={datos} call={call} aviso={aviso} onListo={onListo} />
+          <ProductoEditable key={p.id} producto={p} datos={datos} call={call} aviso={aviso} onListo={onListo} puedeEliminar={puedeEliminar} />
         ))}
       </div>
     </div>
@@ -1089,7 +1102,7 @@ function Catalogo({ call, aviso, datos, onListo }) {
 }
 
 /** Producto de la lista; al tocarlo se abre para modificar todos sus datos. */
-function ProductoEditable({ producto, datos, call, aviso, onListo }) {
+function ProductoEditable({ producto, datos, call, aviso, onListo, puedeEliminar }) {
   const [abierto, setAbierto] = useState(false);
   const [f, setF] = useState({
     nombre: producto.nombre,
@@ -1177,10 +1190,12 @@ function ProductoEditable({ producto, datos, call, aviso, onListo }) {
           vacio="—"
         />
       </Campo>
-      <label className="flex items-center gap-3 min-h-[44px]">
-        <input type="checkbox" className="h-6 w-6" checked={f.activo} onChange={(e) => setF({ ...f, activo: e.target.checked })} />
-        <span className="font-medium">Producto activo</span>
-      </label>
+      {puedeEliminar && (
+        <label className="flex items-center gap-3 min-h-[44px]">
+          <input type="checkbox" className="h-6 w-6" checked={f.activo} onChange={(e) => setF({ ...f, activo: e.target.checked })} />
+          <span className="font-medium">Producto activo</span>
+        </label>
+      )}
       <button type="button" className="btn-primario w-full" disabled={guardando} onClick={guardar}>
         {guardando ? 'Guardando…' : 'Guardar cambios'}
       </button>
@@ -1189,7 +1204,7 @@ function ProductoEditable({ producto, datos, call, aviso, onListo }) {
 }
 
 /** Proveedor de la lista; al tocarlo se abre para modificar todos sus datos. */
-function ProveedorEditable({ proveedor, call, aviso, onListo }) {
+function ProveedorEditable({ proveedor, call, aviso, onListo, puedeEliminar }) {
   const [abierto, setAbierto] = useState(false);
   const [f, setF] = useState({
     nombre: proveedor.nombre,
@@ -1254,10 +1269,12 @@ function ProveedorEditable({ proveedor, call, aviso, onListo }) {
           <input className="campo" type="tel" value={f.telefono} onChange={(e) => setF({ ...f, telefono: e.target.value })} />
         </Campo>
       </div>
-      <label className="flex items-center gap-3 min-h-[44px]">
-        <input type="checkbox" className="h-6 w-6" checked={f.activo} onChange={(e) => setF({ ...f, activo: e.target.checked })} />
-        <span className="font-medium">Proveedor activo</span>
-      </label>
+      {puedeEliminar && (
+        <label className="flex items-center gap-3 min-h-[44px]">
+          <input type="checkbox" className="h-6 w-6" checked={f.activo} onChange={(e) => setF({ ...f, activo: e.target.checked })} />
+          <span className="font-medium">Proveedor activo</span>
+        </label>
+      )}
       <button type="button" className="btn-primario w-full" disabled={guardando} onClick={guardar}>
         {guardando ? 'Guardando…' : 'Guardar cambios'}
       </button>
@@ -1410,7 +1427,7 @@ function AgregarProductoRapido({ call, aviso, onListo }) {
 }
 
 /** Tarjeta común para mostrar una solicitud ya enviada. */
-function TarjetaSolicitud({ s, tipos, esAdmin, call, aviso, onListo }) {
+function TarjetaSolicitud({ s, tipos, puedeResolver, puedeAnular, call, aviso, onListo }) {
   const detalle = Array.isArray(s.detalle_items) ? s.detalle_items : [];
   return (
     <div className={`card space-y-1 ${s.anulado ? 'opacity-75' : ''}`}>
@@ -1440,9 +1457,9 @@ function TarjetaSolicitud({ s, tipos, esAdmin, call, aviso, onListo }) {
       {s.descripcion && <p className="text-sm">{s.descripcion}</p>}
       {s.notas_admin && <p className="text-sm text-agua-800 bg-agua-50 rounded-lg p-2">Master: {s.notas_admin}</p>}
       <SelloAnulado registro={s} />
-      {esAdmin && (
+      {(puedeResolver || puedeAnular) && (
         <div className="flex items-center gap-2 pt-1">
-          {!s.anulado && (
+          {puedeResolver && !s.anulado && (
             <SelectorEstado
               valor={s.estado}
               estados={ESTADOS_SOLICITUD}
@@ -1457,15 +1474,17 @@ function TarjetaSolicitud({ s, tipos, esAdmin, call, aviso, onListo }) {
               }}
             />
           )}
-          <BotonAnular
-            recurso="solicitud"
-            id={s.id}
-            anulado={s.anulado}
-            call={call}
-            aviso={aviso}
-            onListo={onListo}
-            etiqueta="esta solicitud"
-          />
+          {puedeAnular && (
+            <BotonAnular
+              recurso="solicitud"
+              id={s.id}
+              anulado={s.anulado}
+              call={call}
+              aviso={aviso}
+              onListo={onListo}
+              etiqueta="esta solicitud"
+            />
+          )}
         </div>
       )}
     </div>
@@ -1478,7 +1497,9 @@ function VistaSolicitudesNegocio({ usuario, call, aviso }) {
   const [verAnuladas, setVerAnuladas] = useState(false);
   const [f, setF] = useState({ tipo_solicitud: 'insumos_generales', titulo: '', descripcion: '' });
   const [enviando, setEnviando] = useState(false);
-  const esAdmin = usuario.rol === 'admin';
+  const puedeResolver = puede(usuario, 'resolver_solicitudes');
+  const puedeAnular = puede(usuario, 'anular_registros');
+  const verOpcionAnuladas = puede(usuario, 'ver_anulados');
 
   const cargar = useCallback(async () => {
     try {
@@ -1522,7 +1543,7 @@ function VistaSolicitudesNegocio({ usuario, call, aviso }) {
         <button className="btn-primario w-full" disabled={enviando}>{enviando ? 'Enviando…' : 'Enviar solicitud'}</button>
       </form>
 
-      {esAdmin && (
+      {verOpcionAnuladas && (
         <label className="card !p-3 flex items-center gap-3 min-h-[44px] text-sm">
           <input type="checkbox" className="h-5 w-5" checked={verAnuladas} onChange={(e) => setVerAnuladas(e.target.checked)} />
           <span>Mostrar también las anuladas</span>
@@ -1530,7 +1551,16 @@ function VistaSolicitudesNegocio({ usuario, call, aviso }) {
       )}
 
       {lista === null ? <Cargando /> : lista.length === 0 ? <Vacio texto="No hay solicitudes" /> : lista.map((s) => (
-        <TarjetaSolicitud key={s.id} s={s} tipos={TIPOS_SOLICITUD_NEGOCIO} esAdmin={esAdmin} call={call} aviso={aviso} onListo={cargar} />
+        <TarjetaSolicitud
+          key={s.id}
+          s={s}
+          tipos={TIPOS_SOLICITUD_NEGOCIO}
+          puedeResolver={puedeResolver}
+          puedeAnular={puedeAnular}
+          call={call}
+          aviso={aviso}
+          onListo={cargar}
+        />
       ))}
     </div>
   );
@@ -1542,7 +1572,9 @@ function VistaSolicitudesProductos({ usuario, call, aviso }) {
   const [datos, setDatos] = useState(null);
   const [lista, setLista] = useState(null);
   const [verAnuladas, setVerAnuladas] = useState(false);
-  const esAdmin = usuario.rol === 'admin';
+  const puedeResolver = puede(usuario, 'resolver_solicitudes');
+  const puedeAnular = puede(usuario, 'anular_registros');
+  const verOpcionAnuladas = puede(usuario, 'ver_anulados');
 
   const cargar = useCallback(async () => {
     try {
@@ -1575,7 +1607,7 @@ function VistaSolicitudesProductos({ usuario, call, aviso }) {
         ? <FormSolicitudMercancia datos={datos} call={call} aviso={aviso} onListo={cargar} />
         : <FormSolicitudAgua datos={datos} call={call} aviso={aviso} onListo={cargar} />}
 
-      {esAdmin && (
+      {verOpcionAnuladas && (
         <label className="card !p-3 flex items-center gap-3 min-h-[44px] text-sm">
           <input type="checkbox" className="h-5 w-5" checked={verAnuladas} onChange={(e) => setVerAnuladas(e.target.checked)} />
           <span>Mostrar también las anuladas</span>
@@ -1586,7 +1618,16 @@ function VistaSolicitudesProductos({ usuario, call, aviso }) {
       {lista === null ? <Cargando /> : lista.length === 0 ? <Vacio texto="Todavía no hay solicitudes" /> : lista
         .filter((s) => s.tipo_solicitud === tab)
         .map((s) => (
-          <TarjetaSolicitud key={s.id} s={s} tipos={TIPOS_SOLICITUD_PRODUCTOS} esAdmin={esAdmin} call={call} aviso={aviso} onListo={cargar} />
+          <TarjetaSolicitud
+            key={s.id}
+            s={s}
+            tipos={TIPOS_SOLICITUD_PRODUCTOS}
+            puedeResolver={puedeResolver}
+            puedeAnular={puedeAnular}
+            call={call}
+            aviso={aviso}
+            onListo={cargar}
+          />
         ))}
     </div>
   );
@@ -1751,7 +1792,9 @@ function VistaIncidencias({ usuario, call, aviso }) {
   const [lista, setLista] = useState(null);
   const [f, setF] = useState({ tipo: 'operativa_tienda', severidad: 'media', titulo: '', descripcion: '' });
   const [enviando, setEnviando] = useState(false);
-  const esAdmin = usuario.rol === 'admin';
+  const puedeResolver = puede(usuario, 'resolver_incidencias');
+  const puedeAnular = puede(usuario, 'anular_registros');
+  const esAdmin = puedeResolver || puedeAnular;
 
   const cargar = useCallback(async () => {
     try {
@@ -1823,8 +1866,12 @@ function VistaIncidencias({ usuario, call, aviso }) {
           <SelloAnulado registro={i} />
           {esAdmin && (
             <div className="flex items-center gap-2 pt-1">
-              {!i.anulado && <SelectorEstado valor={i.estado} estados={ESTADOS_INCIDENCIA} onCambiar={(e) => cambiarEstado(i, e)} />}
-              <BotonAnular recurso="incidencia" id={i.id} anulado={i.anulado} call={call} aviso={aviso} onListo={cargar} etiqueta="esta incidencia" />
+              {puedeResolver && !i.anulado && (
+                <SelectorEstado valor={i.estado} estados={ESTADOS_INCIDENCIA} onCambiar={(e) => cambiarEstado(i, e)} />
+              )}
+              {puedeAnular && (
+                <BotonAnular recurso="incidencia" id={i.id} anulado={i.anulado} call={call} aviso={aviso} onListo={cargar} etiqueta="esta incidencia" />
+              )}
             </div>
           )}
         </div>
@@ -2368,12 +2415,16 @@ function VistaFinanzas({ call, aviso }) {
 /* Master: Accesos                                                     */
 /* ------------------------------------------------------------------ */
 function VistaAccesos({ usuario, call, aviso }) {
+  const puedeGestionar = puede(usuario, 'gestionar_empleados');
   const [usuarios, setUsuarios] = useState(null);
   const [disponibles, setDisponibles] = useState(Object.keys(MODULOS));
   const [verEliminados, setVerEliminados] = useState(false);
   const [selId, setSelId] = useState('');
   const [datos, setDatos] = useState({ usuario: '', nombre: '', apellido: '', rol: 'motorizados' });
   const [marcados, setMarcados] = useState([]);
+  const [permisosDisp, setPermisosDisp] = useState([]);
+  const [puedeConceder, setPuedeConceder] = useState(false);
+  const [especiales, setEspeciales] = useState([]);
   const [guardando, setGuardando] = useState(false);
   const [creando, setCreando] = useState(false);
   const [nuevo, setNuevo] = useState({ usuario: '', nombre: '', apellido: '', rol: 'motorizados', pin: '' });
@@ -2383,6 +2434,8 @@ function VistaAccesos({ usuario, call, aviso }) {
       const data = await call(`/api/usuarios${qs({ eliminados: verEliminados ? 'true' : '' })}`);
       setUsuarios(data.usuarios);
       setDisponibles(data.modulos_disponibles);
+      setPermisosDisp(data.permisos_disponibles || []);
+      setPuedeConceder(Boolean(data.puede_conceder));
     } catch (err) {
       aviso(err.message, 'error');
       setUsuarios([]);
@@ -2398,10 +2451,13 @@ function VistaAccesos({ usuario, call, aviso }) {
     if (u) {
       setDatos({ usuario: u.usuario, nombre: u.nombre, apellido: u.apellido || '', rol: u.rol });
       setMarcados([...u.modulos_permitidos]);
+      setEspeciales([...(u.permisos_especiales || [])]);
     }
   };
 
   const alternar = (m) => setMarcados((p) => (p.includes(m) ? p.filter((x) => x !== m) : [...p, m]));
+  const alternarEspecial = (c) =>
+    setEspeciales((p) => (p.includes(c) ? p.filter((x) => x !== c) : [...p, c]));
 
   const accion = async (fn, mensaje) => {
     setGuardando(true);
@@ -2424,6 +2480,11 @@ function VistaAccesos({ usuario, call, aviso }) {
   const guardarPermisos = () => accion(
     () => call(`/api/usuarios/${selId}/permisos`, { method: 'PUT', body: { modulos_permitidos: marcados } }),
     'Permisos actualizados. El empleado los verá al recargar.',
+  );
+
+  const guardarEspeciales = () => accion(
+    () => call(`/api/usuarios/${selId}/especiales`, { method: 'PUT', body: { permisos_especiales: especiales } }),
+    'Funciones especiales actualizadas. El empleado las verá al recargar.',
   );
 
   const cambiarEstado = (estado) => {
@@ -2472,15 +2533,15 @@ function VistaAccesos({ usuario, call, aviso }) {
 
   return (
     <div className="space-y-4">
-      <Titulo derecha={
+      <Titulo derecha={puedeGestionar && (
         <button className="btn-sec !py-2 !min-h-[40px]" onClick={() => setCreando((v) => !v)}>
           {creando ? 'Cerrar' : '+ Empleado'}
         </button>
-      }>
+      )}>
         Accesos
       </Titulo>
 
-      {creando && (
+      {creando && puedeGestionar && (
         <form onSubmit={crear} className="card space-y-3">
           <h3 className="font-bold">Nuevo empleado</h3>
           <Campo etiqueta="Usuario para entrar (sin espacios)">
@@ -2577,9 +2638,13 @@ function VistaAccesos({ usuario, call, aviso }) {
               />
             </Campo>
             {esYo && <p className="text-xs text-slate-500">No puedes cambiarte el rol ni quitarte el acceso a ti mismo.</p>}
-            <button className="btn-primario w-full" disabled={guardando} onClick={guardarDatos}>
-              {guardando ? 'Guardando…' : 'Guardar datos'}
-            </button>
+            {puedeGestionar ? (
+              <button className="btn-primario w-full" disabled={guardando} onClick={guardarDatos}>
+                {guardando ? 'Guardando…' : 'Guardar datos'}
+              </button>
+            ) : (
+              <p className="text-xs text-slate-500">Sólo de lectura: no tienes la función “Gestionar empleados”.</p>
+            )}
           </div>
 
           <div className="card space-y-3">
@@ -2587,7 +2652,13 @@ function VistaAccesos({ usuario, call, aviso }) {
             <div className="space-y-1">
               {disponibles.map((m) => (
                 <label key={m} className="flex items-center gap-3 min-h-[44px] border-b border-slate-100">
-                  <input type="checkbox" className="h-6 w-6" checked={marcados.includes(m)} onChange={() => alternar(m)} />
+                  <input
+                    type="checkbox"
+                    className="h-6 w-6"
+                    checked={marcados.includes(m)}
+                    disabled={!puedeConceder}
+                    onChange={() => alternar(m)}
+                  />
                   <span>{MODULOS[m] ? `${MODULOS[m].icono} ${MODULOS[m].etiqueta}` : m}</span>
                 </label>
               ))}
@@ -2597,12 +2668,65 @@ function VistaAccesos({ usuario, call, aviso }) {
                 El Master siempre tiene acceso completo; esto solo decide qué ve en su menú.
               </p>
             )}
-            <button className="btn-primario w-full" disabled={guardando} onClick={guardarPermisos}>
-              {guardando ? 'Guardando…' : 'Guardar permisos'}
-            </button>
+            {puedeConceder && (
+              <button className="btn-primario w-full" disabled={guardando} onClick={guardarPermisos}>
+                {guardando ? 'Guardando…' : 'Guardar permisos'}
+              </button>
+            )}
           </div>
 
-          <div className="card space-y-3">
+          {sel.rol === 'admin' ? (
+            <div className="card">
+              <h3 className="font-bold mb-1">Funciones especiales</h3>
+              <p className="text-sm text-slate-500">
+                El Master tiene todas las funciones siempre. No hace falta concederlas.
+              </p>
+            </div>
+          ) : (
+            <div className="card space-y-4">
+              <div>
+                <h3 className="font-bold">Funciones especiales</h3>
+                <p className="text-xs text-slate-500">
+                  Cosas que normalmente sólo hace el Master. Puedes concederlas una por una.
+                </p>
+              </div>
+
+              {[['ver', 'Lo que puede VER'], ['hacer', 'Lo que puede HACER']].map(([grupo, titulo]) => (
+                <div key={grupo}>
+                  <p className="etiqueta">{titulo}</p>
+                  <div className="space-y-1">
+                    {permisosDisp.filter((x) => x.grupo === grupo).map((x) => (
+                      <label key={x.clave} className="flex items-start gap-3 py-2 border-b border-slate-100">
+                        <input
+                          type="checkbox"
+                          className="h-6 w-6 mt-0.5 shrink-0"
+                          checked={especiales.includes(x.clave)}
+                          disabled={!puedeConceder}
+                          onChange={() => alternarEspecial(x.clave)}
+                        />
+                        <span className="min-w-0">
+                          <span className="font-medium">{x.etiqueta}</span>
+                          <span className="block text-xs text-slate-500">{x.detalle}</span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              ))}
+
+              {puedeConceder ? (
+                <button className="btn-primario w-full" disabled={guardando} onClick={guardarEspeciales}>
+                  {guardando ? 'Guardando…' : 'Guardar funciones especiales'}
+                </button>
+              ) : (
+                <p className="text-xs text-slate-500">
+                  Sólo el Master puede conceder o quitar funciones especiales.
+                </p>
+              )}
+            </div>
+          )}
+
+          <div className={`card space-y-3 ${puedeGestionar ? '' : 'hidden'}`}>
             <h3 className="font-bold">Acceso al sistema</h3>
             <div className="grid grid-cols-3 gap-2">
               {['activo', 'pausado', 'eliminado'].map((e) => (
@@ -2744,7 +2868,9 @@ export default function PurissimaApp() {
     const items = Object.keys(MODULOS)
       .filter((m) => permitidos.includes(m))
       .map((m) => ({ clave: m, ...MODULOS[m] }));
-    if (u.rol === 'admin') Object.entries(VISTAS_MASTER).forEach(([clave, v]) => items.push({ clave, ...v }));
+    Object.entries(VISTAS_MASTER).forEach(([clave, v]) => {
+      if (puede(u, v.permiso)) items.push({ clave, ...v });
+    });
     return items;
   }, [sesion]);
 
@@ -2766,7 +2892,6 @@ export default function PurissimaApp() {
 
   const { usuario } = sesion;
   const props = { usuario, call, aviso };
-  const esAdmin = usuario.rol === 'admin';
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -2805,10 +2930,10 @@ export default function PurissimaApp() {
         {vista === 'solicitudes_negocio' && <VistaSolicitudesNegocio {...props} />}
         {vista === 'solicitudes_productos' && <VistaSolicitudesProductos {...props} />}
         {vista === 'incidencias' && <VistaIncidencias {...props} />}
-        {vista === 'reportes' && esAdmin && <VistaReportes {...props} />}
-        {vista === 'repmotos' && esAdmin && <VistaReporteMotos {...props} />}
-        {vista === 'finanzas' && esAdmin && <VistaFinanzas {...props} />}
-        {vista === 'accesos' && esAdmin && <VistaAccesos {...props} />}
+        {vista === 'reportes' && puede(usuario, 'ver_reportes') && <VistaReportes {...props} />}
+        {vista === 'repmotos' && puede(usuario, 'ver_reporte_motos') && <VistaReporteMotos {...props} />}
+        {vista === 'finanzas' && puede(usuario, 'ver_finanzas') && <VistaFinanzas {...props} />}
+        {vista === 'accesos' && puede(usuario, 'ver_accesos') && <VistaAccesos {...props} />}
         {vista === 'perfil' && <VistaPerfil {...props} />}
       </main>
       <Toast toast={toast} />

@@ -45,6 +45,33 @@ const MODULOS_VALIDOS = Object.freeze([
 ]);
 const ESTADOS_USUARIO = Object.freeze(['activo', 'pausado', 'eliminado']);
 
+/**
+ * Funciones que antes eran exclusivas del Master y ahora se conceden una
+ * a una. El Master las tiene todas siempre.
+ *
+ * NO incluye conceder permisos: eso sigue atado al rol 'admin', para que
+ * nadie pueda ampliarse a sí mismo el acceso.
+ */
+const PERMISOS_ESPECIALES = Object.freeze([
+  // --- lo que puede VER ---
+  { clave: 'ver_reportes', grupo: 'ver', etiqueta: 'Reportes', detalle: 'Histórico de solicitudes e incidencias de todo el equipo' },
+  { clave: 'ver_reporte_motos', grupo: 'ver', etiqueta: 'Reporte de motos', detalle: 'Alertas e historial completo de cada moto' },
+  { clave: 'ver_finanzas', grupo: 'ver', etiqueta: 'Finanzas', detalle: 'Los totales del negocio' },
+  { clave: 'ver_accesos', grupo: 'ver', etiqueta: 'Accesos', detalle: 'La lista de empleados y sus permisos, sin poder cambiarlos' },
+  { clave: 'ver_de_todos', grupo: 'ver', etiqueta: 'Registros de todo el equipo', detalle: 'En sus módulos, ver lo de todos y no sólo lo suyo' },
+  { clave: 'ver_anulados', grupo: 'ver', etiqueta: 'Registros anulados', detalle: 'Ver también lo que fue anulado' },
+  // --- lo que puede HACER ---
+  { clave: 'anular_registros', grupo: 'hacer', etiqueta: 'Anular registros', detalle: 'Anular y reactivar lo que se hizo mal' },
+  { clave: 'gestionar_empleados', grupo: 'hacer', etiqueta: 'Gestionar empleados', detalle: 'Crear, editar, pausar y cambiar PIN' },
+  { clave: 'gestionar_motos', grupo: 'hacer', etiqueta: 'Gestionar motos', detalle: 'Registrar motos y corregir sus datos' },
+  { clave: 'editar_catalogo', grupo: 'hacer', etiqueta: 'Editar catálogo', detalle: 'Modificar proveedores y productos' },
+  { clave: 'eliminar_catalogo', grupo: 'hacer', etiqueta: 'Eliminar del catálogo', detalle: 'Dar de baja productos y proveedores' },
+  { clave: 'resolver_solicitudes', grupo: 'hacer', etiqueta: 'Resolver solicitudes', detalle: 'Cambiar su estado' },
+  { clave: 'resolver_incidencias', grupo: 'hacer', etiqueta: 'Resolver incidencias', detalle: 'Cambiar su estado' },
+  { clave: 'corregir_caja', grupo: 'hacer', etiqueta: 'Corregir caja', detalle: 'Modificar un cierre hecho o cerrar una fecha pasada' },
+]);
+const CLAVES_PERMISOS = Object.freeze(PERMISOS_ESPECIALES.map((p) => p.clave));
+
 /* Registros que el Master puede anular, con el nombre de su tabla */
 const ANULABLES = Object.freeze({
   checklist: 'checklist_motos',
@@ -138,6 +165,7 @@ const COLUMNAS_REQUERIDAS = [
   ['usuarios', 'usuario'],
   ['usuarios', 'apellido'],
   ['usuarios', 'estado'],
+  ['usuarios', 'permisos_especiales'],
   ['solicitudes', 'titulo'],
   ['solicitudes', 'descripcion'],
   ['solicitudes', 'notas_admin'],
@@ -446,7 +474,7 @@ async function autenticar(req, res, next) {
     const payload = verificarJwt(token);
     if (!payload) throw new HttpError(401, 'Sesión inválida o vencida');
     const { rows } = await pool.query(
-      `SELECT id, usuario, nombre, apellido, rol, modulos_permitidos, estado
+      `SELECT id, usuario, nombre, apellido, rol, modulos_permitidos, permisos_especiales, estado
          FROM usuarios WHERE id = $1`,
       [payload.sub],
     );
@@ -461,6 +489,16 @@ async function autenticar(req, res, next) {
 
 const soloAdmin = (req, res, next) =>
   (req.usuario.rol === 'admin' ? next() : next(new HttpError(403, 'Acceso exclusivo del Master')));
+
+/** El Master tiene todas las funciones especiales sin que figuren en su lista. */
+const tienePermiso = (u, clave) =>
+  u.rol === 'admin' || (Array.isArray(u.permisos_especiales) && u.permisos_especiales.includes(clave));
+
+const requierePermiso = (clave) => (req, res, next) => {
+  if (tienePermiso(req.usuario, clave)) return next();
+  const p = PERMISOS_ESPECIALES.find((x) => x.clave === clave);
+  return next(new HttpError(403, `No tiene la función "${p ? p.etiqueta : clave}"`));
+};
 
 const tieneModulo = (u, modulo) =>
   u.rol === 'admin' || (Array.isArray(u.modulos_permitidos) && u.modulos_permitidos.includes(modulo));
@@ -488,6 +526,7 @@ const usuarioPublico = (u) => ({
   nombre_completo: nombreCompleto(u),
   rol: u.rol,
   modulos_permitidos: u.modulos_permitidos,
+  permisos_especiales: u.rol === 'admin' ? CLAVES_PERMISOS : (u.permisos_especiales || []),
 });
 
 /* ------------------------------------------------------------------ */
@@ -511,7 +550,7 @@ app.post('/api/auth/login', limitadorLogin, asyncH(async (req, res) => {
   if (!esPinValido(pin)) throw new HttpError(401, 'Credenciales inválidas');
 
   const { rows } = await pool.query(
-    `SELECT id, usuario, nombre, apellido, rol, modulos_permitidos, estado,
+    `SELECT id, usuario, nombre, apellido, rol, modulos_permitidos, permisos_especiales, estado,
             intentos_fallidos, bloqueado_hasta,
             (pin_hash = crypt($2, pin_hash)) AS pin_ok
        FROM usuarios WHERE lower(usuario) = lower($1)`,
@@ -586,9 +625,29 @@ function validarModulos(valor) {
   return unicos;
 }
 
-const COLS_USUARIO = `id, usuario, nombre, apellido, rol, modulos_permitidos, estado, activo, creado_en,
+const COLS_USUARIO = `id, usuario, nombre, apellido, rol, modulos_permitidos, permisos_especiales,
+            estado, activo, creado_en,
             trim(nombre || ' ' || apellido) AS nombre_completo,
             (bloqueado_hasta IS NOT NULL AND bloqueado_hasta > now()) AS bloqueado`;
+
+/**
+ * Nadie que no sea Master puede tocar una cuenta de Master ni crear una.
+ * Sin esto, alguien con "gestionar empleados" podría cambiarle el PIN al
+ * Master y quedarse con todo el sistema.
+ */
+function protegerMaster(actor, rolObjetivo) {
+  if (actor.rol !== 'admin' && rolObjetivo === 'admin') {
+    throw new HttpError(403, 'Sólo el Master puede crear o modificar otra cuenta de Master');
+  }
+}
+
+/** Comprueba que la cuenta exista y que quien actúa tenga derecho a tocarla. */
+async function exigirPuedeTocar(actor, id) {
+  const { rows } = await pool.query('SELECT id, rol FROM usuarios WHERE id = $1', [id]);
+  if (!rows[0]) throw new HttpError(404, 'Usuario no encontrado');
+  protegerMaster(actor, rows[0].rol);
+  return rows[0];
+}
 
 /** El usuario de ingreso: sin espacios, de 3 a 40 caracteres. */
 function nombreUsuario(valor) {
@@ -597,7 +656,7 @@ function nombreUsuario(valor) {
   return u;
 }
 
-app.get('/api/usuarios', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.get('/api/usuarios', autenticar, requierePermiso('ver_accesos'), asyncH(async (req, res) => {
   const incluirEliminados = req.query.eliminados === 'true';
   const { rows } = await pool.query(
     `SELECT ${COLS_USUARIO} FROM usuarios
@@ -605,15 +664,22 @@ app.get('/api/usuarios', autenticar, soloAdmin, asyncH(async (req, res) => {
       ORDER BY estado, nombre, apellido`,
     [incluirEliminados],
   );
-  res.json({ usuarios: rows, modulos_disponibles: MODULOS_VALIDOS, estados: ESTADOS_USUARIO });
+  res.json({
+    usuarios: rows,
+    modulos_disponibles: MODULOS_VALIDOS,
+    estados: ESTADOS_USUARIO,
+    permisos_disponibles: PERMISOS_ESPECIALES,
+    puede_conceder: req.usuario.rol === 'admin',
+  });
 }));
 
-app.post('/api/usuarios', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.post('/api/usuarios', autenticar, requierePermiso('gestionar_empleados'), asyncH(async (req, res) => {
   const b = req.body || {};
   const usuario = nombreUsuario(b.usuario);
   const nombre = texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 80 });
   const apellido = texto(b.apellido, 'Apellido', { max: 80 });
   const rol = unoDe(b.rol, ['motorizados', 'tienda', 'admin'], 'Rol');
+  protegerMaster(req.usuario, rol);
   if (!esPinValido(b.pin)) throw bad('El PIN debe tener entre 4 y 8 dígitos');
   const modulos = validarModulos(b.modulos_permitidos || []);
   const { rows } = await pool.query(
@@ -626,7 +692,7 @@ app.post('/api/usuarios', autenticar, soloAdmin, asyncH(async (req, res) => {
 }));
 
 /** Editar los datos de una cuenta (no el PIN ni los permisos). */
-app.put('/api/usuarios/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.put('/api/usuarios/:id', autenticar, requierePermiso('gestionar_empleados'), asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   const b = req.body || {};
   const usuarioActualizado = await withTx(async (c) => {
@@ -642,8 +708,13 @@ app.put('/api/usuarios/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
     const rol = b.rol !== undefined
       ? unoDe(b.rol, ['motorizados', 'tienda', 'admin'], 'Rol') : actual.rol;
 
-    // Protección: el Master no puede quitarse a sí mismo el rol de admin
-    if (id === req.usuario.id && rol !== 'admin') {
+    // No se puede tocar una cuenta de Master, ni ascender a nadie a Master,
+    // si quien edita no es Master
+    protegerMaster(req.usuario, actual.rol);
+    protegerMaster(req.usuario, rol);
+
+    // El Master no puede quitarse a sí mismo el rol
+    if (id === req.usuario.id && req.usuario.rol === 'admin' && rol !== 'admin') {
       throw bad('No puede quitarse a sí mismo el rol de Master');
     }
 
@@ -658,9 +729,10 @@ app.put('/api/usuarios/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
 }));
 
 /** Cambiar el estado: activo, pausado o eliminado. */
-app.put('/api/usuarios/:id/estado', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.put('/api/usuarios/:id/estado', autenticar, requierePermiso('gestionar_empleados'), asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   const estado = unoDe(req.body && req.body.estado, ESTADOS_USUARIO, 'Estado');
+  await exigirPuedeTocar(req.usuario, id);
   if (id === req.usuario.id && estado !== 'activo') {
     throw bad('No puede quitarse el acceso a sí mismo');
   }
@@ -688,9 +760,32 @@ app.put('/api/usuarios/:id/permisos', autenticar, soloAdmin, asyncH(async (req, 
   res.json({ usuario: rows[0] });
 }));
 
-app.put('/api/usuarios/:id/pin', autenticar, soloAdmin, asyncH(async (req, res) => {
+/**
+ * Endpoint exclusivo del Master: concede o quita las funciones especiales.
+ * No se delega en ningún permiso, a propósito: si "gestionar empleados"
+ * permitiera esto, quien lo tuviera podría concederse todo lo demás.
+ */
+app.put('/api/usuarios/:id/especiales', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const id = entero(req.params.id, 'id', { min: 1 });
+  const lista = req.body && req.body.permisos_especiales;
+  if (!Array.isArray(lista)) throw bad('permisos_especiales debe ser un arreglo');
+  const unicos = [...new Set(lista)];
+  for (const c of unicos) {
+    if (!CLAVES_PERMISOS.includes(c)) throw bad(`Función no válida: ${String(c).slice(0, 40)}`);
+  }
+  const { rows } = await pool.query(
+    `UPDATE usuarios SET permisos_especiales = $2::jsonb WHERE id = $1
+     RETURNING ${COLS_USUARIO}`,
+    [id, JSON.stringify(unicos)],
+  );
+  if (!rows[0]) throw new HttpError(404, 'Usuario no encontrado');
+  res.json({ usuario: rows[0] });
+}));
+
+app.put('/api/usuarios/:id/pin', autenticar, requierePermiso('gestionar_empleados'), asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   if (!esPinValido(req.body && req.body.pin)) throw bad('El PIN debe tener entre 4 y 8 dígitos');
+  await exigirPuedeTocar(req.usuario, id);
   const { rowCount } = await pool.query(
     `UPDATE usuarios SET pin_hash = crypt($2, gen_salt('bf', 10)),
             intentos_fallidos = 0, bloqueado_hasta = NULL WHERE id = $1`,
@@ -701,9 +796,10 @@ app.put('/api/usuarios/:id/pin', autenticar, soloAdmin, asyncH(async (req, res) 
 }));
 
 /** Se conserva por compatibilidad: equivale a estado activo/pausado. */
-app.put('/api/usuarios/:id/activo', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.put('/api/usuarios/:id/activo', autenticar, requierePermiso('gestionar_empleados'), asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   if (typeof (req.body && req.body.activo) !== 'boolean') throw bad('activo debe ser booleano');
+  await exigirPuedeTocar(req.usuario, id);
   if (id === req.usuario.id && req.body.activo === false) throw bad('No puede desactivar su propia cuenta');
   const { rows } = await pool.query(
     `UPDATE usuarios SET estado = $2 WHERE id = $1 RETURNING ${COLS_USUARIO}`,
@@ -722,7 +818,7 @@ app.get('/api/motos/config', autenticar, requiereModulo('motos'), (req, res) => 
 
 app.get('/api/motos', autenticar, requiereModulo('motos'), asyncH(async (req, res) => {
   const hoy = hoyCaracas();
-  const verTodas = req.usuario.rol === 'admin' && req.query.todas === 'true';
+  const verTodas = tienePermiso(req.usuario, 'gestionar_motos') && req.query.todas === 'true';
   const { rows } = await pool.query(
     `SELECT m.id, m.nombre, m.color, m.placa, m.tipo_modelo,
             m.ultimo_kilometraje, m.ultimo_cambio_aceite_km, m.activa,
@@ -741,7 +837,7 @@ app.get('/api/motos', autenticar, requiereModulo('motos'), asyncH(async (req, re
   res.json({ motos: rows, fecha: hoy });
 }));
 
-app.post('/api/motos', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.post('/api/motos', autenticar, requierePermiso('gestionar_motos'), asyncH(async (req, res) => {
   const b = req.body || {};
   const nombre = texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 80 });
   const color = texto(b.color, 'Color', { requerido: true, min: 2, max: 40 });
@@ -758,7 +854,7 @@ app.post('/api/motos', autenticar, soloAdmin, asyncH(async (req, res) => {
   res.status(201).json({ moto: rows[0] });
 }));
 
-app.put('/api/motos/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.put('/api/motos/:id', autenticar, requierePermiso('gestionar_motos'), asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   const b = req.body || {};
   const moto = await withTx(async (c) => {
@@ -785,7 +881,7 @@ app.put('/api/motos/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
   res.json({ moto });
 }));
 
-app.delete('/api/motos/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.delete('/api/motos/:id', autenticar, requierePermiso('gestionar_motos'), asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   const { rowCount } = await pool.query('UPDATE motos SET activa = FALSE WHERE id = $1', [id]);
   if (!rowCount) throw new HttpError(404, 'Moto no encontrada');
@@ -794,10 +890,11 @@ app.delete('/api/motos/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
 
 app.get('/api/motos/checklists', autenticar, requiereModulo('motos'), asyncH(async (req, res) => {
   const hoy = hoyCaracas();
-  const desde = leerFecha(req.query.desde, req.usuario.rol === 'admin' ? '1900-01-01' : hoy, 'desde');
+  const verTodos = tienePermiso(req.usuario, 'ver_de_todos');
+  const desde = leerFecha(req.query.desde, verTodos ? '1900-01-01' : hoy, 'desde');
   const hasta = leerFecha(req.query.hasta, hoy, 'hasta');
   const soloFallas = req.query.fallas === 'true';
-  const propios = req.usuario.rol === 'admin' ? null : req.usuario.id;
+  const propios = verTodos ? null : req.usuario.id;
   const { rows } = await pool.query(
     `SELECT c.*, (c.fecha AT TIME ZONE 'America/Caracas')::date AS fecha_local,
             m.placa, m.nombre AS moto, m.tipo_modelo, trim(u.nombre || ' ' || u.apellido) AS usuario
@@ -982,7 +1079,9 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
   const hoy = hoyCaracas();
   let fecha = hoy;
   if (b.fecha !== undefined && b.fecha !== null && b.fecha !== '' && b.fecha !== hoy) {
-    if (req.usuario.rol !== 'admin') throw new HttpError(403, 'Solo el Master puede registrar cierres de otras fechas');
+    if (!tienePermiso(req.usuario, 'corregir_caja')) {
+      throw new HttpError(403, 'No tiene la función "Corregir caja" para registrar cierres de otras fechas');
+    }
     fecha = leerFecha(b.fecha, hoy, 'fecha');
     if (fecha > hoy) throw bad('No se puede cerrar una fecha futura');
   }
@@ -1020,7 +1119,7 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
   res.status(201).json({ cierre });
 }));
 
-app.put('/api/caja/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.put('/api/caja/:id', autenticar, requierePermiso('corregir_caja'), asyncH(async (req, res) => {
   const id = uuid(req.params.id, 'id');
   const m = leerMontosCaja(req.body || {});
   const obs = texto(req.body && req.body.observacion, 'Observación', { max: 500 });
@@ -1078,9 +1177,13 @@ app.post('/api/proveedores', autenticar, accesoProveedores, asyncH(async (req, r
   res.status(201).json({ proveedor: rows[0] });
 }));
 
-app.put('/api/proveedores/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.put('/api/proveedores/:id', autenticar, requierePermiso('editar_catalogo'), asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   const b = req.body || {};
+  // Dar de baja un proveedor es otra función distinta de editarlo
+  if (b.activo === false && !tienePermiso(req.usuario, 'eliminar_catalogo')) {
+    throw new HttpError(403, 'No tiene la función "Eliminar del catálogo"');
+  }
   const { rows } = await pool.query(
     `UPDATE proveedores SET nombre=$2, tipo=$3, contacto=$4, rif=$5, telefono=$6, activo=$7
       WHERE id=$1 RETURNING *`,
@@ -1095,7 +1198,7 @@ app.put('/api/proveedores/:id', autenticar, soloAdmin, asyncH(async (req, res) =
   res.json({ proveedor: rows[0] });
 }));
 
-app.delete('/api/proveedores/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.delete('/api/proveedores/:id', autenticar, requierePermiso('eliminar_catalogo'), asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   const { rowCount } = await pool.query('UPDATE proveedores SET activo = FALSE WHERE id = $1', [id]);
   if (!rowCount) throw new HttpError(404, 'Proveedor no encontrado');
@@ -1144,7 +1247,7 @@ app.post('/api/productos', autenticar, (req, res, next) => {
   res.status(201).json({ producto: rows[0] });
 }));
 
-app.put('/api/productos/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.put('/api/productos/:id', autenticar, requierePermiso('editar_catalogo'), asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   const b = req.body || {};
   const producto = await withTx(async (c) => {
@@ -1152,6 +1255,11 @@ app.put('/api/productos/:id', autenticar, soloAdmin, asyncH(async (req, res) => 
     const actual = rows[0];
     if (!actual) throw new HttpError(404, 'Producto no encontrado');
     const categoria = unoDe(b.categoria, CATEGORIAS_PRODUCTO, 'Categoría');
+
+    // Dar de baja un producto es otra función distinta de editarlo
+    if (b.activo === false && actual.activo && !tienePermiso(req.usuario, 'eliminar_catalogo')) {
+      throw new HttpError(403, 'No tiene la función "Eliminar del catálogo"');
+    }
 
     // Lo que el formulario no envía se conserva: el precio ya no se edita
     // desde la aplicación, pero no debe perderse al guardar otros campos.
@@ -1178,7 +1286,7 @@ app.put('/api/productos/:id', autenticar, soloAdmin, asyncH(async (req, res) => 
   res.json({ producto });
 }));
 
-app.delete('/api/productos/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.delete('/api/productos/:id', autenticar, requierePermiso('eliminar_catalogo'), asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   const { rowCount } = await pool.query('UPDATE productos SET activo = FALSE WHERE id = $1', [id]);
   if (!rowCount) throw new HttpError(404, 'Producto no encontrado');
@@ -1293,8 +1401,8 @@ app.get('/api/solicitudes', autenticar, requiereAlgunaSolicitud, asyncH(async (r
     tipos = TIPOS_SOLICITUD_PRODUCTOS;
   }
 
-  const propios = req.usuario.rol === 'admin' ? null : req.usuario.id;
-  const verAnuladas = req.usuario.rol === 'admin' && req.query.anuladas === 'true';
+  const propios = tienePermiso(req.usuario, 'ver_de_todos') ? null : req.usuario.id;
+  const verAnuladas = tienePermiso(req.usuario, 'ver_anulados') && req.query.anuladas === 'true';
   const { rows } = await pool.query(
     `SELECT s.*, trim(u.nombre || ' ' || u.apellido) AS usuario,
             p.nombre AS proveedor,
@@ -1381,7 +1489,7 @@ app.post('/api/solicitudes', autenticar, requiereAlgunaSolicitud, asyncH(async (
   res.status(201).json({ solicitud: rows[0] });
 }));
 
-app.put('/api/solicitudes/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.put('/api/solicitudes/:id', autenticar, requierePermiso('resolver_solicitudes'), asyncH(async (req, res) => {
   const id = uuid(req.params.id, 'id');
   const b = req.body || {};
   const estado = unoDe(b.estado, ESTADOS_SOLICITUD, 'Estado');
@@ -1397,13 +1505,14 @@ app.put('/api/solicitudes/:id', autenticar, soloAdmin, asyncH(async (req, res) =
 /* Incidencias                                                         */
 /* ------------------------------------------------------------------ */
 app.get('/api/incidencias', autenticar, requiereModulo('incidencias'), asyncH(async (req, res) => {
-  const propios = req.usuario.rol === 'admin' ? null : req.usuario.id;
+  const propios = tienePermiso(req.usuario, 'ver_de_todos') ? null : req.usuario.id;
+  const verAnuladas = tienePermiso(req.usuario, 'ver_anulados') && req.query.anuladas === 'true';
   const { rows } = await pool.query(
     `SELECT i.*, trim(u.nombre || ' ' || u.apellido) AS usuario, m.placa, m.nombre AS moto FROM incidencias i
        JOIN usuarios u ON u.id = i.usuario_id LEFT JOIN motos m ON m.id = i.moto_id
-      WHERE ($1::int IS NULL OR i.usuario_id = $1) AND NOT i.anulado
+      WHERE ($1::int IS NULL OR i.usuario_id = $1) AND ($2::boolean OR NOT i.anulado)
       ORDER BY i.fecha_hora DESC LIMIT 200`,
-    [propios],
+    [propios, verAnuladas],
   );
   res.json({ incidencias: rows, tipos: TIPOS_INCIDENCIA, estados: ESTADOS_INCIDENCIA, severidades: SEVERIDADES });
 }));
@@ -1427,7 +1536,7 @@ app.post('/api/incidencias', autenticar, requiereModulo('incidencias'), asyncH(a
   res.status(201).json({ incidencia: rows[0] });
 }));
 
-app.put('/api/incidencias/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.put('/api/incidencias/:id', autenticar, requierePermiso('resolver_incidencias'), asyncH(async (req, res) => {
   const id = uuid(req.params.id, 'id');
   const b = req.body || {};
   const estado = unoDe(b.estado, ESTADOS_INCIDENCIA, 'Estado');
@@ -1445,7 +1554,7 @@ app.put('/api/incidencias/:id', autenticar, soloAdmin, asyncH(async (req, res) =
 /* Anular no borra: marca el registro, guarda quién, cuándo y por qué, */
 /* lo saca de los totales y libera el día para rehacerlo.              */
 /* ------------------------------------------------------------------ */
-app.put('/api/anular/:recurso/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.put('/api/anular/:recurso/:id', autenticar, requierePermiso('anular_registros'), asyncH(async (req, res) => {
   const { recurso } = req.params;
   const tabla = ANULABLES[recurso]; // lista blanca: nunca llega texto del usuario al SQL
   if (!tabla) throw bad(`Tipo de registro no anulable (${Object.keys(ANULABLES).join(', ')})`);
@@ -1511,7 +1620,7 @@ async function agrupar(unidad, desde, hasta, limite) {
   return rows;
 }
 
-app.get('/api/reportes/financieros', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.get('/api/reportes/financieros', autenticar, requierePermiso('ver_finanzas'), asyncH(async (req, res) => {
   const hoy = hoyCaracas();
   const desde = leerFecha(req.query.desde, '1900-01-01', 'desde');
   const hasta = leerFecha(req.query.hasta, hoy, 'hasta');
@@ -1531,7 +1640,7 @@ app.get('/api/reportes/financieros', autenticar, soloAdmin, asyncH(async (req, r
   res.json(out);
 }));
 
-app.get('/api/reportes/operativos', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.get('/api/reportes/operativos', autenticar, requierePermiso('ver_reportes'), asyncH(async (req, res) => {
   const hoy = hoyCaracas();
   const tipo = req.query.tipo || 'todos';
   unoDe(tipo, ['solicitudes', 'incidencias', 'todos'], 'tipo');
@@ -1586,7 +1695,7 @@ app.get('/api/reportes/operativos', autenticar, soloAdmin, asyncH(async (req, re
 /* ------------------------------------------------------------------ */
 const KM_AVISO_ACEITE = Number(process.env.KM_AVISO_ACEITE) || 3000;
 
-app.get('/api/reportes/motos', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.get('/api/reportes/motos', autenticar, requierePermiso('ver_reporte_motos'), asyncH(async (req, res) => {
   const hoy = hoyCaracas();
   const verInactivas = req.query.inactivas === 'true';
 
@@ -1653,7 +1762,7 @@ app.get('/api/reportes/motos', autenticar, soloAdmin, asyncH(async (req, res) =>
 }));
 
 /** Historial completo de una moto */
-app.get('/api/reportes/motos/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+app.get('/api/reportes/motos/:id', autenticar, requierePermiso('ver_reporte_motos'), asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   const desde = leerFecha(req.query.desde, '1900-01-01', 'desde');
   const hasta = leerFecha(req.query.hasta, hoyCaracas(), 'hasta');

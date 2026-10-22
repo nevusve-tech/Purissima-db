@@ -24,6 +24,7 @@ Al terminar queda un único usuario: se entra con `Master` y PIN `123456`. **Cam
 | `migracion_002_tanda1.sql` | `usuario` de ingreso, `apellido` y `estado` en la tabla de usuarios |
 | `migracion_003_tanda2.sql` | anulación de reportes, empaquetado de productos, proveedor en solicitudes y permisos de solicitudes separados |
 | `migracion_004_tanda3.sql` | subcategorías de mercancía y costos operativos del cierre en dólares |
+| `migracion_005_permisos.sql` | funciones especiales por empleado (`permisos_especiales`) |
 
 ## Paso 2: arranque local
 
@@ -62,7 +63,10 @@ Las claves primarias son UUID en las tablas de movimiento (checklist, caja, entr
 ## Reglas implementadas
 
 - **Seguridad**: JWT HS256 firmado a mano con `crypto.createHmac` y comparado con `timingSafeEqual`; límite de 10 intentos por IP; bloqueo de 15 minutos por usuario; hash de relleno para igualar tiempos cuando el usuario no existe; payload máximo 50 kb; `trust proxy`; PIN con Bcrypt vía `crypt()` de pgcrypto.
-- **Permisos dinámicos**: `modulos_permitidos` se relee de la base en cada petición, nunca del token, así que quitar un permiso surte efecto de inmediato. El menú del frontend se construye desde ese arreglo; el Master añade Reportes, Finanzas y Accesos.
+- **Permisos en dos niveles**, releídos de la base en cada petición y nunca del token, así que quitar uno surte efecto de inmediato:
+  - `modulos_permitidos` — qué formularios puede llenar. El menú del frontend se construye desde ese arreglo.
+  - `permisos_especiales` — funciones que antes eran sólo del Master, concedidas una a una. Seis de **ver** (`ver_reportes`, `ver_reporte_motos`, `ver_finanzas`, `ver_accesos`, `ver_de_todos`, `ver_anulados`) y ocho de **hacer** (`anular_registros`, `gestionar_empleados`, `gestionar_motos`, `editar_catalogo`, `eliminar_catalogo`, `resolver_solicitudes`, `resolver_incidencias`, `corregir_caja`). El rol `admin` las tiene todas implícitamente.
+- **Contra la escalada de privilegios**: conceder permisos (`/permisos` y `/especiales`) sigue atado al rol `admin` y no se delega en ninguna función, porque quien pudiera concederlos se concedería todo. Además, nadie que no sea Master puede crear una cuenta de Master ni tocar una existente: sin eso, alguien con "gestionar empleados" podría cambiarle el PIN al Master y quedarse con el sistema.
 - **Transaccionalidad**: `BEGIN/COMMIT/ROLLBACK` con `FOR UPDATE` en motos, caja y stock. El cierre de caja usa además `pg_advisory_xact_lock` y el índice único por fecha.
 - **Contabilidad**: `redondearMoneda` corrige el error de punto flotante IEEE 754. `total_cierre_bs` debe cuadrar al centavo con pago móvil + efectivo + punto, validado en la API y por un CHECK en la base. `total_ingreso_dolar` se calcula en el servidor como `total_cierre_bs / tasa_dolar`. Los costos operativos se escriben en dólares y su equivalente en bolívares (`USD × tasa`) es lo que resta al neto. La tasa se guarda con 4 decimales.
 - **Proveedores por rubro**: los de agua sólo aparecen al registrar o pedir agua, los de mercancía sólo en mercancía, y los marcados como "ambos" en las dos.

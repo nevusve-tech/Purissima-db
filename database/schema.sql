@@ -58,8 +58,13 @@ CREATE TABLE usuarios (
   apellido            varchar(80)  NOT NULL DEFAULT '',
   rol                 varchar(20)  NOT NULL CHECK (rol IN ('motorizados', 'tienda', 'admin')),
   pin_hash            varchar(120) NOT NULL,
+  -- Qué formularios puede llenar
   modulos_permitidos  jsonb        NOT NULL DEFAULT '[]'::jsonb
                                    CHECK (jsonb_typeof(modulos_permitidos) = 'array'),
+  -- Funciones del Master concedidas una a una (ver_* y hacer).
+  -- Conceder permisos NO está aquí: sigue siendo exclusivo del rol admin.
+  permisos_especiales jsonb        NOT NULL DEFAULT '[]'::jsonb
+                                   CHECK (jsonb_typeof(permisos_especiales) = 'array'),
   estado              varchar(10)  NOT NULL DEFAULT 'activo'
                                    CHECK (estado IN ('activo', 'pausado', 'eliminado')),
   intentos_fallidos   smallint     NOT NULL DEFAULT 0 CHECK (intentos_fallidos >= 0),
