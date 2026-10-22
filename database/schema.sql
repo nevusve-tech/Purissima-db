@@ -33,6 +33,7 @@ DROP TABLE IF EXISTS proveedores        CASCADE;
 DROP TABLE IF EXISTS motos              CASCADE;
 DROP TABLE IF EXISTS usuarios           CASCADE;
 DROP FUNCTION IF EXISTS set_actualizado_en() CASCADE;
+DROP FUNCTION IF EXISTS sync_usuario_activo() CASCADE;
 
 -- ---------------------------------------------------------------------
 -- Utilidad: mantener la columna actualizado_en
@@ -51,23 +52,41 @@ $fn$ LANGUAGE plpgsql;
 -- =====================================================================
 CREATE TABLE usuarios (
   id                  integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  usuario             varchar(40)  NOT NULL
+                                   CHECK (length(trim(usuario)) >= 3 AND usuario !~ '\s'),
   nombre              varchar(80)  NOT NULL CHECK (length(trim(nombre)) >= 2),
+  apellido            varchar(80)  NOT NULL DEFAULT '',
   rol                 varchar(20)  NOT NULL CHECK (rol IN ('motorizados', 'tienda', 'admin')),
   pin_hash            varchar(120) NOT NULL,
   modulos_permitidos  jsonb        NOT NULL DEFAULT '[]'::jsonb
                                    CHECK (jsonb_typeof(modulos_permitidos) = 'array'),
+  estado              varchar(10)  NOT NULL DEFAULT 'activo'
+                                   CHECK (estado IN ('activo', 'pausado', 'eliminado')),
   intentos_fallidos   smallint     NOT NULL DEFAULT 0 CHECK (intentos_fallidos >= 0),
   bloqueado_hasta     timestamptz,
   activo              boolean      NOT NULL DEFAULT TRUE,
   creado_en           timestamptz  NOT NULL DEFAULT now(),
   actualizado_en      timestamptz  NOT NULL DEFAULT now()
 );
--- El login busca por lower(nombre): el índice único evita ambigüedad
-CREATE UNIQUE INDEX ux_usuarios_nombre_lower ON usuarios (lower(nombre));
+-- Se entra con "usuario": el índice único evita ambigüedad.
+-- El nombre puede repetirse (dos empleados pueden llamarse igual).
+CREATE UNIQUE INDEX ux_usuarios_usuario_lower ON usuarios (lower(usuario));
 CREATE INDEX ix_usuarios_rol ON usuarios (rol);
+CREATE INDEX ix_usuarios_estado ON usuarios (estado);
 
 CREATE TRIGGER trg_usuarios_actualizado BEFORE UPDATE ON usuarios
   FOR EACH ROW EXECUTE FUNCTION set_actualizado_en();
+
+-- "activo" se mantiene solo en sincronía con "estado"
+CREATE FUNCTION sync_usuario_activo() RETURNS trigger AS $fn$
+BEGIN
+  NEW.activo = (NEW.estado = 'activo');
+  RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_usuarios_estado BEFORE INSERT OR UPDATE ON usuarios
+  FOR EACH ROW EXECUTE FUNCTION sync_usuario_activo();
 
 -- =====================================================================
 -- MOTOS
@@ -292,9 +311,9 @@ END $$;
 
 -- =====================================================================
 -- SEMILLA: un único usuario Master
--- Usuario: Master     PIN: 123456
+-- Se entra con el usuario "Master" y el PIN 123456
 -- CAMBIE EL PIN EN EL PRIMER INGRESO (👤 -> Cambiar PIN)
 -- =====================================================================
-INSERT INTO usuarios (nombre, rol, pin_hash, modulos_permitidos)
-VALUES ('Master', 'admin', crypt('123456', gen_salt('bf', 10)),
+INSERT INTO usuarios (usuario, nombre, apellido, rol, pin_hash, modulos_permitidos)
+VALUES ('Master', 'Master', '', 'admin', crypt('123456', gen_salt('bf', 10)),
         '["motos","caja","recepcion","solicitudes","incidencias"]'::jsonb);

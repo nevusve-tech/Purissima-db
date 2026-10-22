@@ -41,6 +41,7 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 }
 
 const MODULOS_VALIDOS = Object.freeze(['motos', 'caja', 'recepcion', 'solicitudes', 'incidencias']);
+const ESTADOS_USUARIO = Object.freeze(['activo', 'pausado', 'eliminado']);
 
 /* Listas exactas e inmodificables, indexadas por motos.tipo_modelo */
 const CHECKLISTS = Object.freeze({
@@ -114,6 +115,9 @@ async function withTx(fn) {
 /** Comprueba que la migración esté aplicada antes de aceptar tráfico. */
 const COLUMNAS_REQUERIDAS = [
   ['usuarios', 'modulos_permitidos'],
+  ['usuarios', 'usuario'],
+  ['usuarios', 'apellido'],
+  ['usuarios', 'estado'],
   ['solicitudes', 'titulo'],
   ['solicitudes', 'descripcion'],
   ['solicitudes', 'notas_admin'],
@@ -400,11 +404,12 @@ async function autenticar(req, res, next) {
     const payload = verificarJwt(token);
     if (!payload) throw new HttpError(401, 'Sesión inválida o vencida');
     const { rows } = await pool.query(
-      'SELECT id, nombre, rol, modulos_permitidos, activo FROM usuarios WHERE id = $1',
+      `SELECT id, usuario, nombre, apellido, rol, modulos_permitidos, estado
+         FROM usuarios WHERE id = $1`,
       [payload.sub],
     );
     const u = rows[0];
-    if (!u || !u.activo) throw new HttpError(401, 'Usuario inexistente o desactivado');
+    if (!u || u.estado !== 'activo') throw new HttpError(401, 'Su cuenta no tiene acceso. Consulte con el Master.');
     req.usuario = u; // permisos siempre frescos desde la BD
     next();
   } catch (err) {
@@ -421,8 +426,16 @@ const requiereModulo = (modulo) => (req, res, next) => {
   return next(new HttpError(403, `No tiene acceso al módulo "${modulo}"`));
 };
 
+const nombreCompleto = (u) => `${u.nombre || ''} ${u.apellido || ''}`.trim();
+
 const usuarioPublico = (u) => ({
-  id: u.id, nombre: u.nombre, rol: u.rol, modulos_permitidos: u.modulos_permitidos,
+  id: u.id,
+  usuario: u.usuario,
+  nombre: u.nombre,
+  apellido: u.apellido || '',
+  nombre_completo: nombreCompleto(u),
+  rol: u.rol,
+  modulos_permitidos: u.modulos_permitidos,
 });
 
 /* ------------------------------------------------------------------ */
@@ -439,15 +452,18 @@ app.get('/api/salud', asyncH(async (req, res) => {
 const HASH_RELLENO = '$2a$10$7EqJtq98hPqEX7fNZaFWoOHiCjKU3AqzFj2zvZ3Jrx8yHk3ZyYqZy';
 
 app.post('/api/auth/login', limitadorLogin, asyncH(async (req, res) => {
-  const nombre = texto(req.body && req.body.nombre, 'Usuario', { requerido: true, max: 80 });
-  const pin = req.body && req.body.pin;
+  const b = req.body || {};
+  // Se entra con "usuario"; se acepta "nombre" por compatibilidad
+  const ingreso = texto(b.usuario !== undefined ? b.usuario : b.nombre, 'Usuario', { requerido: true, max: 40 });
+  const pin = b.pin;
   if (!esPinValido(pin)) throw new HttpError(401, 'Credenciales inválidas');
 
   const { rows } = await pool.query(
-    `SELECT id, nombre, rol, modulos_permitidos, activo, intentos_fallidos, bloqueado_hasta,
+    `SELECT id, usuario, nombre, apellido, rol, modulos_permitidos, estado,
+            intentos_fallidos, bloqueado_hasta,
             (pin_hash = crypt($2, pin_hash)) AS pin_ok
-       FROM usuarios WHERE lower(nombre) = lower($1)`,
-    [nombre, pin],
+       FROM usuarios WHERE lower(usuario) = lower($1)`,
+    [ingreso, pin],
   );
   const u = rows[0];
   if (!u) {
@@ -472,7 +488,11 @@ app.post('/api/auth/login', limitadorLogin, asyncH(async (req, res) => {
     ).catch(() => {});
     throw new HttpError(401, 'Credenciales inválidas');
   }
-  if (!u.activo) throw new HttpError(401, 'Credenciales inválidas');
+  if (u.estado !== 'activo') {
+    throw new HttpError(403, u.estado === 'pausado'
+      ? 'Su cuenta está pausada. Consulte con el Master.'
+      : 'Su cuenta ya no tiene acceso al sistema.');
+  }
 
   await pool.query(
     'UPDATE usuarios SET intentos_fallidos = 0, bloqueado_hasta = NULL WHERE id = $1',
@@ -514,28 +534,93 @@ function validarModulos(valor) {
   return unicos;
 }
 
+const COLS_USUARIO = `id, usuario, nombre, apellido, rol, modulos_permitidos, estado, activo, creado_en,
+            trim(nombre || ' ' || apellido) AS nombre_completo,
+            (bloqueado_hasta IS NOT NULL AND bloqueado_hasta > now()) AS bloqueado`;
+
+/** El usuario de ingreso: sin espacios, de 3 a 40 caracteres. */
+function nombreUsuario(valor) {
+  const u = texto(valor, 'Usuario', { requerido: true, min: 3, max: 40 });
+  if (/\s/.test(u)) throw bad('El usuario no puede tener espacios');
+  return u;
+}
+
 app.get('/api/usuarios', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const incluirEliminados = req.query.eliminados === 'true';
   const { rows } = await pool.query(
-    `SELECT id, nombre, rol, modulos_permitidos, activo, creado_en,
-            (bloqueado_hasta IS NOT NULL AND bloqueado_hasta > now()) AS bloqueado
-       FROM usuarios ORDER BY nombre`,
+    `SELECT ${COLS_USUARIO} FROM usuarios
+      WHERE ($1::boolean OR estado <> 'eliminado')
+      ORDER BY estado, nombre, apellido`,
+    [incluirEliminados],
   );
-  res.json({ usuarios: rows, modulos_disponibles: MODULOS_VALIDOS });
+  res.json({ usuarios: rows, modulos_disponibles: MODULOS_VALIDOS, estados: ESTADOS_USUARIO });
 }));
 
 app.post('/api/usuarios', autenticar, soloAdmin, asyncH(async (req, res) => {
   const b = req.body || {};
+  const usuario = nombreUsuario(b.usuario);
   const nombre = texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 80 });
+  const apellido = texto(b.apellido, 'Apellido', { max: 80 });
   const rol = unoDe(b.rol, ['motorizados', 'tienda', 'admin'], 'Rol');
   if (!esPinValido(b.pin)) throw bad('El PIN debe tener entre 4 y 8 dígitos');
   const modulos = validarModulos(b.modulos_permitidos || []);
   const { rows } = await pool.query(
-    `INSERT INTO usuarios (nombre, rol, pin_hash, modulos_permitidos)
-     VALUES ($1, $2, crypt($3, gen_salt('bf', 10)), $4::jsonb)
-     RETURNING id, nombre, rol, modulos_permitidos, activo, creado_en`,
-    [nombre, rol, b.pin, JSON.stringify(modulos)],
+    `INSERT INTO usuarios (usuario, nombre, apellido, rol, pin_hash, modulos_permitidos)
+     VALUES ($1, $2, $3, $4, crypt($5, gen_salt('bf', 10)), $6::jsonb)
+     RETURNING ${COLS_USUARIO}`,
+    [usuario, nombre, apellido, rol, b.pin, JSON.stringify(modulos)],
   );
   res.status(201).json({ usuario: rows[0] });
+}));
+
+/** Editar los datos de una cuenta (no el PIN ni los permisos). */
+app.put('/api/usuarios/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const id = entero(req.params.id, 'id', { min: 1 });
+  const b = req.body || {};
+  const usuarioActualizado = await withTx(async (c) => {
+    const { rows } = await c.query('SELECT * FROM usuarios WHERE id = $1 FOR UPDATE', [id]);
+    const actual = rows[0];
+    if (!actual) throw new HttpError(404, 'Usuario no encontrado');
+
+    const usuario = b.usuario !== undefined ? nombreUsuario(b.usuario) : actual.usuario;
+    const nombre = b.nombre !== undefined
+      ? texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 80 }) : actual.nombre;
+    const apellido = b.apellido !== undefined
+      ? texto(b.apellido, 'Apellido', { max: 80 }) : actual.apellido;
+    const rol = b.rol !== undefined
+      ? unoDe(b.rol, ['motorizados', 'tienda', 'admin'], 'Rol') : actual.rol;
+
+    // Protección: el Master no puede quitarse a sí mismo el rol de admin
+    if (id === req.usuario.id && rol !== 'admin') {
+      throw bad('No puede quitarse a sí mismo el rol de Master');
+    }
+
+    const r = await c.query(
+      `UPDATE usuarios SET usuario = $2, nombre = $3, apellido = $4, rol = $5
+        WHERE id = $1 RETURNING ${COLS_USUARIO}`,
+      [id, usuario, nombre, apellido, rol],
+    );
+    return r.rows[0];
+  });
+  res.json({ usuario: usuarioActualizado });
+}));
+
+/** Cambiar el estado: activo, pausado o eliminado. */
+app.put('/api/usuarios/:id/estado', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const id = entero(req.params.id, 'id', { min: 1 });
+  const estado = unoDe(req.body && req.body.estado, ESTADOS_USUARIO, 'Estado');
+  if (id === req.usuario.id && estado !== 'activo') {
+    throw bad('No puede quitarse el acceso a sí mismo');
+  }
+  const { rows } = await pool.query(
+    `UPDATE usuarios SET estado = $2,
+            intentos_fallidos = CASE WHEN $2 = 'activo' THEN 0 ELSE intentos_fallidos END,
+            bloqueado_hasta  = CASE WHEN $2 = 'activo' THEN NULL ELSE bloqueado_hasta END
+      WHERE id = $1 RETURNING ${COLS_USUARIO}`,
+    [id, estado],
+  );
+  if (!rows[0]) throw new HttpError(404, 'Usuario no encontrado');
+  res.json({ usuario: rows[0] });
 }));
 
 /* Endpoint exclusivo del Master: actualiza el JSONB de módulos */
@@ -544,7 +629,7 @@ app.put('/api/usuarios/:id/permisos', autenticar, soloAdmin, asyncH(async (req, 
   const modulos = validarModulos(req.body && req.body.modulos_permitidos);
   const { rows } = await pool.query(
     `UPDATE usuarios SET modulos_permitidos = $2::jsonb WHERE id = $1
-     RETURNING id, nombre, rol, modulos_permitidos, activo`,
+     RETURNING ${COLS_USUARIO}`,
     [id, JSON.stringify(modulos)],
   );
   if (!rows[0]) throw new HttpError(404, 'Usuario no encontrado');
@@ -563,13 +648,14 @@ app.put('/api/usuarios/:id/pin', autenticar, soloAdmin, asyncH(async (req, res) 
   res.json({ ok: true });
 }));
 
+/** Se conserva por compatibilidad: equivale a estado activo/pausado. */
 app.put('/api/usuarios/:id/activo', autenticar, soloAdmin, asyncH(async (req, res) => {
   const id = entero(req.params.id, 'id', { min: 1 });
   if (typeof (req.body && req.body.activo) !== 'boolean') throw bad('activo debe ser booleano');
   if (id === req.usuario.id && req.body.activo === false) throw bad('No puede desactivar su propia cuenta');
   const { rows } = await pool.query(
-    'UPDATE usuarios SET activo = $2 WHERE id = $1 RETURNING id, nombre, rol, modulos_permitidos, activo',
-    [id, req.body.activo],
+    `UPDATE usuarios SET estado = $2 WHERE id = $1 RETURNING ${COLS_USUARIO}`,
+    [id, req.body.activo ? 'activo' : 'pausado'],
   );
   if (!rows[0]) throw new HttpError(404, 'Usuario no encontrado');
   res.json({ usuario: rows[0] });
@@ -661,7 +747,7 @@ app.get('/api/motos/checklists', autenticar, requiereModulo('motos'), asyncH(asy
   const propios = req.usuario.rol === 'admin' ? null : req.usuario.id;
   const { rows } = await pool.query(
     `SELECT c.*, (c.fecha AT TIME ZONE 'America/Caracas')::date AS fecha_local,
-            m.placa, m.nombre AS moto, m.tipo_modelo, u.nombre AS usuario
+            m.placa, m.nombre AS moto, m.tipo_modelo, trim(u.nombre || ' ' || u.apellido) AS usuario
        FROM checklist_motos c
        JOIN motos m ON m.id = c.moto_id
        JOIN usuarios u ON u.id = c.usuario_id
@@ -762,7 +848,7 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
 
   if (resultado.incidencia) {
     notificar(`Falla reportada en moto ${resultado.moto.placa}`, {
-      'Reportó': req.usuario.nombre,
+      'Reportó': nombreCompleto(req.usuario),
       Moto: `${resultado.moto.nombre} - ${resultado.moto.placa}`,
       Detalle: resultado.incidencia.descripcion,
     });
@@ -810,7 +896,7 @@ function leerMontosCaja(b) {
 app.get('/api/caja/hoy', autenticar, requiereModulo('caja'), asyncH(async (req, res) => {
   const hoy = hoyCaracas();
   const { rows } = await pool.query(
-    `SELECT c.*, u.nombre AS usuario FROM cierres_caja c
+    `SELECT c.*, trim(u.nombre || ' ' || u.apellido) AS usuario FROM cierres_caja c
        JOIN usuarios u ON u.id = c.usuario_id WHERE c.fecha = $1::date`,
     [hoy],
   );
@@ -822,7 +908,7 @@ app.get('/api/caja', autenticar, requiereModulo('caja'), asyncH(async (req, res)
   const desde = leerFecha(req.query.desde, '1900-01-01', 'desde');
   const hasta = leerFecha(req.query.hasta, hoy, 'hasta');
   const { rows } = await pool.query(
-    `SELECT c.*, u.nombre AS usuario FROM cierres_caja c JOIN usuarios u ON u.id = c.usuario_id
+    `SELECT c.*, trim(u.nombre || ' ' || u.apellido) AS usuario FROM cierres_caja c JOIN usuarios u ON u.id = c.usuario_id
       WHERE c.fecha BETWEEN $1::date AND $2::date ORDER BY c.fecha DESC LIMIT 200`,
     [desde, hasta],
   );
@@ -858,7 +944,7 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
   });
 
   notificar(`Cierre de caja ${fecha}`, {
-    Responsable: req.usuario.nombre,
+    Responsable: nombreCompleto(req.usuario),
     'Pago móvil (Bs)': cierre.pago_movil_bs.toFixed(2),
     'Efectivo (Bs)': cierre.efectivo_bs.toFixed(2),
     'Punto de venta (Bs)': cierre.punto_venta_bs.toFixed(2),
@@ -996,7 +1082,7 @@ app.get('/api/entradas/agua', autenticar, requiereModulo('recepcion'), asyncH(as
   const hasta = leerFecha(req.query.hasta, hoy, 'hasta');
   const { rows } = await pool.query(
     `SELECT e.*, (e.fecha_hora AT TIME ZONE 'America/Caracas')::date AS fecha,
-            u.nombre AS usuario, p.nombre AS proveedor
+            trim(u.nombre || ' ' || u.apellido) AS usuario, p.nombre AS proveedor
        FROM entradas_agua e JOIN usuarios u ON u.id = e.usuario_id
        JOIN proveedores p ON p.id = e.proveedor_id
       WHERE (e.fecha_hora AT TIME ZONE 'America/Caracas')::date BETWEEN $1::date AND $2::date
@@ -1026,7 +1112,7 @@ app.get('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asyn
   const hasta = leerFecha(req.query.hasta, hoy, 'hasta');
   const { rows } = await pool.query(
     `SELECT e.*, (e.fecha_hora AT TIME ZONE 'America/Caracas')::date AS fecha,
-            u.nombre AS usuario, p.nombre AS proveedor
+            trim(u.nombre || ' ' || u.apellido) AS usuario, p.nombre AS proveedor
        FROM entradas_mercancia e JOIN usuarios u ON u.id = e.usuario_id
        JOIN proveedores p ON p.id = e.proveedor_id
       WHERE (e.fecha_hora AT TIME ZONE 'America/Caracas')::date BETWEEN $1::date AND $2::date
@@ -1085,7 +1171,7 @@ app.post('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asy
 app.get('/api/solicitudes', autenticar, requiereModulo('solicitudes'), asyncH(async (req, res) => {
   const propios = req.usuario.rol === 'admin' ? null : req.usuario.id;
   const { rows } = await pool.query(
-    `SELECT s.*, u.nombre AS usuario FROM solicitudes s JOIN usuarios u ON u.id = s.usuario_id
+    `SELECT s.*, trim(u.nombre || ' ' || u.apellido) AS usuario FROM solicitudes s JOIN usuarios u ON u.id = s.usuario_id
       WHERE ($1::int IS NULL OR s.usuario_id = $1) ORDER BY s.fecha_hora DESC LIMIT 200`,
     [propios],
   );
@@ -1103,7 +1189,7 @@ app.post('/api/solicitudes', autenticar, requiereModulo('solicitudes'), asyncH(a
     [tipo, req.usuario.id, titulo, texto(b.descripcion, 'Descripción', { max: 2000 }), JSON.stringify(detalle)],
   );
   notificar('Nueva solicitud', {
-    Usuario: req.usuario.nombre, Tipo: rows[0].tipo_solicitud,
+    Usuario: nombreCompleto(req.usuario), Tipo: rows[0].tipo_solicitud,
     'Título': rows[0].titulo, 'Descripción': rows[0].descripcion,
   });
   res.status(201).json({ solicitud: rows[0] });
@@ -1127,7 +1213,7 @@ app.put('/api/solicitudes/:id', autenticar, soloAdmin, asyncH(async (req, res) =
 app.get('/api/incidencias', autenticar, requiereModulo('incidencias'), asyncH(async (req, res) => {
   const propios = req.usuario.rol === 'admin' ? null : req.usuario.id;
   const { rows } = await pool.query(
-    `SELECT i.*, u.nombre AS usuario, m.placa, m.nombre AS moto FROM incidencias i
+    `SELECT i.*, trim(u.nombre || ' ' || u.apellido) AS usuario, m.placa, m.nombre AS moto FROM incidencias i
        JOIN usuarios u ON u.id = i.usuario_id LEFT JOIN motos m ON m.id = i.moto_id
       WHERE ($1::int IS NULL OR i.usuario_id = $1) ORDER BY i.fecha_hora DESC LIMIT 200`,
     [propios],
@@ -1148,7 +1234,7 @@ app.post('/api/incidencias', autenticar, requiereModulo('incidencias'), asyncH(a
       b.cierre_caja_id ? uuid(b.cierre_caja_id, 'Cierre de caja') : null, severidad, titulo, descripcion],
   );
   notificar(`Nueva incidencia (${severidad})`, {
-    Usuario: req.usuario.nombre, Tipo: rows[0].tipo,
+    Usuario: nombreCompleto(req.usuario), Tipo: rows[0].tipo,
     'Título': rows[0].titulo, 'Descripción': rows[0].descripcion,
   });
   res.status(201).json({ incidencia: rows[0] });
@@ -1232,7 +1318,7 @@ app.get('/api/reportes/operativos', autenticar, soloAdmin, asyncH(async (req, re
         AND ($3::text IS NULL OR s.estado = $3) AND ($4::text IS NULL OR s.tipo_solicitud = $4)
         AND ($5::int IS NULL OR s.usuario_id = $5)`;
     const lista = await pool.query(
-      `SELECT s.*, u.nombre AS usuario FROM solicitudes s JOIN usuarios u ON u.id = s.usuario_id
+      `SELECT s.*, trim(u.nombre || ' ' || u.apellido) AS usuario FROM solicitudes s JOIN usuarios u ON u.id = s.usuario_id
         WHERE ${filtro} ORDER BY s.fecha_hora DESC LIMIT 500`, base);
     const porEstado = await pool.query(
       `SELECT s.estado, COUNT(*) AS total FROM solicitudes s WHERE ${filtro}
@@ -1248,7 +1334,7 @@ app.get('/api/reportes/operativos', autenticar, soloAdmin, asyncH(async (req, re
         AND ($3::text IS NULL OR i.estado = $3) AND ($4::text IS NULL OR i.tipo = $4)
         AND ($5::int IS NULL OR i.usuario_id = $5)`;
     const lista = await pool.query(
-      `SELECT i.*, u.nombre AS usuario, m.placa, m.nombre AS moto FROM incidencias i
+      `SELECT i.*, trim(u.nombre || ' ' || u.apellido) AS usuario, m.placa, m.nombre AS moto FROM incidencias i
          JOIN usuarios u ON u.id = i.usuario_id LEFT JOIN motos m ON m.id = i.moto_id
         WHERE ${filtro} ORDER BY i.fecha_hora DESC LIMIT 500`, base);
     const porEstado = await pool.query(
@@ -1260,6 +1346,114 @@ app.get('/api/reportes/operativos', autenticar, soloAdmin, asyncH(async (req, re
     out.incidencias = { items: lista.rows, por_estado: porEstado.rows, por_caso: porCaso.rows };
   }
   res.json(out);
+}));
+
+/* ------------------------------------------------------------------ */
+/* Reporte de motos (exclusivo del Master)                             */
+/* ------------------------------------------------------------------ */
+const KM_AVISO_ACEITE = Number(process.env.KM_AVISO_ACEITE) || 3000;
+
+app.get('/api/reportes/motos', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const hoy = hoyCaracas();
+  const verInactivas = req.query.inactivas === 'true';
+
+  const motos = await pool.query(
+    `SELECT m.id, m.nombre, m.color, m.placa, m.tipo_modelo, m.activa,
+            m.ultimo_kilometraje, m.ultimo_cambio_aceite_km,
+            (m.ultimo_kilometraje - m.ultimo_cambio_aceite_km) AS km_desde_aceite,
+            (SELECT count(*) FROM checklist_motos c WHERE c.moto_id = m.id) AS checklists_total,
+            (SELECT count(*) FROM checklist_motos c WHERE c.moto_id = m.id AND c.tiene_falla) AS checklists_con_falla,
+            (SELECT count(*) FROM incidencias i WHERE i.moto_id = m.id AND i.estado <> 'cerrada') AS incidencias_abiertas,
+            (SELECT max(c.fecha) FROM checklist_motos c WHERE c.moto_id = m.id) AS ultimo_checklist,
+            (SELECT max(c.fecha) FROM checklist_motos c
+              WHERE c.moto_id = m.id AND c.cambio_aceite_realizado) AS ultimo_cambio_aceite,
+            EXISTS (SELECT 1 FROM checklist_motos c WHERE c.moto_id = m.id
+                     AND (c.fecha AT TIME ZONE 'America/Caracas')::date = $1::date) AS checklist_hoy
+       FROM motos m
+      WHERE (m.activa OR $2::boolean)
+      ORDER BY m.activa DESC, m.nombre`,
+    [hoy, verInactivas],
+  );
+
+  // Incidencias abiertas asociadas a una moto
+  const incidencias = await pool.query(
+    `SELECT i.id, i.moto_id, i.titulo, i.descripcion, i.severidad, i.estado, i.fecha_hora,
+            m.placa, m.nombre AS moto, trim(u.nombre || ' ' || u.apellido) AS usuario
+       FROM incidencias i
+       JOIN motos m ON m.id = i.moto_id
+       JOIN usuarios u ON u.id = i.usuario_id
+      WHERE i.estado <> 'cerrada'
+      ORDER BY i.fecha_hora DESC LIMIT 100`,
+  );
+
+  // Puntos del checklist marcados como falla en los últimos 30 días
+  const itemsFalla = await pool.query(
+    `SELECT c.moto_id, m.placa, m.nombre AS moto, c.fecha, kv.key AS item,
+            trim(u.nombre || ' ' || u.apellido) AS usuario
+       FROM checklist_motos c
+       JOIN motos m ON m.id = c.moto_id
+       JOIN usuarios u ON u.id = c.usuario_id
+       CROSS JOIN LATERAL jsonb_each(c.detalles_items) kv
+      WHERE c.detalles_items IS NOT NULL
+        AND jsonb_typeof(c.detalles_items) = 'object'
+        AND kv.value = 'false'::jsonb
+        AND c.fecha > now() - interval '30 days'
+      ORDER BY c.fecha DESC LIMIT 200`,
+  );
+
+  const aceiteVencido = motos.rows
+    .filter((m) => m.km_desde_aceite >= KM_AVISO_ACEITE)
+    .map((m) => ({ moto_id: m.id, moto: m.nombre, placa: m.placa, km_desde_aceite: m.km_desde_aceite }));
+
+  res.json({
+    fecha: hoy,
+    km_aviso_aceite: KM_AVISO_ACEITE,
+    motos: motos.rows,
+    alertas: {
+      incidencias_abiertas: incidencias.rows,
+      items_en_falla: itemsFalla.rows,
+      aceite_vencido: aceiteVencido,
+      total: incidencias.rows.length + itemsFalla.rows.length + aceiteVencido.length,
+    },
+  });
+}));
+
+/** Historial completo de una moto */
+app.get('/api/reportes/motos/:id', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const id = entero(req.params.id, 'id', { min: 1 });
+  const desde = leerFecha(req.query.desde, '1900-01-01', 'desde');
+  const hasta = leerFecha(req.query.hasta, hoyCaracas(), 'hasta');
+
+  const moto = await pool.query('SELECT * FROM motos WHERE id = $1', [id]);
+  if (!moto.rows[0]) throw new HttpError(404, 'Moto no encontrada');
+
+  const checklists = await pool.query(
+    `SELECT c.*, trim(u.nombre || ' ' || u.apellido) AS usuario,
+            (c.fecha AT TIME ZONE 'America/Caracas')::date AS fecha_local
+       FROM checklist_motos c JOIN usuarios u ON u.id = c.usuario_id
+      WHERE c.moto_id = $1
+        AND (c.fecha AT TIME ZONE 'America/Caracas')::date BETWEEN $2::date AND $3::date
+      ORDER BY c.fecha DESC LIMIT 400`,
+    [id, desde, hasta],
+  );
+
+  const incidencias = await pool.query(
+    `SELECT i.*, trim(u.nombre || ' ' || u.apellido) AS usuario
+       FROM incidencias i JOIN usuarios u ON u.id = i.usuario_id
+      WHERE i.moto_id = $1 ORDER BY i.fecha_hora DESC LIMIT 200`,
+    [id],
+  );
+
+  const cambiosAceite = checklists.rows
+    .filter((c) => c.cambio_aceite_realizado)
+    .map((c) => ({ fecha: c.fecha, kilometraje: c.kilometraje_inicial, usuario: c.usuario }));
+
+  res.json({
+    moto: moto.rows[0],
+    checklists: checklists.rows,
+    incidencias: incidencias.rows,
+    cambios_aceite: cambiosAceite,
+  });
 }));
 
 /* ------------------------------------------------------------------ */

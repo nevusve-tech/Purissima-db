@@ -25,11 +25,14 @@ const MODULOS = {
 };
 const VISTAS_MASTER = {
   reportes: { etiqueta: 'Reportes', icono: '📊' },
+  repmotos: { etiqueta: 'Reporte de motos', icono: '🛠️' },
   finanzas: { etiqueta: 'Finanzas', icono: '💰' },
   accesos: { etiqueta: 'Accesos', icono: '🔐' },
 };
 
 const ROL_ETIQUETA = { admin: 'Master', motorizados: 'Motorizado', tienda: 'Tienda' };
+const ESTADO_USUARIO_ETIQUETA = { activo: 'Activo', pausado: 'Pausado', eliminado: 'Sin acceso' };
+const TONO_ESTADO_USUARIO = { activo: 'verde', pausado: 'ambar', eliminado: 'rojo' };
 
 const TIPOS_SOLICITUD = [
   ['mercancia', 'Mercancía'], ['agua', 'Agua'], ['insumos_generales', 'Insumos generales'],
@@ -217,7 +220,7 @@ function Pestanas({ opciones, activa, onChange }) {
 /* Login                                                               */
 /* ------------------------------------------------------------------ */
 function Login({ onLogin }) {
-  const [nombre, setNombre] = useState('');
+  const [usuario, setUsuario] = useState('');
   const [pin, setPin] = useState('');
   const [error, setError] = useState('');
   const [enviando, setEnviando] = useState(false);
@@ -227,7 +230,7 @@ function Login({ onLogin }) {
     setError('');
     setEnviando(true);
     try {
-      const data = await apiFetch('/api/auth/login', { method: 'POST', body: { nombre, pin } });
+      const data = await apiFetch('/api/auth/login', { method: 'POST', body: { usuario, pin } });
       onLogin(data.usuario, data.token);
     } catch (err) {
       setError(err.message);
@@ -237,15 +240,29 @@ function Login({ onLogin }) {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-b from-agua-100 to-agua-50 px-4">
-      <form onSubmit={enviar} className="card w-full max-w-sm space-y-4">
+    <div className="min-h-screen flex items-center justify-center bg-white px-4">
+      <form onSubmit={enviar} className="card w-full max-w-sm space-y-4 border-agua-100 shadow-md">
         <div className="text-center">
-          <div className="text-5xl">💧</div>
-          <h1 className="text-2xl font-extrabold text-agua-800">Purissima Cloud</h1>
-          <p className="text-sm text-slate-500">Gestión interna</p>
+          <img
+            src="/logo-purissima.png"
+            alt="Purissima - pura + natural"
+            className="mx-auto w-full max-w-[260px] h-auto"
+            width={800}
+            height={404}
+          />
+          <p className="mt-2 text-sm font-semibold tracking-wide text-agua-700">GESTIÓN INTERNA</p>
         </div>
         <Campo etiqueta="Usuario">
-          <input className="campo" value={nombre} onChange={(e) => setNombre(e.target.value)} autoComplete="username" required />
+          <input
+            className="campo"
+            value={usuario}
+            onChange={(e) => setUsuario(e.target.value.replace(/\s/g, ''))}
+            autoComplete="username"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            required
+          />
         </Campo>
         <Campo etiqueta="PIN (4 a 8 dígitos)">
           <input
@@ -261,7 +278,7 @@ function Login({ onLogin }) {
           />
         </Campo>
         {error && <p className="text-sm text-red-600 bg-red-50 rounded-lg p-2" role="alert">{error}</p>}
-        <button className="btn-primario w-full" disabled={enviando || !nombre || pin.length < 4}>
+        <button className="btn-primario w-full" disabled={enviando || !usuario || pin.length < 4}>
           {enviando ? 'Ingresando…' : 'Ingresar'}
         </button>
       </form>
@@ -646,19 +663,77 @@ function VistaRecepcion({ usuario, call, aviso }) {
 
   useEffect(() => { cargar(); }, [cargar]);
 
+  const esAdmin = usuario.rol === 'admin';
+
+  // "Proveedores y productos" es exclusivo del Master
+  const pestanas = [['agua', 'Agua'], ['mercancia', 'Mercancía']];
+  if (esAdmin) pestanas.push(['catalogo', 'Proveedores y productos']);
+  const activa = tab === 'catalogo' && !esAdmin ? 'agua' : tab;
+
   if (!datos) return <Cargando />;
+  const props = { call, aviso, datos, esAdmin, onListo: cargar };
 
   return (
     <div>
       <Titulo>Recepción</Titulo>
-      <Pestanas
-        opciones={[['agua', 'Agua'], ['mercancia', 'Mercancía'], ['catalogo', 'Proveedores y productos']]}
-        activa={tab}
-        onChange={setTab}
-      />
-      {tab === 'agua' && <EntradaAgua call={call} aviso={aviso} datos={datos} onListo={cargar} />}
-      {tab === 'mercancia' && <EntradaMercancia call={call} aviso={aviso} datos={datos} onListo={cargar} />}
-      {tab === 'catalogo' && <Catalogo call={call} aviso={aviso} datos={datos} onListo={cargar} />}
+      <Pestanas opciones={pestanas} activa={activa} onChange={setTab} />
+      {activa === 'agua' && <EntradaAgua {...props} />}
+      {activa === 'mercancia' && <EntradaMercancia {...props} />}
+      {activa === 'catalogo' && esAdmin && <Catalogo {...props} />}
+    </div>
+  );
+}
+
+/** Botón simple para quien no es Master: agregar un proveedor que falte en la lista. */
+function AgregarProveedorRapido({ call, aviso, onListo }) {
+  const [abierto, setAbierto] = useState(false);
+  const [f, setF] = useState({ nombre: '', tipo: 'ambos', telefono: '' });
+  const [enviando, setEnviando] = useState(false);
+
+  const enviar = async (e) => {
+    e.preventDefault();
+    setEnviando(true);
+    try {
+      await call('/api/proveedores', { method: 'POST', body: f });
+      aviso('Proveedor agregado', 'ok');
+      setF({ nombre: '', tipo: 'ambos', telefono: '' });
+      setAbierto(false);
+      onListo();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setEnviando(false);
+    }
+  };
+
+  if (!abierto) {
+    return (
+      <button type="button" className="btn-sec w-full !py-2 !min-h-[40px] !text-sm" onClick={() => setAbierto(true)}>
+        + Agregar proveedor que no está en la lista
+      </button>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-agua-200 bg-agua-50 p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <p className="font-semibold text-sm">Nuevo proveedor</p>
+        <button type="button" className="text-slate-500 text-xl px-2" onClick={() => setAbierto(false)} aria-label="Cerrar">×</button>
+      </div>
+      <Campo etiqueta="Nombre">
+        <input className="campo" value={f.nombre} onChange={(e) => setF({ ...f, nombre: e.target.value })} minLength={2} />
+      </Campo>
+      <div className="grid grid-cols-2 gap-2">
+        <Campo etiqueta="Tipo">
+          <Select valor={f.tipo} onChange={(v) => setF({ ...f, tipo: v })} opciones={TIPOS_PROVEEDOR} />
+        </Campo>
+        <Campo etiqueta="Teléfono">
+          <input className="campo" type="tel" value={f.telefono} onChange={(e) => setF({ ...f, telefono: e.target.value })} />
+        </Campo>
+      </div>
+      <button type="button" className="btn-primario w-full !py-2 !min-h-[40px]" disabled={enviando || f.nombre.trim().length < 2} onClick={enviar}>
+        {enviando ? 'Guardando…' : 'Guardar proveedor'}
+      </button>
     </div>
   );
 }
@@ -671,7 +746,7 @@ function SinProveedores() {
   );
 }
 
-function EntradaAgua({ call, aviso, datos, onListo }) {
+function EntradaAgua({ call, aviso, datos, onListo, esAdmin }) {
   const [litraje, setLitraje] = useState('');
   const [proveedor, setProveedor] = useState('');
   const [obs, setObs] = useState('');
@@ -696,7 +771,7 @@ function EntradaAgua({ call, aviso, datos, onListo }) {
     }
   };
 
-  if (datos.proveedores.length === 0) return <SinProveedores />;
+  if (datos.proveedores.length === 0 && esAdmin) return <SinProveedores />;
 
   return (
     <div className="space-y-4">
@@ -711,6 +786,7 @@ function EntradaAgua({ call, aviso, datos, onListo }) {
             required
           />
         </Campo>
+        {!esAdmin && <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} />}
         <Campo etiqueta="Observaciones (opcional)">
           <textarea className="campo" rows={2} maxLength={500} value={obs} onChange={(e) => setObs(e.target.value)} />
         </Campo>
@@ -733,7 +809,7 @@ function EntradaAgua({ call, aviso, datos, onListo }) {
   );
 }
 
-function EntradaMercancia({ call, aviso, datos, onListo }) {
+function EntradaMercancia({ call, aviso, datos, onListo, esAdmin }) {
   const [proveedor, setProveedor] = useState('');
   const [obs, setObs] = useState('');
   const [filas, setFilas] = useState([{ producto_id: '', cantidad: '', costo_usd: '' }]);
@@ -766,9 +842,15 @@ function EntradaMercancia({ call, aviso, datos, onListo }) {
     }
   };
 
-  if (datos.proveedores.length === 0) return <SinProveedores />;
+  if (datos.proveedores.length === 0 && esAdmin) return <SinProveedores />;
   if (datos.productos.length === 0) {
-    return <div className="card text-center text-slate-500">Primero registre productos en la pestaña “Proveedores y productos”.</div>;
+    return (
+      <div className="card text-center text-slate-500">
+        {esAdmin
+          ? 'Primero registre productos en la pestaña “Proveedores y productos”.'
+          : 'Todavía no hay productos cargados. Pídele al Master que los registre.'}
+      </div>
+    );
   }
 
   return (
@@ -783,6 +865,7 @@ function EntradaMercancia({ call, aviso, datos, onListo }) {
             required
           />
         </Campo>
+        {!esAdmin && <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} />}
         {filas.map((f, i) => (
           <div key={i} className="rounded-xl border border-slate-200 p-3 space-y-2">
             <Campo etiqueta={`Producto ${i + 1}`}>
@@ -899,11 +982,9 @@ function Catalogo({ call, aviso, datos, onListo }) {
 
       <div>
         <h3 className="font-bold mb-2">Proveedores ({datos.proveedores.length})</h3>
+        <p className="text-xs text-slate-500 mb-2">Toca un proveedor para modificar sus datos.</p>
         {datos.proveedores.length === 0 ? <Vacio texto="Sin proveedores" /> : datos.proveedores.map((p) => (
-          <div key={p.id} className="card !p-3 mb-2 flex justify-between text-sm">
-            <span className="truncate">{p.nombre}</span>
-            <Chip tono="azul">{etiquetaDe(TIPOS_PROVEEDOR, p.tipo)}</Chip>
-          </div>
+          <ProveedorEditable key={p.id} proveedor={p} call={call} aviso={aviso} onListo={onListo} />
         ))}
         <h3 className="font-bold mb-2 mt-4">Inventario ({datos.productos.length})</h3>
         {datos.productos.length === 0 ? <Vacio texto="Sin productos" /> : datos.productos.map((p) => (
@@ -913,6 +994,83 @@ function Catalogo({ call, aviso, datos, onListo }) {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+/** Proveedor de la lista; al tocarlo se abre para modificar todos sus datos. */
+function ProveedorEditable({ proveedor, call, aviso, onListo }) {
+  const [abierto, setAbierto] = useState(false);
+  const [f, setF] = useState({
+    nombre: proveedor.nombre,
+    tipo: proveedor.tipo,
+    contacto: proveedor.contacto || '',
+    rif: proveedor.rif || '',
+    telefono: proveedor.telefono || '',
+    activo: proveedor.activo,
+  });
+  const [guardando, setGuardando] = useState(false);
+
+  const guardar = async () => {
+    setGuardando(true);
+    try {
+      await call(`/api/proveedores/${proveedor.id}`, { method: 'PUT', body: f });
+      aviso('Proveedor actualizado', 'ok');
+      setAbierto(false);
+      onListo();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setGuardando(false);
+    }
+  };
+
+  if (!abierto) {
+    return (
+      <button
+        type="button"
+        onClick={() => setAbierto(true)}
+        className="card !p-3 mb-2 w-full flex justify-between items-center text-sm text-left"
+      >
+        <span className="truncate">
+          {proveedor.nombre}
+          {proveedor.telefono ? <span className="text-slate-400"> · {proveedor.telefono}</span> : null}
+        </span>
+        <Chip tono="azul">{etiquetaDe(TIPOS_PROVEEDOR, proveedor.tipo)}</Chip>
+      </button>
+    );
+  }
+
+  return (
+    <div className="card mb-2 space-y-3">
+      <div className="flex items-center justify-between">
+        <h4 className="font-bold">Modificar proveedor</h4>
+        <button type="button" className="text-slate-500 text-2xl px-2" onClick={() => setAbierto(false)} aria-label="Cerrar">×</button>
+      </div>
+      <Campo etiqueta="Nombre">
+        <input className="campo" value={f.nombre} onChange={(e) => setF({ ...f, nombre: e.target.value })} minLength={2} />
+      </Campo>
+      <Campo etiqueta="Tipo">
+        <Select valor={f.tipo} onChange={(v) => setF({ ...f, tipo: v })} opciones={TIPOS_PROVEEDOR} />
+      </Campo>
+      <Campo etiqueta="Contacto">
+        <input className="campo" value={f.contacto} onChange={(e) => setF({ ...f, contacto: e.target.value })} />
+      </Campo>
+      <div className="grid grid-cols-2 gap-2">
+        <Campo etiqueta="RIF">
+          <input className="campo" value={f.rif} onChange={(e) => setF({ ...f, rif: e.target.value })} />
+        </Campo>
+        <Campo etiqueta="Teléfono">
+          <input className="campo" type="tel" value={f.telefono} onChange={(e) => setF({ ...f, telefono: e.target.value })} />
+        </Campo>
+      </div>
+      <label className="flex items-center gap-3 min-h-[44px]">
+        <input type="checkbox" className="h-6 w-6" checked={f.activo} onChange={(e) => setF({ ...f, activo: e.target.checked })} />
+        <span className="font-medium">Proveedor activo</span>
+      </label>
+      <button type="button" className="btn-primario w-full" disabled={guardando} onClick={guardar}>
+        {guardando ? 'Guardando…' : 'Guardar cambios'}
+      </button>
     </div>
   );
 }
@@ -1182,6 +1340,213 @@ function VistaReportes({ call, aviso }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Master: Reporte de motos                                            */
+/* ------------------------------------------------------------------ */
+function DetalleMoto({ detalle, onVolver }) {
+  const { moto, checklists, incidencias, cambios_aceite: cambios } = detalle;
+  const [tab, setTab] = useState('checklists');
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2">
+        <button className="btn-sec !py-2 !min-h-[40px] !px-3" onClick={onVolver}>←</button>
+        <div className="min-w-0">
+          <h2 className="text-xl font-bold text-agua-900 truncate">{moto.nombre}</h2>
+          <p className="text-sm text-slate-500">
+            {moto.placa} · {moto.color} · {etiquetaDe(MODELOS, moto.tipo_modelo)}
+          </p>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Tarjeta titulo="Kilometraje" valor={`${nf0.format(moto.ultimo_kilometraje)} km`} destacado />
+        <Tarjeta
+          titulo="Desde el último aceite"
+          valor={`${nf0.format(moto.ultimo_kilometraje - moto.ultimo_cambio_aceite_km)} km`}
+        />
+      </div>
+
+      <Pestanas
+        opciones={[
+          ['checklists', `Checklists (${checklists.length})`],
+          ['aceite', `Aceite (${cambios.length})`],
+          ['incidencias', `Incidencias (${incidencias.length})`],
+        ]}
+        activa={tab}
+        onChange={setTab}
+      />
+
+      {tab === 'checklists' && (checklists.length === 0 ? <Vacio texto="Sin checklists registrados" /> : checklists.map((c) => {
+        const items = c.detalles_items && typeof c.detalles_items === 'object' ? c.detalles_items : {};
+        const fallas = Object.entries(items).filter(([, ok]) => ok === false).map(([k]) => k);
+        return (
+          <div key={c.id} className="card !p-3 mb-2 text-sm space-y-1">
+            <div className="flex justify-between items-start gap-2">
+              <span className="font-semibold">{fmtFecha(c.fecha_local)}</span>
+              <div className="flex gap-1 shrink-0">
+                {c.cambio_aceite_realizado && <Chip tono="azul">Cambio de aceite</Chip>}
+                {c.tiene_falla ? <Chip tono="rojo">Con falla</Chip> : <Chip tono="verde">Sin novedad</Chip>}
+              </div>
+            </div>
+            <p className="text-slate-500">
+              {c.se_uso_hoy ? `Usada · ${nf0.format(c.kilometraje_inicial || 0)} km` : 'No se usó'} · {c.usuario}
+            </p>
+            {fallas.length > 0 && (
+              <p className="text-red-700 bg-red-50 rounded-lg p-2">
+                <b>Marcado negativo:</b> {fallas.join(', ')}
+              </p>
+            )}
+            {c.observacion_falla && <p className="text-slate-700">{c.observacion_falla}</p>}
+          </div>
+        );
+      }))}
+
+      {tab === 'aceite' && (cambios.length === 0 ? <Vacio texto="Sin cambios de aceite registrados" /> : cambios.map((c, i) => (
+        <div key={i} className="card !p-3 mb-2 flex justify-between text-sm">
+          <span className="font-semibold">{fmtFechaHora(c.fecha)}</span>
+          <span>{c.kilometraje !== null ? `${nf0.format(c.kilometraje)} km` : '—'} · {c.usuario}</span>
+        </div>
+      )))}
+
+      {tab === 'incidencias' && (incidencias.length === 0 ? <Vacio texto="Sin incidencias" /> : incidencias.map((i) => (
+        <div key={i.id} className="card !p-3 mb-2 text-sm space-y-1">
+          <div className="flex justify-between items-start gap-2">
+            <span className="font-semibold">{i.titulo}</span>
+            <div className="flex gap-1 shrink-0">
+              <Chip tono={tonoSeveridad(i.severidad)}>{i.severidad}</Chip>
+              <Chip tono={tonoEstado(i.estado)}>{etiquetaEstado(i.estado)}</Chip>
+            </div>
+          </div>
+          <p className="text-slate-500">{fmtFechaHora(i.fecha_hora)} · {i.usuario}</p>
+          {i.descripcion && <p>{i.descripcion}</p>}
+        </div>
+      )))}
+    </div>
+  );
+}
+
+function VistaReporteMotos({ call, aviso }) {
+  const [datos, setDatos] = useState(null);
+  const [detalle, setDetalle] = useState(null);
+  const [abriendo, setAbriendo] = useState(false);
+
+  const cargar = useCallback(async () => {
+    try {
+      setDatos(await call('/api/reportes/motos'));
+    } catch (err) {
+      aviso(err.message, 'error');
+      setDatos({ motos: [], alertas: { total: 0, incidencias_abiertas: [], items_en_falla: [], aceite_vencido: [] } });
+    }
+  }, [call, aviso]);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  const abrir = async (m) => {
+    setAbriendo(true);
+    try {
+      setDetalle(await call(`/api/reportes/motos/${m.id}`));
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setAbriendo(false);
+    }
+  };
+
+  if (datos === null) return <Cargando />;
+  if (detalle) return <DetalleMoto detalle={detalle} onVolver={() => setDetalle(null)} />;
+
+  const a = datos.alertas;
+
+  return (
+    <div className="space-y-3">
+      <Titulo>Reporte de motos</Titulo>
+
+      {a.total > 0 ? (
+        <div className="rounded-2xl border-2 border-red-300 bg-red-50 p-4 space-y-2">
+          <p className="font-bold text-red-800">
+            ⚠️ {a.total} {a.total === 1 ? 'asunto requiere' : 'asuntos requieren'} tu atención
+          </p>
+
+          {a.incidencias_abiertas.length > 0 && (
+            <div>
+              <p className="text-sm font-semibold text-red-800 mt-2">Incidencias sin cerrar</p>
+              {a.incidencias_abiertas.map((i) => (
+                <p key={i.id} className="text-sm text-red-900">
+                  • <b>{i.moto} ({i.placa})</b>: {i.titulo} — {fmtFechaHora(i.fecha_hora)}
+                </p>
+              ))}
+            </div>
+          )}
+
+          {a.items_en_falla.length > 0 && (
+            <div>
+              <p className="text-sm font-semibold text-red-800 mt-2">Puntos marcados como negativos (últimos 30 días)</p>
+              {a.items_en_falla.slice(0, 15).map((it, i) => (
+                <p key={i} className="text-sm text-red-900">
+                  • <b>{it.moto}</b>: {it.item} — {fmtFechaHora(it.fecha)}
+                </p>
+              ))}
+              {a.items_en_falla.length > 15 && (
+                <p className="text-xs text-red-700">y {a.items_en_falla.length - 15} más…</p>
+              )}
+            </div>
+          )}
+
+          {a.aceite_vencido.length > 0 && (
+            <div>
+              <p className="text-sm font-semibold text-red-800 mt-2">Cambio de aceite vencido</p>
+              {a.aceite_vencido.map((m) => (
+                <p key={m.moto_id} className="text-sm text-red-900">
+                  • <b>{m.moto} ({m.placa})</b>: {nf0.format(m.km_desde_aceite)} km desde el último cambio
+                </p>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="rounded-2xl border-2 border-emerald-300 bg-emerald-50 p-4">
+          <p className="font-bold text-emerald-800">✓ Sin novedades en las motos</p>
+          <p className="text-sm text-emerald-700">Ninguna incidencia abierta ni punto marcado como negativo.</p>
+        </div>
+      )}
+
+      <p className="text-sm text-slate-500">Toca una moto para ver su historial completo.</p>
+
+      {datos.motos.length === 0 ? <Vacio texto="No hay motos registradas" /> : datos.motos.map((m) => (
+        <button
+          key={m.id}
+          type="button"
+          disabled={abriendo}
+          onClick={() => abrir(m)}
+          className="card w-full text-left space-y-1 disabled:opacity-60"
+        >
+          <div className="flex justify-between items-start gap-2">
+            <div className="min-w-0">
+              <p className="font-bold">{m.nombre}</p>
+              <p className="text-sm text-slate-500 truncate">
+                {m.placa} · {nf0.format(m.ultimo_kilometraje)} km
+              </p>
+            </div>
+            <span className="text-slate-400 shrink-0">›</span>
+          </div>
+          <div className="flex gap-1 flex-wrap">
+            <Chip tono={m.km_desde_aceite >= datos.km_aviso_aceite ? 'rojo' : m.km_desde_aceite >= datos.km_aviso_aceite * 0.85 ? 'ambar' : 'verde'}>
+              Aceite: {nf0.format(m.km_desde_aceite)} km
+            </Chip>
+            {m.incidencias_abiertas > 0 && <Chip tono="rojo">{m.incidencias_abiertas} incidencia(s)</Chip>}
+            {m.checklists_con_falla > 0 && <Chip tono="ambar">{m.checklists_con_falla} con falla</Chip>}
+            <Chip>{m.checklists_total} checklist(s)</Chip>
+            {m.checklist_hoy ? <Chip tono="verde">Hoy ✓</Chip> : <Chip tono="ambar">Falta hoy</Chip>}
+          </div>
+          {m.ultimo_cambio_aceite && (
+            <p className="text-xs text-slate-400">Último aceite: {fmtFechaHora(m.ultimo_cambio_aceite)}</p>
+          )}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Master: Finanzas                                                    */
 /* ------------------------------------------------------------------ */
 function Tarjeta({ titulo, valor, destacado, nota }) {
@@ -1290,37 +1655,45 @@ function VistaFinanzas({ call, aviso }) {
 function VistaAccesos({ usuario, call, aviso }) {
   const [usuarios, setUsuarios] = useState(null);
   const [disponibles, setDisponibles] = useState(Object.keys(MODULOS));
+  const [verEliminados, setVerEliminados] = useState(false);
   const [selId, setSelId] = useState('');
+  const [datos, setDatos] = useState({ usuario: '', nombre: '', apellido: '', rol: 'motorizados' });
   const [marcados, setMarcados] = useState([]);
   const [guardando, setGuardando] = useState(false);
-  const [nuevo, setNuevo] = useState({ nombre: '', rol: 'motorizados', pin: '' });
+  const [creando, setCreando] = useState(false);
+  const [nuevo, setNuevo] = useState({ usuario: '', nombre: '', apellido: '', rol: 'motorizados', pin: '' });
 
   const cargar = useCallback(async () => {
     try {
-      const data = await call('/api/usuarios');
+      const data = await call(`/api/usuarios${qs({ eliminados: verEliminados ? 'true' : '' })}`);
       setUsuarios(data.usuarios);
       setDisponibles(data.modulos_disponibles);
     } catch (err) {
       aviso(err.message, 'error');
       setUsuarios([]);
     }
-  }, [call, aviso]);
+  }, [call, aviso, verEliminados]);
   useEffect(() => { cargar(); }, [cargar]);
+
+  const sel = (usuarios || []).find((u) => String(u.id) === String(selId));
 
   const seleccionar = (id) => {
     setSelId(id);
     const u = (usuarios || []).find((x) => String(x.id) === String(id));
-    setMarcados(u ? [...u.modulos_permitidos] : []);
+    if (u) {
+      setDatos({ usuario: u.usuario, nombre: u.nombre, apellido: u.apellido || '', rol: u.rol });
+      setMarcados([...u.modulos_permitidos]);
+    }
   };
 
   const alternar = (m) => setMarcados((p) => (p.includes(m) ? p.filter((x) => x !== m) : [...p, m]));
 
-  const guardar = async () => {
+  const accion = async (fn, mensaje) => {
     setGuardando(true);
     try {
-      await call(`/api/usuarios/${selId}/permisos`, { method: 'PUT', body: { modulos_permitidos: marcados } });
-      aviso('Permisos actualizados. El empleado los verá al recargar.', 'ok');
-      cargar();
+      await fn();
+      aviso(mensaje, 'ok');
+      await cargar();
     } catch (err) {
       aviso(err.message, 'error');
     } finally {
@@ -1328,19 +1701,27 @@ function VistaAccesos({ usuario, call, aviso }) {
     }
   };
 
-  const crear = async (e) => {
-    e.preventDefault();
-    setGuardando(true);
-    try {
-      await call('/api/usuarios', { method: 'POST', body: { ...nuevo, modulos_permitidos: [] } });
-      aviso('Usuario creado. Asígnele módulos arriba.', 'ok');
-      setNuevo({ nombre: '', rol: 'motorizados', pin: '' });
-      cargar();
-    } catch (err) {
-      aviso(err.message, 'error');
-    } finally {
-      setGuardando(false);
-    }
+  const guardarDatos = () => accion(
+    () => call(`/api/usuarios/${selId}`, { method: 'PUT', body: datos }),
+    'Datos actualizados',
+  );
+
+  const guardarPermisos = () => accion(
+    () => call(`/api/usuarios/${selId}/permisos`, { method: 'PUT', body: { modulos_permitidos: marcados } }),
+    'Permisos actualizados. El empleado los verá al recargar.',
+  );
+
+  const cambiarEstado = (estado) => {
+    const textos = {
+      activo: '¿Reactivar el acceso de esta persona?',
+      pausado: '¿Pausar el acceso? No podrá entrar hasta que lo reactives, pero conserva todo su historial.',
+      eliminado: '¿Quitarle el acceso de forma permanente? Su historial de gestión se conserva intacto, solo deja de poder entrar.',
+    };
+    if (!window.confirm(textos[estado])) return undefined;
+    return accion(
+      () => call(`/api/usuarios/${selId}/estado`, { method: 'PUT', body: { estado } }),
+      'Estado actualizado',
+    );
   };
 
   const reiniciarPin = async () => {
@@ -1355,35 +1736,139 @@ function VistaAccesos({ usuario, call, aviso }) {
     }
   };
 
-  const alternarActivo = async (u) => {
+  const crear = async (e) => {
+    e.preventDefault();
+    setGuardando(true);
     try {
-      await call(`/api/usuarios/${u.id}/activo`, { method: 'PUT', body: { activo: !u.activo } });
-      aviso(u.activo ? 'Usuario desactivado' : 'Usuario activado', 'ok');
+      await call('/api/usuarios', { method: 'POST', body: { ...nuevo, modulos_permitidos: [] } });
+      aviso('Empleado creado. Ahora asígnale sus módulos.', 'ok');
+      setNuevo({ usuario: '', nombre: '', apellido: '', rol: 'motorizados', pin: '' });
+      setCreando(false);
       cargar();
     } catch (err) {
       aviso(err.message, 'error');
+    } finally {
+      setGuardando(false);
     }
   };
 
   if (usuarios === null) return <Cargando />;
-  const sel = usuarios.find((u) => String(u.id) === String(selId));
+  const esYo = sel && sel.id === usuario.id;
 
   return (
     <div className="space-y-4">
-      <Titulo>Accesos</Titulo>
+      <Titulo derecha={
+        <button className="btn-sec !py-2 !min-h-[40px]" onClick={() => setCreando((v) => !v)}>
+          {creando ? 'Cerrar' : '+ Empleado'}
+        </button>
+      }>
+        Accesos
+      </Titulo>
+
+      {creando && (
+        <form onSubmit={crear} className="card space-y-3">
+          <h3 className="font-bold">Nuevo empleado</h3>
+          <Campo etiqueta="Usuario para entrar (sin espacios)">
+            <input
+              className="campo"
+              value={nuevo.usuario}
+              onChange={(e) => setNuevo({ ...nuevo, usuario: e.target.value.replace(/\s/g, '') })}
+              minLength={3}
+              maxLength={40}
+              autoCapitalize="none"
+              required
+            />
+          </Campo>
+          <div className="grid grid-cols-2 gap-2">
+            <Campo etiqueta="Nombre">
+              <input className="campo" value={nuevo.nombre} onChange={(e) => setNuevo({ ...nuevo, nombre: e.target.value })} minLength={2} required />
+            </Campo>
+            <Campo etiqueta="Apellido">
+              <input className="campo" value={nuevo.apellido} onChange={(e) => setNuevo({ ...nuevo, apellido: e.target.value })} />
+            </Campo>
+          </div>
+          <Campo etiqueta="Rol">
+            <Select
+              valor={nuevo.rol}
+              onChange={(v) => setNuevo({ ...nuevo, rol: v })}
+              opciones={[['motorizados', 'Motorizado'], ['tienda', 'Tienda'], ['admin', 'Master']]}
+            />
+          </Campo>
+          <Campo etiqueta="PIN inicial (4 a 8 dígitos)">
+            <input
+              className="campo"
+              inputMode="numeric"
+              pattern="\d{4,8}"
+              maxLength={8}
+              value={nuevo.pin}
+              onChange={(e) => setNuevo({ ...nuevo, pin: e.target.value.replace(/\D/g, '') })}
+              required
+            />
+          </Campo>
+          <button className="btn-primario w-full" disabled={guardando}>Crear empleado</button>
+        </form>
+      )}
+
       <div className="card space-y-3">
         <Campo etiqueta="Empleado">
           <Select
             valor={selId}
             onChange={seleccionar}
-            opciones={usuarios.map((u) => [String(u.id), `${u.nombre} (${ROL_ETIQUETA[u.rol] || u.rol})${u.activo ? '' : ' — inactivo'}`])}
+            opciones={usuarios.map((u) => [
+              String(u.id),
+              `${u.nombre_completo || u.nombre} (${ROL_ETIQUETA[u.rol] || u.rol})${u.estado === 'activo' ? '' : ` — ${ESTADO_USUARIO_ETIQUETA[u.estado]}`}`,
+            ])}
             vacio="Seleccione…"
           />
         </Campo>
-        {sel && (
-          <>
-            {sel.bloqueado && <Chip tono="rojo">Cuenta bloqueada por intentos fallidos</Chip>}
-            <p className="etiqueta">Formularios / módulos que puede ver y llenar</p>
+        <label className="flex items-center gap-3 min-h-[44px] text-sm">
+          <input type="checkbox" className="h-5 w-5" checked={verEliminados} onChange={(e) => setVerEliminados(e.target.checked)} />
+          <span>Mostrar también las cuentas sin acceso permanente</span>
+        </label>
+      </div>
+
+      {sel && (
+        <>
+          <div className="card space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="font-bold">Datos de la cuenta</h3>
+              <Chip tono={TONO_ESTADO_USUARIO[sel.estado]}>{ESTADO_USUARIO_ETIQUETA[sel.estado]}</Chip>
+            </div>
+            {sel.bloqueado && <Chip tono="rojo">Bloqueada por intentos fallidos</Chip>}
+            <Campo etiqueta="Usuario para entrar (sin espacios)">
+              <input
+                className="campo"
+                value={datos.usuario}
+                onChange={(e) => setDatos({ ...datos, usuario: e.target.value.replace(/\s/g, '') })}
+                minLength={3}
+                maxLength={40}
+                autoCapitalize="none"
+              />
+            </Campo>
+            <div className="grid grid-cols-2 gap-2">
+              <Campo etiqueta="Nombre">
+                <input className="campo" value={datos.nombre} onChange={(e) => setDatos({ ...datos, nombre: e.target.value })} minLength={2} />
+              </Campo>
+              <Campo etiqueta="Apellido">
+                <input className="campo" value={datos.apellido} onChange={(e) => setDatos({ ...datos, apellido: e.target.value })} />
+              </Campo>
+            </div>
+            <Campo etiqueta="Rol">
+              <Select
+                valor={datos.rol}
+                onChange={(v) => setDatos({ ...datos, rol: v })}
+                opciones={[['motorizados', 'Motorizado'], ['tienda', 'Tienda'], ['admin', 'Master']]}
+                disabled={esYo}
+              />
+            </Campo>
+            {esYo && <p className="text-xs text-slate-500">No puedes cambiarte el rol ni quitarte el acceso a ti mismo.</p>}
+            <button className="btn-primario w-full" disabled={guardando} onClick={guardarDatos}>
+              {guardando ? 'Guardando…' : 'Guardar datos'}
+            </button>
+          </div>
+
+          <div className="card space-y-3">
+            <h3 className="font-bold">Formularios que puede ver y llenar</h3>
             <div className="space-y-1">
               {disponibles.map((m) => (
                 <label key={m} className="flex items-center gap-3 min-h-[44px] border-b border-slate-100">
@@ -1394,47 +1879,40 @@ function VistaAccesos({ usuario, call, aviso }) {
             </div>
             {sel.rol === 'admin' && (
               <p className="text-xs text-slate-500">
-                El Master siempre tiene acceso completo; estos permisos sólo afectan lo que ve en su menú.
+                El Master siempre tiene acceso completo; esto solo decide qué ve en su menú.
               </p>
             )}
-            <button className="btn-primario w-full" disabled={guardando} onClick={guardar}>
+            <button className="btn-primario w-full" disabled={guardando} onClick={guardarPermisos}>
               {guardando ? 'Guardando…' : 'Guardar permisos'}
             </button>
-            <div className="grid grid-cols-2 gap-2">
-              <button className="btn-sec" onClick={reiniciarPin}>Cambiar PIN</button>
-              <button className="btn-sec" disabled={sel.id === usuario.id} onClick={() => alternarActivo(sel)}>
-                {sel.activo ? 'Desactivar' : 'Activar'}
-              </button>
-            </div>
-          </>
-        )}
-      </div>
+          </div>
 
-      <form onSubmit={crear} className="card space-y-3">
-        <h3 className="font-bold">Nuevo empleado</h3>
-        <Campo etiqueta="Nombre">
-          <input className="campo" value={nuevo.nombre} onChange={(e) => setNuevo({ ...nuevo, nombre: e.target.value })} minLength={2} required />
-        </Campo>
-        <Campo etiqueta="Rol">
-          <Select
-            valor={nuevo.rol}
-            onChange={(v) => setNuevo({ ...nuevo, rol: v })}
-            opciones={[['motorizados', 'Motorizado'], ['tienda', 'Tienda'], ['admin', 'Master']]}
-          />
-        </Campo>
-        <Campo etiqueta="PIN inicial (4 a 8 dígitos)">
-          <input
-            className="campo"
-            inputMode="numeric"
-            pattern="\d{4,8}"
-            maxLength={8}
-            value={nuevo.pin}
-            onChange={(e) => setNuevo({ ...nuevo, pin: e.target.value.replace(/\D/g, '') })}
-            required
-          />
-        </Campo>
-        <button className="btn-primario w-full" disabled={guardando}>Crear empleado</button>
-      </form>
+          <div className="card space-y-3">
+            <h3 className="font-bold">Acceso al sistema</h3>
+            <div className="grid grid-cols-3 gap-2">
+              {['activo', 'pausado', 'eliminado'].map((e) => (
+                <button
+                  key={e}
+                  disabled={guardando || esYo || sel.estado === e}
+                  onClick={() => cambiarEstado(e)}
+                  className={`btn !px-2 !text-sm ${
+                    sel.estado === e
+                      ? 'bg-agua-700 text-white'
+                      : e === 'eliminado' ? 'bg-red-100 text-red-800' : 'bg-slate-200 text-slate-800'
+                  }`}
+                >
+                  {ESTADO_USUARIO_ETIQUETA[e]}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-slate-500">
+              Pausar quita el acceso temporalmente. Quitar acceso lo hace de forma permanente.
+              En los dos casos el historial de su gestión se conserva intacto.
+            </p>
+            <button className="btn-sec w-full" onClick={reiniciarPin}>Cambiar su PIN</button>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1465,8 +1943,9 @@ function VistaPerfil({ usuario, call, aviso }) {
     <div className="space-y-4">
       <Titulo>Mi cuenta</Titulo>
       <div className="card">
-        <p className="font-bold text-lg">{usuario.nombre}</p>
+        <p className="font-bold text-lg">{usuario.nombre_completo || usuario.nombre}</p>
         <p className="text-slate-500">{ROL_ETIQUETA[usuario.rol] || usuario.rol}</p>
+        <p className="text-sm text-slate-400 mt-1">Usuario de ingreso: <b>{usuario.usuario}</b></p>
       </div>
       <form onSubmit={enviar} className="card space-y-3">
         <h3 className="font-bold">Cambiar PIN</h3>
@@ -1581,8 +2060,8 @@ export default function PurissimaApp() {
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-2xl">💧</span>
             <div className="leading-tight min-w-0">
-              <p className="font-extrabold">Purissima</p>
-              <p className="text-xs text-agua-100 truncate">{usuario.nombre} · {ROL_ETIQUETA[usuario.rol] || usuario.rol}</p>
+              <p className="font-extrabold truncate">{usuario.nombre_completo || usuario.nombre}</p>
+              <p className="text-xs text-agua-100 truncate">{ROL_ETIQUETA[usuario.rol] || usuario.rol}</p>
             </div>
           </div>
           <div className="flex items-center gap-1 shrink-0">
@@ -1611,6 +2090,7 @@ export default function PurissimaApp() {
         {vista === 'solicitudes' && <VistaSolicitudes {...props} />}
         {vista === 'incidencias' && <VistaIncidencias {...props} />}
         {vista === 'reportes' && esAdmin && <VistaReportes {...props} />}
+        {vista === 'repmotos' && esAdmin && <VistaReporteMotos {...props} />}
         {vista === 'finanzas' && esAdmin && <VistaFinanzas {...props} />}
         {vista === 'accesos' && esAdmin && <VistaAccesos {...props} />}
         {vista === 'perfil' && <VistaPerfil {...props} />}

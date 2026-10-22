@@ -1,6 +1,6 @@
 /* Service worker mínimo: caché del shell, nunca cachea /api */
-const CACHE = 'purissima-shell-v1';
-const SHELL = ['/', '/manifest.webmanifest', '/icon.svg'];
+const CACHE = 'purissima-shell-v2';
+const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/logo-purissima.png'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
