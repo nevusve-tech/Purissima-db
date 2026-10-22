@@ -2306,6 +2306,25 @@ app.use((err, req, res, next) => {
 /* ------------------------------------------------------------------ */
 const server = app.listen(PORT, async () => {
   console.log(`Purissima Cloud escuchando en el puerto ${PORT} (${TZ})`);
+
+  /*
+   * Deja dicho si las fotos quedaron encendidas. Las claves del almacén
+   * se leen una sola vez, al arrancar: si se agregan en Render sin
+   * reiniciar el servicio, siguen sin efecto, y sin esta línea la única
+   * forma de notarlo era abrir el formulario en el teléfono y mirar si
+   * las fotos salían como obligatorias.
+   */
+  if (FOTOS_HABILITADAS) {
+    console.log(`[fotos] Activadas. Almacén "${BUCKET_FOTOS}" en ${SUPABASE_URL}`);
+  } else {
+    const faltan = [
+      !SUPABASE_URL && 'SUPABASE_URL',
+      !SUPABASE_SERVICE_KEY && 'SUPABASE_SERVICE_KEY',
+    ].filter(Boolean);
+    console.warn(`[fotos] Desactivadas: falta ${faltan.join(' y ')} en las variables de entorno.`);
+    console.warn('[fotos] El sistema funciona igual, pero no acepta fotos y el checklist no las exige.');
+  }
+
   try {
     app.locals.esquemaOk = await verificarEsquema();
   } catch (err) {
