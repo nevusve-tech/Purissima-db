@@ -26,7 +26,7 @@ services:
       npm --prefix frontend install --include=dev &&
       npm --prefix frontend run build &&
       npm --prefix backend install --omit=dev &&
-      (npm --prefix frontend audit || true)
+      (cd frontend && npm audit || true)
     startCommand: npm --prefix backend start
     healthCheckPath: /api/salud
     envVars:
