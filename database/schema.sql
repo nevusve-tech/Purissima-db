@@ -366,13 +366,14 @@ CREATE TABLE solicitudes (
   notas_admin     text,
   proveedor_id    integer      REFERENCES proveedores (id),
   fecha_hora      timestamptz  NOT NULL DEFAULT now(),
-  actualizado_en  timestamptz  NOT NULL DEFAULT now(),
-  -- En mercancía el proveedor es obligatorio: sin él, al recibir no se
-  -- sabe si pedir la foto de la factura ni si la entrega va a crédito, y
-  -- de hecho no se puede recibir porque la recepción exige proveedor.
-  CONSTRAINT ck_solicitudes_proveedor_mercancia
-    CHECK (tipo_solicitud <> 'mercancia' OR proveedor_id IS NOT NULL)
+  actualizado_en  timestamptz  NOT NULL DEFAULT now()
 );
+-- El proveedor es obligatorio en mercancía, pero eso lo exige el backend
+-- y no una restricción aquí. Una restricción en la base rompería las
+-- solicitudes creadas antes de la regla: NOT VALID no perdona una fila
+-- para siempre, sólo evita revisar las existentes al crearla, y después
+-- cualquier UPDATE de esas filas vuelve a fallar. Pasó: una solicitud
+-- vieja sin proveedor no se podía ni anular ni recibir.
 CREATE INDEX ix_solicitudes_fecha ON solicitudes (fecha_hora);
 CREATE INDEX ix_solicitudes_proveedor ON solicitudes (proveedor_id);
 CREATE INDEX ix_solicitudes_usuario ON solicitudes (usuario_id);

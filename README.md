@@ -28,6 +28,7 @@ Al terminar queda un único usuario: se entra con `Master` y PIN `123456`. **Cam
 | `migracion_006_roles.sql` | tabla `roles`: los cargos los crea el Master y cada uno guarda sus permisos |
 | `migracion_007_fotos.sql` | almacén privado de fotos, las tres del checklist de motos y la de la factura |
 | `migracion_009_credito.sql` | proveedores a crédito, proveedor obligatorio en solicitudes de mercancía y puntos del checklist en reparación |
+| `migracion_010_arreglo_solicitud.sql` | retira la restricción de la 009 que impedía anular o recibir una solicitud vieja sin proveedor |
 | `migracion_008_mejoras.sql` | km exacto del cambio de aceite, combustible, recepción contra solicitud, tipo de factura por proveedor, apertura de tienda y ajustes del Master |
 
 ## Paso 2: arranque local
