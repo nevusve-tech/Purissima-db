@@ -59,6 +59,7 @@ const PERMISOS_ESPECIALES = Object.freeze([
   { clave: 'ver_finanzas', grupo: 'ver', etiqueta: 'Finanzas', detalle: 'Los totales del negocio' },
   { clave: 'ver_accesos', grupo: 'ver', etiqueta: 'Accesos', detalle: 'La lista de empleados y sus permisos, sin poder cambiarlos' },
   { clave: 'ver_apertura_diaria', grupo: 'ver', etiqueta: 'Apertura del día', detalle: 'Al entrar cada día, si la tienda abrió y a qué hora' },
+  { clave: 'ver_pedidos_credito', grupo: 'ver', etiqueta: 'Pedidos por pagar', detalle: 'Lo que se le debe a los proveedores a crédito y cuándo vence' },
   { clave: 'ver_de_todos', grupo: 'ver', etiqueta: 'Registros de todo el equipo', detalle: 'En sus módulos, ver lo de todos y no sólo lo suyo' },
   { clave: 'ver_anulados', grupo: 'ver', etiqueta: 'Registros anulados', detalle: 'Ver también lo que fue anulado' },
   // --- lo que puede HACER ---
@@ -89,6 +90,18 @@ const METODOS_PAGO_COMBUSTIBLE = Object.freeze(['transferencia', 'pago_movil', '
 
 /* Cómo factura un proveedor, y qué implica para la foto de la factura */
 const TIPOS_FACTURA = Object.freeze(['fisica', 'digital', 'ambas']);
+
+/*
+ * Cómo se le paga a un proveedor.
+ *
+ * 'contado' -> se paga al recibir y la factura llega con la entrega
+ * 'credito' -> deja una nota de entrega y la factura llega al pagarle
+ *
+ * Un proveedor a crédito no entrega factura al recibir, así que no se le
+ * puede pedir la foto: en su lugar se anota cuánto se debe y cuándo
+ * vence, y la foto se pide el día que se le paga.
+ */
+const METODOS_PAGO_PROVEEDOR = Object.freeze(['contado', 'credito']);
 
 /* ------------------------------------------------------------------ */
 /* Ajustes que el Master cambia desde la aplicación                    */
@@ -234,6 +247,12 @@ const COLUMNAS_REQUERIDAS = [
   ['entradas_mercancia', 'solicitud_id'],
   ['entradas_mercancia', 'factura_digital'],
   ['proveedores', 'tipo_factura'],
+  ['proveedores', 'metodo_pago'],
+  ['proveedores', 'dias_credito'],
+  ['entradas_mercancia', 'a_credito'],
+  ['entradas_mercancia', 'monto_nota_usd'],
+  ['entradas_mercancia', 'vence_el'],
+  ['incidencias', 'items_afectados'],
   ['checklist_motos', 'foto_tablero'],
   ['checklist_motos', 'foto_frontal'],
   ['checklist_motos', 'foto_trasera'],
@@ -1408,6 +1427,27 @@ app.get('/api/motos/config', autenticar, requiereModulo('motos'), asyncH(async (
 }));
 
 /**
+ * Los puntos del checklist de una moto que tienen una incidencia abierta.
+ *
+ * Mientras una falla no se cierre, ese punto no se vuelve a revisar: la
+ * falla sigue ahí y reportarla otra vez cada día sólo acumularía
+ * incidencias duplicadas de lo mismo, llenando el almacén sin aportar.
+ */
+async function itemsEnReparacion(motoId, cliente) {
+  const { rows } = await (cliente || pool).query(
+    `SELECT DISTINCT jsonb_array_elements_text(items_afectados) AS item
+       FROM incidencias
+      WHERE moto_id = $1
+        AND tipo = 'moto'
+        AND estado <> 'cerrada'
+        AND NOT anulado
+        AND jsonb_typeof(items_afectados) = 'array'`,
+    [motoId],
+  );
+  return rows.map((r) => r.item);
+}
+
+/**
  * Calcula el aviso del próximo cambio de aceite de una moto.
  *
  * Devuelve el kilometraje al que toca, cuántos faltan, y un color:
@@ -1448,10 +1488,21 @@ app.get('/api/motos', autenticar, requiereModulo('motos'), asyncH(async (req, re
       ORDER BY m.nombre, m.placa`,
     [hoy, verTodas],
   );
-  res.json({
-    motos: rows.map((m) => ({ ...m, aviso_aceite: avisoAceite(m, ajustes) })),
-    fecha: hoy,
-  });
+  /*
+   * Cada moto informa qué puntos están en reparación, para que el
+   * formulario los muestre bloqueados en vez de dejar que el motorizado
+   * reporte la misma falla todos los días.
+   */
+  const motos = [];
+  for (const m of rows) {
+    // eslint-disable-next-line no-await-in-loop
+    motos.push({
+      ...m,
+      aviso_aceite: avisoAceite(m, ajustes),
+      items_en_reparacion: await itemsEnReparacion(m.id),
+    });
+  }
+  res.json({ motos, fecha: hoy });
 }));
 
 app.post('/api/motos', autenticar, requierePermiso('gestionar_motos'), asyncH(async (req, res) => {
@@ -1560,12 +1611,25 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
         throw bad(`El kilometraje inicial (${km}) no puede ser menor al último registrado (${moto.ultimo_kilometraje})`);
       }
       if (lista.length) {
+        /*
+         * Los puntos que ya tienen una incidencia sin cerrar no se vuelven
+         * a revisar: la falla sigue ahí y reportarla otra vez cada día sólo
+         * acumularía incidencias duplicadas de lo mismo. Salen marcados
+         * como "en reparación" y se dan por malos sin preguntar.
+         */
+        const enReparacion = await itemsEnReparacion(id, c);
         const recibidos = b.items;
         if (!recibidos || typeof recibidos !== 'object' || Array.isArray(recibidos)) throw bad('items es obligatorio');
         for (const k of Object.keys(recibidos)) {
           if (!lista.includes(k)) throw bad(`Ítem no válido para ${moto.tipo_modelo}: ${k.slice(0, 60)}`);
         }
         for (const nombre of lista) {
+          if (enReparacion.includes(nombre)) {
+            // Ya está reportado y abierto: se arrastra como malo, pero no
+            // genera una incidencia nueva
+            items[nombre] = false;
+            continue;
+          }
           if (typeof recibidos[nombre] !== 'boolean') throw bad(`Falta revisar el ítem: ${nombre}`);
           items[nombre] = recibidos[nombre];
           if (!recibidos[nombre]) hayItemMalo = true;
@@ -1608,18 +1672,22 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
     }
 
     /*
-     * Las tres fotos del día son obligatorias, pero sólo se exigen cuando
-     * el almacén está configurado: así el sistema sigue funcionando
-     * mientras falten las variables de entorno, en vez de dejar al
-     * motorizado sin poder registrar nada.
+     * Las tres fotos del día son obligatorias, con dos excepciones:
+     *
+     *  - si la moto NO se usó, no se piden: fotografiar el tablero y la
+     *    lata de una moto que no salió del estacionamiento no documenta
+     *    nada y gasta el almacén
+     *  - si el almacén no está configurado, tampoco, para que el sistema
+     *    siga funcionando en vez de dejar al motorizado sin registrar
      */
+    const pideFotos = FOTOS_HABILITADAS && seUso;
     const ETIQUETA_FOTO = { tablero: 'del tablero', frontal: 'frontal', trasera: 'trasera (contrapicado)' };
     const fotos = {};
     for (const clave of ['tablero', 'frontal', 'trasera']) {
       const valor = b[`foto_${clave}`];
       const vacia = valor === undefined || valor === null || valor === '';
       if (vacia) {
-        if (FOTOS_HABILITADAS) throw bad(`Falta la foto ${ETIQUETA_FOTO[clave]}`);
+        if (pideFotos) throw bad(`Falta la foto ${ETIQUETA_FOTO[clave]}`);
         fotos[clave] = null;
       } else {
         fotos[clave] = validarRutaFoto(valor, `Foto ${ETIQUETA_FOTO[clave]}`);
@@ -1657,12 +1725,24 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
 
     let incidencia = null;
     if (tieneFalla) {
-      const fallos = Object.entries(items).filter(([, ok]) => !ok).map(([k]) => k);
+      /*
+       * La incidencia cubre sólo los puntos NUEVOS. Los que ya estaban en
+       * reparación tienen su propia incidencia abierta y no se duplican.
+       *
+       * Los nombres quedan en items_afectados, no sólo dentro del texto:
+       * así el sistema puede saber qué punto está en reparación y
+       * bloquearlo en el checklist siguiente.
+       */
+      const yaAbiertos = await itemsEnReparacion(id, c);
+      const fallos = Object.entries(items)
+        .filter(([nombre, ok]) => !ok && !yaAbiertos.includes(nombre))
+        .map(([k]) => k);
       const desc = `${obs}${fallos.length ? ` | Ítems con falla: ${fallos.join(', ')}` : ''}`;
       const inc = await c.query(
-        `INSERT INTO incidencias (tipo, usuario_id, moto_id, severidad, titulo, descripcion)
-         VALUES ('moto', $1, $2, 'alta', $3, $4) RETURNING *`,
-        [req.usuario.id, id, `Falla en moto ${moto.placa}`, desc.slice(0, 2000)],
+        `INSERT INTO incidencias (tipo, usuario_id, moto_id, severidad, titulo, descripcion, items_afectados)
+         VALUES ('moto', $1, $2, 'alta', $3, $4, $5::jsonb) RETURNING *`,
+        [req.usuario.id, id, `Falla en moto ${moto.placa}`, desc.slice(0, 2000),
+          JSON.stringify(fallos)],
       );
       incidencia = inc.rows[0];
     }
@@ -1682,9 +1762,10 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
 /* ------------------------------------------------------------------ */
 /* Combustible                                                         */
 /*                                                                     */
-/* Lo registra quien tenga acceso al reporte de motos, porque el que    */
-/* echa gasolina es el motorizado. Una carga mal hecha no se borra: se  */
-/* anula, igual que el resto de los registros.                          */
+/* Vive en el módulo de Motos y lo registra quien tenga ese módulo,     */
+/* porque el que echa gasolina es el motorizado y no tiene por qué      */
+/* necesitar permisos de Master para anotarlo. Una carga mal hecha no   */
+/* se borra: se anula, igual que el resto de los registros.             */
 /*                                                                     */
 /* El monto va en bolívares. No entra a los costos operativos del       */
 /* cierre de caja: esa gestión se lleva aparte, por decisión del dueño. */
@@ -1696,7 +1777,7 @@ const COLS_COMBUSTIBLE = `f.id, f.moto_id, f.litros, f.monto_bs, f.metodo_pago,
             trim(u.nombre || ' ' || u.apellido) AS usuario,
             trim(a.nombre || ' ' || a.apellido) AS anulado_por_nombre`;
 
-app.get('/api/combustible', autenticar, requierePermiso('ver_reporte_motos'), asyncH(async (req, res) => {
+app.get('/api/combustible', autenticar, requiereModulo('motos'), asyncH(async (req, res) => {
   const hoy = hoyCaracas();
   const desde = leerFecha(req.query.desde, sumarDias(hoy, -30), 'desde');
   const hasta = leerFecha(req.query.hasta, hoy, 'hasta');
@@ -1736,7 +1817,7 @@ app.get('/api/combustible', autenticar, requierePermiso('ver_reporte_motos'), as
   });
 }));
 
-app.post('/api/combustible', autenticar, requierePermiso('ver_reporte_motos'), asyncH(async (req, res) => {
+app.post('/api/combustible', autenticar, requiereModulo('motos'), asyncH(async (req, res) => {
   const b = req.body || {};
   const motoId = entero(b.moto_id, 'Moto', { min: 1 });
   const litros = monto(b.litros, 'Litros');
@@ -2180,8 +2261,9 @@ app.get('/api/proveedores', autenticar, accesoProveedores, asyncH(async (req, re
 app.post('/api/proveedores', autenticar, accesoProveedores, asyncH(async (req, res) => {
   const b = req.body || {};
   const { rows } = await pool.query(
-    `INSERT INTO proveedores (nombre, tipo, contacto, rif, telefono, tipo_factura)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    `INSERT INTO proveedores (nombre, tipo, contacto, rif, telefono, tipo_factura,
+                              metodo_pago, dias_credito)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
     [texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 120 }),
       unoDe(b.tipo, TIPOS_PROVEEDOR, 'Tipo de proveedor'),
       texto(b.contacto, 'Contacto', { max: 120 }) || null,
@@ -2189,7 +2271,9 @@ app.post('/api/proveedores', autenticar, accesoProveedores, asyncH(async (req, r
       texto(b.telefono, 'Teléfono', { max: 30 }) || null,
       // Si no lo indican, se asume física: es el caso que exige respaldo,
       // así que nadie queda sin foto por omisión.
-      b.tipo_factura === undefined ? 'fisica' : unoDe(b.tipo_factura, TIPOS_FACTURA, 'Tipo de factura')],
+      b.tipo_factura === undefined ? 'fisica' : unoDe(b.tipo_factura, TIPOS_FACTURA, 'Tipo de factura'),
+      b.metodo_pago === undefined ? 'contado' : unoDe(b.metodo_pago, METODOS_PAGO_PROVEEDOR, 'Método de pago'),
+      entero(b.dias_credito ?? 0, 'Días de crédito', { min: 0, max: 365 })],
   );
   res.status(201).json({ proveedor: rows[0] });
 }));
@@ -2203,7 +2287,9 @@ app.put('/api/proveedores/:id', autenticar, requierePermiso('editar_catalogo'), 
   }
   const { rows } = await pool.query(
     `UPDATE proveedores SET nombre=$2, tipo=$3, contacto=$4, rif=$5, telefono=$6, activo=$7,
-            tipo_factura = COALESCE($8, tipo_factura)
+            tipo_factura  = COALESCE($8, tipo_factura),
+            metodo_pago   = COALESCE($9, metodo_pago),
+            dias_credito  = COALESCE($10, dias_credito)
       WHERE id=$1 RETURNING *`,
     [id, texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 120 }),
       unoDe(b.tipo, TIPOS_PROVEEDOR, 'Tipo de proveedor'),
@@ -2212,7 +2298,9 @@ app.put('/api/proveedores/:id', autenticar, requierePermiso('editar_catalogo'), 
       texto(b.telefono, 'Teléfono', { max: 30 }) || null,
       b.activo === undefined ? true : Boolean(b.activo),
       // Si no viene en la petición se conserva el que tenga
-      b.tipo_factura === undefined ? null : unoDe(b.tipo_factura, TIPOS_FACTURA, 'Tipo de factura')],
+      b.tipo_factura === undefined ? null : unoDe(b.tipo_factura, TIPOS_FACTURA, 'Tipo de factura'),
+      b.metodo_pago === undefined ? null : unoDe(b.metodo_pago, METODOS_PAGO_PROVEEDOR, 'Método de pago'),
+      b.dias_credito === undefined ? null : entero(b.dias_credito, 'Días de crédito', { min: 0, max: 365 })],
   );
   if (!rows[0]) throw new HttpError(404, 'Proveedor no encontrado');
   res.json({ proveedor: rows[0] });
@@ -2373,6 +2461,7 @@ app.get('/api/solicitudes/pendientes-mercancia', autenticar, requiereModulo('rec
     `SELECT s.id, s.titulo, s.descripcion, s.estado, s.detalle_items,
             (s.fecha_hora AT TIME ZONE 'America/Caracas')::date AS fecha,
             s.proveedor_id, p.nombre AS proveedor, p.tipo_factura,
+            p.metodo_pago, p.dias_credito,
             trim(u.nombre || ' ' || u.apellido) AS pidio
        FROM solicitudes s
        JOIN usuarios u ON u.id = s.usuario_id
@@ -2439,13 +2528,39 @@ app.post('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asy
      * el respaldo hace falta.
      */
     const { rows: pv } = await c.query(
-      'SELECT id, nombre, tipo_factura FROM proveedores WHERE id = $1 AND activo', [proveedor],
+      `SELECT id, nombre, tipo_factura, metodo_pago, dias_credito
+         FROM proveedores WHERE id = $1 AND activo`, [proveedor],
     );
     if (!pv[0]) throw bad('El proveedor no existe o está inactivo');
     const tipoFactura = pv[0].tipo_factura || 'fisica';
 
+    /*
+     * Un proveedor a crédito no entrega factura al recibir: deja una nota
+     * de entrega y la factura llega el día que se le paga. Así que no se
+     * le puede pedir la foto; en su lugar se anota cuánto se debe, leído
+     * de esa nota, y cuándo vence.
+     *
+     * El método lo decide el proveedor y no quien recibe, igual que el
+     * tipo de factura: si fuera opcional, el día que no quisiera escribir
+     * el monto marcaría "contado" y se perdería la cuenta.
+     */
+    const aCredito = pv[0].metodo_pago === 'credito';
+    let montoNota = null;
+    let venceEl = null;
+    if (aCredito) {
+      montoNota = monto(b.monto_nota_usd, 'Monto de la nota de entrega', { requerido: true });
+      if (montoNota <= 0) throw bad('El monto de la nota de entrega debe ser mayor que cero');
+      const dias = Number(pv[0].dias_credito) || 0;
+      venceEl = sumarDias(hoyCaracas(), dias);
+    }
+
+    const foto = validarFotoOEnlace(b.foto_factura_url, 'Foto de la factura');
+
     let digital = false;
-    if (tipoFactura === 'digital') {
+    if (aCredito) {
+      // No hay factura todavía: la foto se pedirá al marcarlo como pagado
+      digital = false;
+    } else if (tipoFactura === 'digital') {
       digital = true; // ese proveedor nunca entrega papel
     } else if (tipoFactura === 'ambas') {
       digital = Boolean(b.factura_digital);
@@ -2453,10 +2568,9 @@ app.post('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asy
       throw bad(`${pv[0].nombre} entrega factura física. Tome la foto de la factura.`);
     }
 
-    const foto = validarFotoOEnlace(b.foto_factura_url, 'Foto de la factura');
     // Igual que con las fotos del checklist: sólo se exige si el almacén
     // está configurado, para no trancar la recepción por una variable.
-    if (!digital && !foto && FOTOS_HABILITADAS) {
+    if (!aCredito && !digital && !foto && FOTOS_HABILITADAS) {
       throw bad(tipoFactura === 'ambas'
         ? 'Falta la foto de la factura. Si este proveedor la envió al correo, marque "factura digital".'
         : `${pv[0].nombre} entrega factura física: la foto es obligatoria.`);
@@ -2514,10 +2628,10 @@ app.post('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asy
     const { rows } = await c.query(
       `INSERT INTO entradas_mercancia
          (usuario_id, proveedor_id, items_recibidos, foto_factura_url, observaciones,
-          solicitud_id, factura_digital)
-       VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7) RETURNING *`,
+          solicitud_id, factura_digital, a_credito, monto_nota_usd, vence_el)
+       VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9, $10::date) RETURNING *`,
       [req.usuario.id, proveedor, JSON.stringify(items), foto || null, obs || null,
-        solicitudId, digital],
+        solicitudId, digital, aCredito, montoNota, venceEl],
     );
 
     // La solicitud se da por cerrada: llega en una sola entrega
@@ -2530,6 +2644,103 @@ app.post('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asy
     return rows[0];
   });
   res.status(201).json({ entrada });
+}));
+
+/* ------------------------------------------------------------------ */
+/* Pedidos a crédito por pagar                                         */
+/*                                                                     */
+/* Los montos van en DÓLARES aunque se paguen en bolívares: una deuda a */
+/* quince o treinta días en bolívares no significa nada, porque lo que  */
+/* se debe en términos reales cambia con la tasa.                       */
+/*                                                                     */
+/* Esto NO entra a la contabilidad de la aplicación: ni a finanzas, ni  */
+/* a los costos operativos, ni a los promedios. Es un recordatorio de   */
+/* lo que hay que pagar y de cuándo se pagó, nada más.                  */
+/*                                                                     */
+/* Se ve con la función especial "Pedidos por pagar", para que no lo    */
+/* tenga delante todo el que recibe mercancía.                          */
+/* ------------------------------------------------------------------ */
+app.get('/api/credito/pendientes', autenticar, requierePermiso('ver_pedidos_credito'), asyncH(async (req, res) => {
+  const hoy = hoyCaracas();
+  const incluirPagados = req.query.pagados === 'true';
+  const { rows } = await pool.query(
+    `SELECT e.id, e.monto_nota_usd, e.vence_el, e.pagado_en, e.foto_factura_url,
+            (e.fecha_hora AT TIME ZONE 'America/Caracas')::date AS recibido_el,
+            (e.vence_el - $1::date) AS dias_restantes,
+            p.nombre AS proveedor, p.dias_credito,
+            trim(u.nombre || ' ' || u.apellido) AS recibio,
+            trim(g.nombre || ' ' || g.apellido) AS pago,
+            e.items_recibidos
+       FROM entradas_mercancia e
+       JOIN proveedores p ON p.id = e.proveedor_id
+       JOIN usuarios u ON u.id = e.usuario_id
+       LEFT JOIN usuarios g ON g.id = e.pagado_por
+      WHERE e.a_credito AND NOT e.anulado
+        AND ($2::boolean OR e.pagado_en IS NULL)
+      ORDER BY (e.pagado_en IS NOT NULL), e.vence_el NULLS LAST
+      LIMIT 200`,
+    [hoy, incluirPagados],
+  );
+
+  const pendientes = rows.filter((r) => !r.pagado_en);
+  res.json({
+    pedidos: rows,
+    hoy,
+    totales: {
+      pendientes: pendientes.length,
+      // Sin monto escrito todavía no suma: se informa aparte
+      sin_monto: pendientes.filter((r) => r.monto_nota_usd === null).length,
+      vencidos: pendientes.filter((r) => r.dias_restantes !== null && r.dias_restantes < 0).length,
+      debe_usd: redondearMoneda(
+        pendientes.reduce((a, r) => a + (Number(r.monto_nota_usd) || 0), 0),
+      ),
+    },
+  });
+}));
+
+/** Corregir el monto de la nota, para cuando quien recibió se equivocó al teclear. */
+app.put('/api/credito/:id/monto', autenticar, requierePermiso('ver_pedidos_credito'), asyncH(async (req, res) => {
+  const id = uuid(req.params.id, 'id');
+  const nuevo = monto(req.body && req.body.monto_nota_usd, 'Monto de la nota', { requerido: true });
+  if (nuevo <= 0) throw bad('El monto debe ser mayor que cero');
+  const { rows } = await pool.query(
+    `UPDATE entradas_mercancia SET monto_nota_usd = $2
+      WHERE id = $1 AND a_credito AND NOT anulado RETURNING id, monto_nota_usd`,
+    [id, nuevo],
+  );
+  if (!rows[0]) throw new HttpError(404, 'Ese pedido a crédito no existe o fue anulado');
+  res.json({ pedido: rows[0] });
+}));
+
+/**
+ * Marcar un pedido como pagado. Aquí sí se pide la foto de la factura,
+ * porque es el momento en que el proveedor por fin la entrega: el
+ * respaldo no se pierde, sólo se aplaza hasta que el papel exista.
+ */
+app.put('/api/credito/:id/pagado', autenticar, requierePermiso('ver_pedidos_credito'), asyncH(async (req, res) => {
+  const id = uuid(req.params.id, 'id');
+  const foto = validarFotoOEnlace(req.body && req.body.foto_factura_url, 'Foto de la factura');
+  if (!foto && FOTOS_HABILITADAS) {
+    throw bad('Falta la foto de la factura que le entregaron al pagar.');
+  }
+  const pedido = await withTx(async (c) => {
+    const { rows } = await c.query(
+      `SELECT id, pagado_en, monto_nota_usd FROM entradas_mercancia
+        WHERE id = $1 AND a_credito AND NOT anulado FOR UPDATE`,
+      [id],
+    );
+    if (!rows[0]) throw new HttpError(404, 'Ese pedido a crédito no existe o fue anulado');
+    if (rows[0].pagado_en) throw bad('Ese pedido ya estaba marcado como pagado');
+    const r = await c.query(
+      `UPDATE entradas_mercancia
+          SET pagado_en = now(), pagado_por = $2,
+              foto_factura_url = COALESCE($3, foto_factura_url)
+        WHERE id = $1 RETURNING id, pagado_en, monto_nota_usd`,
+      [id, req.usuario.id, foto || null],
+    );
+    return r.rows[0];
+  });
+  res.json({ pedido });
 }));
 
 /* ------------------------------------------------------------------ */
@@ -2584,6 +2795,20 @@ app.post('/api/solicitudes', autenticar, requiereAlgunaSolicitud, asyncH(async (
   let detalle = [];
 
   if (tipo === 'mercancia') {
+    /*
+     * El proveedor es obligatorio. Sin él, al recibir la solicitud el
+     * sistema no sabe de quién es y no puede decidir si pedir la foto de
+     * la factura ni si la entrega va a crédito. De hecho ni se podía
+     * recibir, porque la recepción exige proveedor.
+     */
+    proveedor = entero(b.proveedor_id, 'Proveedor', { min: 1 });
+    const { rows: pv } = await pool.query(
+      `SELECT id FROM proveedores
+        WHERE id = $1 AND activo AND tipo IN ('mercancia', 'ambos')`,
+      [proveedor],
+    );
+    if (!pv[0]) throw bad('Ese proveedor no existe, está inactivo o no es de mercancía');
+
     // Lista de productos con la cantidad de bultos pedidos
     if (!Array.isArray(b.detalle_items) || b.detalle_items.length === 0 || b.detalle_items.length > 100) {
       throw bad('Debe pedir entre 1 y 100 productos');

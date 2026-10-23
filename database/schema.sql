@@ -224,6 +224,13 @@ CREATE TABLE proveedores (
   -- día que se pierda el papel.
   tipo_factura varchar(10) NOT NULL DEFAULT 'fisica'
                            CHECK (tipo_factura IN ('fisica', 'digital', 'ambas')),
+  -- Cómo se le paga. A crédito no entrega factura al recibir, sino una
+  -- nota de entrega: ahí se anota cuánto se debe y la factura se pide el
+  -- día del pago. Los días cuentan desde la recepción.
+  metodo_pago  varchar(10) NOT NULL DEFAULT 'contado'
+                           CHECK (metodo_pago IN ('contado', 'credito')),
+  dias_credito integer     NOT NULL DEFAULT 0
+                           CHECK (dias_credito >= 0 AND dias_credito <= 365),
   activo    boolean      NOT NULL DEFAULT TRUE
 );
 CREATE UNIQUE INDEX ux_proveedores_nombre ON proveedores (lower(nombre));
@@ -288,8 +295,23 @@ CREATE TABLE entradas_mercancia (
   -- De qué solicitud vino esta recepción, si vino de alguna. La llave
   -- foránea se agrega más abajo, porque "solicitudes" se crea después.
   solicitud_id      uuid,
-  observaciones     text
+  -- Si el proveedor trabaja a crédito: cuánto se quedó debiendo (en
+  -- DÓLARES, porque una deuda a plazo en bolívares no significa nada) y
+  -- cuándo vence. Esto NO entra a la contabilidad de la aplicación: es un
+  -- recordatorio de lo que hay que pagar y de cuándo se pagó.
+  a_credito         boolean     NOT NULL DEFAULT FALSE,
+  monto_nota_usd    numeric(14,2) CHECK (monto_nota_usd IS NULL OR monto_nota_usd >= 0),
+  vence_el          date,
+  pagado_en         timestamptz,
+  pagado_por        integer     REFERENCES usuarios (id),
+  observaciones     text,
+  -- Sólo lo que fue a crédito puede quedar pagado: lo de contado se paga
+  -- en el acto y no pasa por esta cuenta.
+  CONSTRAINT ck_mercancia_pago_solo_credito CHECK (pagado_en IS NULL OR a_credito)
 );
+-- Para la alerta de pedidos por pagar
+CREATE INDEX ix_mercancia_por_pagar ON entradas_mercancia (vence_el)
+  WHERE a_credito AND pagado_en IS NULL AND NOT anulado;
 CREATE INDEX ix_entradas_merc_fecha ON entradas_mercancia (fecha_hora);
 CREATE INDEX ix_entradas_merc_usuario ON entradas_mercancia (usuario_id);
 CREATE INDEX ix_entradas_merc_proveedor ON entradas_mercancia (proveedor_id);
@@ -344,7 +366,12 @@ CREATE TABLE solicitudes (
   notas_admin     text,
   proveedor_id    integer      REFERENCES proveedores (id),
   fecha_hora      timestamptz  NOT NULL DEFAULT now(),
-  actualizado_en  timestamptz  NOT NULL DEFAULT now()
+  actualizado_en  timestamptz  NOT NULL DEFAULT now(),
+  -- En mercancía el proveedor es obligatorio: sin él, al recibir no se
+  -- sabe si pedir la foto de la factura ni si la entrega va a crédito, y
+  -- de hecho no se puede recibir porque la recepción exige proveedor.
+  CONSTRAINT ck_solicitudes_proveedor_mercancia
+    CHECK (tipo_solicitud <> 'mercancia' OR proveedor_id IS NOT NULL)
 );
 CREATE INDEX ix_solicitudes_fecha ON solicitudes (fecha_hora);
 CREATE INDEX ix_solicitudes_proveedor ON solicitudes (proveedor_id);
@@ -373,7 +400,12 @@ CREATE TABLE incidencias (
   cierre_caja_id  uuid         REFERENCES cierres_caja (id),
   notas_admin     text,
   fecha_hora      timestamptz  NOT NULL DEFAULT now(),
-  actualizado_en  timestamptz  NOT NULL DEFAULT now()
+  actualizado_en  timestamptz  NOT NULL DEFAULT now(),
+  -- Qué puntos del checklist afecta esta incidencia. Mientras siga
+  -- abierta, esos puntos quedan bloqueados en el checklist de la moto:
+  -- la falla sigue ahí y reportarla cada día sólo acumularía duplicados.
+  items_afectados          jsonb       NOT NULL DEFAULT '[]'::jsonb
+                                       CHECK (jsonb_typeof(items_afectados) = 'array')
 );
 CREATE INDEX ix_incidencias_fecha ON incidencias (fecha_hora);
 CREATE INDEX ix_incidencias_usuario ON incidencias (usuario_id);
@@ -413,6 +445,10 @@ CREATE UNIQUE INDEX ux_checklist_moto_dia
   WHERE NOT anulado;
 
 CREATE UNIQUE INDEX ux_cierres_fecha ON cierres_caja (fecha) WHERE NOT anulado;
+
+-- Para saber qué puntos de una moto están en reparación
+CREATE INDEX ix_incidencias_moto_abiertas ON incidencias (moto_id)
+  WHERE estado <> 'cerrada' AND NOT anulado;
 
 -- La recepción que vino de una solicitud. El índice único es PARCIAL: una
 -- solicitud se recibe una sola vez, pero si esa recepción se anula, vuelve

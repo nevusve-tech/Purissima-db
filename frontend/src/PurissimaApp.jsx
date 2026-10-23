@@ -27,6 +27,16 @@ const TIPOS_FACTURA = [
   ['ambas', 'Depende de la entrega'],
 ];
 
+/*
+ * Cómo se le paga a un proveedor. A crédito deja una nota de entrega y la
+ * factura llega el día del pago, así que al recibir no se pide foto sino
+ * el monto que se queda debiendo.
+ */
+const METODOS_PAGO_PROVEEDOR = [
+  ['contado', 'De contado'],
+  ['credito', 'A crédito (deja nota de entrega)'],
+];
+
 const MODULOS = {
   motos: { etiqueta: 'Motos', icono: '🏍️' },
   caja: { etiqueta: 'Caja', icono: '💵' },
@@ -397,6 +407,107 @@ function NumInput({ value, onChange, ...rest }) {
   );
 }
 
+/*
+ * Campo de dinero al estilo de una caja registradora.
+ *
+ * El teclado numérico del teléfono no ofrece el punto decimal, así que un
+ * campo que lo exija es imposible de llenar desde un celular. Aquí se
+ * escriben sólo dígitos y los centavos se llenan primero:
+ *
+ *   1      ->        0,01
+ *   12     ->        0,12
+ *   123    ->        1,23
+ *   12345  ->      123,45
+ *
+ * El valor que viaja hacia afuera es el número de verdad (123.45), no el
+ * texto con separadores. Lo que se guarda en el estado del formulario son
+ * los dígitos crudos, y de ahí se derivan las dos caras: lo que se ve y
+ * lo que se envía.
+ *
+ * "decimales" es 2 para dinero y 4 para la tasa del día, que se cotiza
+ * con más precisión.
+ */
+const soloDigitos = (s) => String(s ?? '').replace(/\D/g, '');
+
+/** Pasa los dígitos crudos al número real: "12345" con 2 decimales -> 123.45 */
+function digitosANumero(digitos, decimales) {
+  const d = soloDigitos(digitos);
+  if (!d) return null;
+  return Number(d) / 10 ** decimales;
+}
+
+/** Y al texto que ve la persona, con los separadores de Venezuela. */
+function digitosATexto(digitos, decimales) {
+  const d = soloDigitos(digitos);
+  if (!d) return '';
+  const n = Number(d) / 10 ** decimales;
+  return new Intl.NumberFormat('es-VE', {
+    minimumFractionDigits: decimales,
+    maximumFractionDigits: decimales,
+  }).format(n);
+}
+
+/** Del número real de vuelta a dígitos, para rellenar un campo ya guardado. */
+const numeroADigitos = (n, decimales) => (
+  n === null || n === undefined || n === '' || Number.isNaN(Number(n))
+    ? ''
+    : String(Math.round(Number(n) * 10 ** decimales))
+);
+
+function MontoInput({ digitos, onDigitos, decimales = 2, prefijo, ...rest }) {
+  return (
+    <div className="relative">
+      {prefijo && (
+        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">
+          {prefijo}
+        </span>
+      )}
+      <input
+        type="text"
+        inputMode="numeric"
+        autoComplete="off"
+        className={`campo text-right ${prefijo ? 'pl-12' : ''}`}
+        value={digitosATexto(digitos, decimales)}
+        placeholder={decimales === 0 ? '0' : `0,${'0'.repeat(decimales)}`}
+        onChange={(e) => onDigitos(soloDigitos(e.target.value).slice(0, 15))}
+        {...rest}
+      />
+    </div>
+  );
+}
+
+/*
+ * Campo de hora que pone los dos puntos solo.
+ *
+ * Mismo problema que el dinero: el teclado numérico no trae los dos
+ * puntos. Se escriben cuatro dígitos y el campo muestra 08:15.
+ */
+const horaDesdeDigitos = (digitos) => {
+  const d = soloDigitos(digitos).slice(0, 4);
+  return d.length <= 2 ? d : `${d.slice(0, 2)}:${d.slice(2)}`;
+};
+
+const horaValida = (digitos) => {
+  const d = soloDigitos(digitos);
+  if (d.length !== 4) return false;
+  return Number(d.slice(0, 2)) <= 23 && Number(d.slice(2)) <= 59;
+};
+
+function HoraInput({ digitos, onDigitos, ...rest }) {
+  return (
+    <input
+      type="text"
+      inputMode="numeric"
+      autoComplete="off"
+      className="campo"
+      placeholder="08:15"
+      value={horaDesdeDigitos(digitos)}
+      onChange={(e) => onDigitos(soloDigitos(e.target.value).slice(0, 4))}
+      {...rest}
+    />
+  );
+}
+
 function Campo({ etiqueta, children }) {
   return (
     <label className="block">
@@ -566,17 +677,34 @@ const horaCorta = (iso) => (iso
  *   abierta sin confirmar    -> tarjeta con la hora y el botón de enterado
  *   todo en orden            -> una línea tranquila que no estorba
  */
-function BarraTienda({ call, aviso }) {
+function BarraTienda({ usuario, call, aviso }) {
+  /*
+   * Dos públicos distintos para dos cosas distintas:
+   *
+   *  - el estado de la tienda en letra pequeña arriba lo ven el Master y
+   *    quien tenga Caja, que son los que pueden abrirla y los que cierran
+   *    caja. A un motorizado no le dice nada y sólo le ocupa pantalla.
+   *
+   *  - la tarjeta de confirmación diaria la ve quien tenga la función
+   *    "Apertura del día", que el Master reparte a quien quiera. Esa
+   *    persona puede no tener Caja, y aun así debe poder enterarse.
+   */
+  const tieneCaja = Array.isArray(usuario.modulos_permitidos)
+    && usuario.modulos_permitidos.includes('caja');
+  const veEstado = usuario.es_master || tieneCaja;
+  const veConfirmacion = puede(usuario, 'ver_apertura_diaria');
+  const leInteresa = veEstado || veConfirmacion;
   const [info, setInfo] = useState(null);
   const [ocupado, setOcupado] = useState(false);
 
   const cargar = useCallback(async () => {
+    if (!leInteresa) return; // no se consulta lo que no se va a mostrar
     try {
       setInfo(await call('/api/tienda/estado'));
     } catch {
       setInfo(null); // si falla, la barra simplemente no aparece
     }
-  }, [call]);
+  }, [call, leInteresa]);
   useEffect(() => { cargar(); }, [cargar]);
 
   const accion = async (ruta, mensaje) => {
@@ -592,7 +720,7 @@ function BarraTienda({ call, aviso }) {
     }
   };
 
-  if (!info || !info.dia) return null;
+  if (!leInteresa || !info || !info.dia) return null;
   const d = info.dia;
   const abierta = d.estado === 'abierta';
   const debeConfirmar = info.ve_confirmacion && abierta && !d.confirmada_por_mi;
@@ -600,6 +728,7 @@ function BarraTienda({ call, aviso }) {
   const esAlarma = d.estado === 'sin_registrar' && d.laborable && (info.puede_abrir || info.ve_confirmacion);
 
   if (abierta && !debeConfirmar) {
+    if (!veEstado) return null;
     return (
       <p className="mb-3 text-xs text-slate-500">
         Tienda abierta a las {horaCorta(d.hora_apertura)}
@@ -610,6 +739,7 @@ function BarraTienda({ call, aviso }) {
   }
 
   if (!esAlarma && !debeConfirmar) {
+    if (!veEstado) return null;
     // Domingo, o día marcado como cerrado a propósito: nada que hacer
     const detalle = d.motivo_cierre || (!d.laborable ? nombreDia(d.fecha) : '');
     return (
@@ -695,7 +825,15 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
   const lista = CHECKLISTS[moto.tipo_modelo] || [];
   const [seUso, setSeUso] = useState(true);
   const [km, setKm] = useState(String(moto.ultimo_kilometraje));
-  const [items, setItems] = useState(() => Object.fromEntries(lista.map((i) => [i, true])));
+  /*
+   * Los puntos con una falla abierta salen bloqueados: la falla sigue ahí
+   * y volver a reportarla cada día sólo acumularía incidencias duplicadas
+   * de lo mismo. Arrancan en falso y no se pueden cambiar.
+   */
+  const enReparacion = Array.isArray(moto.items_en_reparacion) ? moto.items_en_reparacion : [];
+  const [items, setItems] = useState(
+    () => Object.fromEntries(lista.map((i) => [i, !enReparacion.includes(i)])),
+  );
   const [cambioAceite, setCambioAceite] = useState(false);
   const [kmAceite, setKmAceite] = useState('');
   const [tieneFalla, setTieneFalla] = useState(false);
@@ -715,10 +853,17 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
     return () => { vivo = false; };
   }, [call]);
 
-  const hayItemMalo = Object.values(items).some((v) => !v);
+  // Los que ya están en reparación no cuentan como falla nueva
+  const hayItemMalo = Object.entries(items).some(([k, v]) => !v && !enReparacion.includes(k));
   const falla = tieneFalla || (seUso && hayItemMalo);
   const ponerFoto = (clave) => (ruta) => setFotos((p) => ({ ...p, [clave]: ruta }));
-  const faltanFotos = fotosExigidas
+  /*
+   * Las fotos se piden sólo si la moto se usó: fotografiar el tablero y la
+   * lata de una moto que no salió del estacionamiento no documenta nada y
+   * gasta el almacén.
+   */
+  const pideFotos = fotosExigidas && seUso;
+  const faltanFotos = pideFotos
     && ['tablero', 'frontal', 'trasera'].filter((k) => !fotos[k]);
 
   const enviar = async (e) => {
@@ -810,27 +955,42 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
       {seUso && lista.length > 0 && (
         <div className="space-y-2">
           <p className="etiqueta">Revisión ({lista.length} puntos)</p>
-          {lista.map((nombre) => (
-            <div key={nombre} className="flex items-center justify-between gap-2 border-b border-slate-100 pb-2">
-              <span className="text-sm">{nombre}</span>
-              <div className="flex shrink-0 gap-1">
-                <button
-                  type="button"
-                  onClick={() => setItems((p) => ({ ...p, [nombre]: true }))}
-                  className={`rounded-lg px-3 py-2 text-sm font-semibold min-h-[40px] ${items[nombre] ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-600'}`}
-                >
-                  OK
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setItems((p) => ({ ...p, [nombre]: false }))}
-                  className={`rounded-lg px-3 py-2 text-sm font-semibold min-h-[40px] ${!items[nombre] ? 'bg-red-600 text-white' : 'bg-slate-100 text-slate-600'}`}
-                >
-                  Falla
-                </button>
+          {enReparacion.length > 0 && (
+            <p className="text-xs text-amber-900 bg-amber-50 rounded-lg p-2">
+              {enReparacion.length === 1
+                ? 'Un punto está en reparación y no se revisa'
+                : `${enReparacion.length} puntos están en reparación y no se revisan`}
+              : {enReparacion.join(', ')}. Se desbloquean al cerrar su incidencia.
+            </p>
+          )}
+          {lista.map((nombre) => {
+            const bloqueado = enReparacion.includes(nombre);
+            return (
+              <div key={nombre} className="flex items-center justify-between gap-2 border-b border-slate-100 pb-2">
+                <span className="text-sm min-w-0">{nombre}</span>
+                {bloqueado ? (
+                  <Chip tono="ambar">en reparación</Chip>
+                ) : (
+                  <div className="flex shrink-0 gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setItems((p) => ({ ...p, [nombre]: true }))}
+                      className={`rounded-lg px-3 py-2 text-sm font-semibold min-h-[40px] ${items[nombre] ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-600'}`}
+                    >
+                      OK
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setItems((p) => ({ ...p, [nombre]: false }))}
+                      className={`rounded-lg px-3 py-2 text-sm font-semibold min-h-[40px] ${!items[nombre] ? 'bg-red-600 text-white' : 'bg-slate-100 text-slate-600'}`}
+                    >
+                      Falla
+                    </button>
+                  </div>
+                )}
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -862,6 +1022,7 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
         </Campo>
       )}
 
+      {seUso && (
       <div className="space-y-2">
         <div>
           <p className="etiqueta">
@@ -879,7 +1040,7 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
           onCambio={ponerFoto('tablero')}
           subirFoto={subirFoto}
           aviso={aviso}
-          requerido={fotosExigidas}
+          requerido={pideFotos}
         />
         <CapturaFoto
           etiqueta="Frontal"
@@ -889,7 +1050,7 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
           onCambio={ponerFoto('frontal')}
           subirFoto={subirFoto}
           aviso={aviso}
-          requerido={fotosExigidas}
+          requerido={pideFotos}
         />
         <CapturaFoto
           etiqueta="Trasera en contrapicado"
@@ -899,7 +1060,7 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
           onCambio={ponerFoto('trasera')}
           subirFoto={subirFoto}
           aviso={aviso}
-          requerido={fotosExigidas}
+          requerido={pideFotos}
         />
         {falla && (
           <CapturaFoto
@@ -913,6 +1074,7 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
           />
         )}
       </div>
+      )}
 
       <button className="btn-primario w-full" disabled={enviando}>{enviando ? 'Guardando…' : 'Guardar checklist'}</button>
     </form>
@@ -962,6 +1124,175 @@ function FormMoto({ call, aviso, onListo }) {
       </div>
       <button className="btn-primario w-full" disabled={enviando}>{enviando ? 'Guardando…' : 'Registrar'}</button>
     </form>
+  );
+}
+
+/*
+ * Combustible, dentro del módulo de Motos y debajo de la lista.
+ *
+ * Vive aquí y no en el reporte del Master porque el que echa gasolina es
+ * el motorizado: tiene que poder anotarlo sin permisos especiales.
+ *
+ * El monto va en bolívares, que es con lo que se paga en la bomba, y se
+ * escribe al estilo de caja registradora porque el teclado del teléfono
+ * no da el punto decimal.
+ */
+function SeccionCombustible({ motos, call, aviso, puedeAnular }) {
+  const [cargas, setCargas] = useState(null);
+  const [totales, setTotales] = useState(null);
+  const [abierta, setAbierta] = useState('');
+  const [f, setF] = useState({ litros: '', monto: '', metodo_pago: 'pago_movil', observacion: '' });
+  const [enviando, setEnviando] = useState(false);
+
+  const cargar = useCallback(async () => {
+    try {
+      const d = await call(`/api/combustible${qs({ desde: sumarDias(hoyCaracas(), -30) })}`);
+      setCargas(d.cargas);
+      setTotales(d.totales);
+    } catch (err) {
+      aviso(err.message, 'error');
+      setCargas([]);
+    }
+  }, [call, aviso]);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  const abrir = (id) => {
+    setAbierta((p) => (p === id ? '' : id));
+    setF({ litros: '', monto: '', metodo_pago: 'pago_movil', observacion: '' });
+  };
+
+  const litros = digitosANumero(f.litros, 2);
+  const monto = digitosANumero(f.monto, 2);
+  /* Qué falta por llenar, para decirlo en vez de dejar el botón muerto */
+  const falta = [
+    !litros || litros <= 0 ? 'los litros' : null,
+    monto === null ? 'el monto' : null,
+  ].filter(Boolean);
+
+  const enviar = async (e, motoId) => {
+    e.preventDefault();
+    setEnviando(true);
+    try {
+      await call('/api/combustible', {
+        method: 'POST',
+        body: {
+          moto_id: motoId,
+          litros,
+          monto_bs: monto || 0,
+          metodo_pago: f.metodo_pago,
+          observacion: f.observacion || undefined,
+        },
+      });
+      aviso('Combustible registrado', 'ok');
+      setAbierta('');
+      setF({ litros: '', monto: '', metodo_pago: 'pago_movil', observacion: '' });
+      await cargar();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setEnviando(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3 pt-2">
+      <Titulo>⛽ Combustible</Titulo>
+      <p className="text-sm text-slate-500 -mt-2">
+        Toca una moto para anotar una tanqueada. La fecha la pone el sistema.
+      </p>
+
+      {motos.map((m) => (
+        <div key={m.id} className="card space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-bold">{m.nombre}</p>
+              <p className="text-sm text-slate-500 truncate">{m.placa} · {m.color}</p>
+            </div>
+            <button
+              type="button"
+              className="btn-primario shrink-0"
+              onClick={() => abrir(String(m.id))}
+            >
+              {abierta === String(m.id) ? 'Cerrar' : 'Cargar'}
+            </button>
+          </div>
+
+          {abierta === String(m.id) && (
+            <form onSubmit={(e) => enviar(e, m.id)} className="rounded-xl bg-slate-50 p-3 space-y-3">
+              <p className="text-xs text-slate-500">
+                Escribe sólo números: los decimales se llenan primero. Para 12,50 escribe 1250.
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <Campo etiqueta="Litros">
+                  <MontoInput digitos={f.litros} onDigitos={(v) => setF({ ...f, litros: v })} />
+                </Campo>
+                <Campo etiqueta="Monto en Bs">
+                  <MontoInput digitos={f.monto} onDigitos={(v) => setF({ ...f, monto: v })} prefijo="Bs" />
+                </Campo>
+              </div>
+              <Campo etiqueta="Método de pago">
+                <Select
+                  valor={f.metodo_pago}
+                  onChange={(v) => setF({ ...f, metodo_pago: v })}
+                  opciones={METODOS_COMBUSTIBLE}
+                />
+              </Campo>
+              <Campo etiqueta="Observación (opcional)">
+                <input
+                  className="campo"
+                  maxLength={300}
+                  value={f.observacion}
+                  onChange={(e) => setF({ ...f, observacion: e.target.value })}
+                />
+              </Campo>
+              <button className="btn-primario w-full" disabled={enviando || falta.length > 0}>
+                {enviando ? 'Guardando…' : falta.length ? `Falta ${falta.join(' y ')}` : 'Registrar combustible'}
+              </button>
+            </form>
+          )}
+        </div>
+      ))}
+
+      {totales && totales.cargas > 0 && (
+        <div className="grid grid-cols-3 gap-2">
+          <Tarjeta titulo="Tanqueadas" valor={nf0.format(totales.cargas)} nota="30 días" />
+          <Tarjeta titulo="Litros" valor={nf.format(totales.litros)} nota="30 días" />
+          <Tarjeta titulo="Gasto" valor={fmtBs(totales.monto_bs)} nota="30 días" />
+        </div>
+      )}
+
+      {cargas === null ? <Cargando /> : cargas.length === 0 ? (
+        <Vacio texto="Sin tanqueadas en los últimos 30 días" />
+      ) : cargas.map((c) => (
+        <div key={c.id} className={`card !p-3 text-sm space-y-1 ${c.anulado ? 'opacity-75' : ''}`}>
+          <div className="flex justify-between items-start gap-2">
+            <span className="font-semibold">{c.moto} · {fmtFecha(c.fecha)}</span>
+            <div className="flex gap-1 shrink-0 flex-wrap justify-end">
+              {c.anulado && <Chip tono="gris">anulado</Chip>}
+              <Chip tono="azul">{etiquetaMetodo(c.metodo_pago)}</Chip>
+            </div>
+          </div>
+          <p className="text-slate-600">
+            {nf.format(c.litros)} litros · {fmtBs(c.monto_bs)} · {c.usuario}
+          </p>
+          {c.observacion && <p className="text-slate-500 text-xs">{c.observacion}</p>}
+          <SelloAnulado registro={c} />
+          {puedeAnular && (
+            <div className="flex justify-end pt-1">
+              <BotonAnular
+                recurso="combustible"
+                id={c.id}
+                anulado={c.anulado}
+                call={call}
+                aviso={aviso}
+                onListo={cargar}
+                etiqueta={`la carga de ${c.moto} del ${fmtFecha(c.fecha)}`}
+              />
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -1016,6 +1347,15 @@ function VistaMotos({ usuario, call, aviso, subirFoto }) {
           </div>
         ))
       )}
+
+      {motos !== null && motos.length > 0 && (
+        <SeccionCombustible
+          motos={motos}
+          call={call}
+          aviso={aviso}
+          puedeAnular={puede(usuario, 'anular_registros')}
+        />
+      )}
     </div>
   );
 }
@@ -1046,22 +1386,34 @@ function VistaCaja({ usuario, call, aviso }) {
 
   useEffect(() => { cargar(); }, [cargar]);
 
+  /*
+   * El formulario guarda DÍGITOS, no números: los campos de dinero se
+   * escriben al estilo de una caja registradora porque el teclado del
+   * teléfono no ofrece el punto decimal. De esos dígitos se derivan el
+   * número real y el texto que se ve.
+   */
+  const num = (clave, dec = 2) => digitosANumero(f[clave], dec) || 0;
+
   const totalBs = useMemo(
-    () => redondear(redondear(f.pago_movil_bs) + redondear(f.efectivo_bs) + redondear(f.punto_venta_bs)),
+    () => redondear(num('pago_movil_bs') + num('efectivo_bs') + num('punto_venta_bs')),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [f.pago_movil_bs, f.efectivo_bs, f.punto_venta_bs],
   );
-  const tasa = redondearTasa(f.tasa_dolar);
+  // La tasa se cotiza con cuatro decimales, no con dos
+  const tasa = redondearTasa(digitosANumero(f.tasa_dolar, 4) || 0);
   const totalUsd = useMemo(
     () => (tasa > 0 ? redondear(totalBs / tasa) : 0),
     [totalBs, tasa],
   );
   // Los costos se escriben en dólares; su equivalente en bolívares es lo que resta al neto
   const costosBs = useMemo(
-    () => (tasa > 0 ? redondear(redondear(f.costos_operativos_usd) * tasa) : 0),
+    () => (tasa > 0 ? redondear(num('costos_operativos_usd') * tasa) : 0),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [tasa, f.costos_operativos_usd],
   );
   const netoBs = useMemo(
-    () => redondear(totalBs - redondear(f.impuestos_fiscales_bs) - costosBs),
+    () => redondear(totalBs - num('impuestos_fiscales_bs') - costosBs),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [totalBs, f.impuestos_fiscales_bs, costosBs],
   );
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
@@ -1075,14 +1427,14 @@ function VistaCaja({ usuario, call, aviso }) {
       await call('/api/caja/cierre', {
         method: 'POST',
         body: {
-          pago_movil_bs: redondear(f.pago_movil_bs),
-          efectivo_bs: redondear(f.efectivo_bs),
-          punto_venta_bs: redondear(f.punto_venta_bs),
+          pago_movil_bs: num('pago_movil_bs'),
+          efectivo_bs: num('efectivo_bs'),
+          punto_venta_bs: num('punto_venta_bs'),
           total_cierre_bs: totalBs,
           tasa_dolar: tasa,
           total_ingreso_dolar: totalUsd,
-          impuestos_fiscales_bs: redondear(f.impuestos_fiscales_bs),
-          costos_operativos_usd: redondear(f.costos_operativos_usd),
+          impuestos_fiscales_bs: num('impuestos_fiscales_bs'),
+          costos_operativos_usd: num('costos_operativos_usd'),
           observacion: f.observacion,
         },
       });
@@ -1120,15 +1472,25 @@ function VistaCaja({ usuario, call, aviso }) {
       ) : (
         <form onSubmit={enviar} className="card space-y-3">
           <p className="text-sm text-slate-500">Fecha: {fmtFecha(hoy.fecha)}</p>
-          <Campo etiqueta="Pago móvil (Bs)"><NumInput value={f.pago_movil_bs} onChange={set('pago_movil_bs')} placeholder="0.00" /></Campo>
-          <Campo etiqueta="Efectivo (Bs)"><NumInput value={f.efectivo_bs} onChange={set('efectivo_bs')} placeholder="0.00" /></Campo>
-          <Campo etiqueta="Punto de venta (Bs)"><NumInput value={f.punto_venta_bs} onChange={set('punto_venta_bs')} placeholder="0.00" /></Campo>
+          <p className="text-xs text-slate-500">
+            En los montos escribe sólo números: los centavos se llenan primero y el
+            punto se pone solo. Para 123,45 escribe 12345.
+          </p>
+          <Campo etiqueta="Pago móvil (Bs)">
+            <MontoInput digitos={f.pago_movil_bs} onDigitos={set('pago_movil_bs')} prefijo="Bs" />
+          </Campo>
+          <Campo etiqueta="Efectivo (Bs)">
+            <MontoInput digitos={f.efectivo_bs} onDigitos={set('efectivo_bs')} prefijo="Bs" />
+          </Campo>
+          <Campo etiqueta="Punto de venta (Bs)">
+            <MontoInput digitos={f.punto_venta_bs} onDigitos={set('punto_venta_bs')} prefijo="Bs" />
+          </Campo>
           <div className="rounded-xl bg-agua-50 border border-agua-200 p-3">
             <p className="text-sm text-slate-600">Total Bs (calculado)</p>
             <p className="text-2xl font-extrabold text-agua-800">{fmtBs(totalBs)}</p>
           </div>
           <Campo etiqueta="Tasa del dólar del día (obligatoria)">
-            <NumInput value={f.tasa_dolar} onChange={set('tasa_dolar')} placeholder="0.0000" required />
+            <MontoInput digitos={f.tasa_dolar} onDigitos={set('tasa_dolar')} decimales={4} required />
           </Campo>
           <div className="rounded-xl bg-emerald-50 border border-emerald-200 p-3">
             <p className="text-sm text-slate-600">Ingreso total en dólares (calculado)</p>
@@ -1136,10 +1498,10 @@ function VistaCaja({ usuario, call, aviso }) {
             <p className="text-xs text-slate-500">Total Bs ÷ tasa del día</p>
           </div>
           <Campo etiqueta="Impuestos fiscales (Bs)">
-            <NumInput value={f.impuestos_fiscales_bs} onChange={set('impuestos_fiscales_bs')} placeholder="0.00" />
+            <MontoInput digitos={f.impuestos_fiscales_bs} onDigitos={set('impuestos_fiscales_bs')} prefijo="Bs" />
           </Campo>
           <Campo etiqueta="Costos operativos (USD)">
-            <NumInput value={f.costos_operativos_usd} onChange={set('costos_operativos_usd')} placeholder="0.00" />
+            <MontoInput digitos={f.costos_operativos_usd} onDigitos={set('costos_operativos_usd')} prefijo="$" />
           </Campo>
           <div className="rounded-xl bg-slate-50 border border-slate-200 p-3">
             <p className="text-sm text-slate-600">Equivalen a</p>
@@ -1388,12 +1750,184 @@ const ESTADOS_ITEM = [
   ['no_llego', 'No llegó'],
 ];
 
+/*
+ * Los pedidos a crédito que están por pagar.
+ *
+ * Los montos van en DÓLARES aunque se paguen en bolívares: una deuda a
+ * quince o treinta días en bolívares no significa nada, porque lo que se
+ * debe en términos reales cambia con la tasa.
+ *
+ * Esto no entra a la contabilidad de la aplicación. Es un recordatorio de
+ * lo que hay que pagar y de cuándo se pagó.
+ */
+function PedidosPorPagar({ call, aviso, subirFoto }) {
+  const [datos, setDatos] = useState(null);
+  const [abierto, setAbierto] = useState(false);
+  const [pagando, setPagando] = useState(null); // id del pedido que se está pagando
+  const [fotoPago, setFotoPago] = useState('');
+  const [editando, setEditando] = useState(null);
+  const [montoDig, setMontoDig] = useState('');
+  const [ocupado, setOcupado] = useState(false);
+
+  const cargar = useCallback(async () => {
+    try {
+      setDatos(await call('/api/credito/pendientes'));
+    } catch {
+      setDatos(null); // sin la función especial, el panel no aparece
+    }
+  }, [call]);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  const guardarMonto = async (id) => {
+    const valor = digitosANumero(montoDig, 2);
+    if (!valor || valor <= 0) return aviso('Escribe el monto de la nota', 'error');
+    setOcupado(true);
+    try {
+      await call(`/api/credito/${id}/monto`, { method: 'PUT', body: { monto_nota_usd: valor } });
+      aviso('Monto actualizado', 'ok');
+      setEditando(null); setMontoDig('');
+      await cargar();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setOcupado(false);
+    }
+  };
+
+  const marcarPagado = async (id) => {
+    setOcupado(true);
+    try {
+      await call(`/api/credito/${id}/pagado`, {
+        method: 'PUT',
+        body: { foto_factura_url: fotoPago || undefined },
+      });
+      aviso('Pedido marcado como pagado', 'ok');
+      setPagando(null); setFotoPago('');
+      await cargar();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setOcupado(false);
+    }
+  };
+
+  if (!datos) return null;
+  const t = datos.totales;
+  const pendientes = datos.pedidos.filter((x) => !x.pagado_en);
+  if (pendientes.length === 0) return null;
+
+  return (
+    <div className={`card space-y-3 ${t.vencidos > 0 ? '!border-red-300' : ''}`}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="font-bold">
+            {t.vencidos > 0 ? '⚠️ ' : ''}
+            Pedidos por pagar
+          </h3>
+          <p className="text-xs text-slate-500">
+            {t.pendientes === 1 ? '1 pedido a crédito' : `${nf0.format(t.pendientes)} pedidos a crédito`}
+            {t.debe_usd > 0 ? ` · debes ${fmtUsd(t.debe_usd)}` : ''}
+            {t.vencidos > 0 ? ` · ${nf0.format(t.vencidos)} vencido(s)` : ''}
+          </p>
+        </div>
+        <button type="button" className="btn-sec !py-2 !min-h-[40px] shrink-0" onClick={() => setAbierto((v) => !v)}>
+          {abierto ? 'Cerrar' : 'Ver'}
+        </button>
+      </div>
+
+      {abierto && pendientes.map((x) => {
+        const vencido = x.dias_restantes !== null && x.dias_restantes < 0;
+        return (
+          <div key={x.id} className={`rounded-xl p-3 space-y-2 ${vencido ? 'bg-red-50' : 'bg-slate-50'}`}>
+            <div className="flex justify-between items-start gap-2">
+              <span className="font-semibold min-w-0">{x.proveedor}</span>
+              {x.dias_restantes === null ? (
+                <Chip>sin vencimiento</Chip>
+              ) : vencido ? (
+                <Chip tono="rojo">{`vencido hace ${nf0.format(Math.abs(x.dias_restantes))} d`}</Chip>
+              ) : (
+                <Chip tono={x.dias_restantes <= 3 ? 'ambar' : 'gris'}>
+                  {x.dias_restantes === 0 ? 'vence hoy' : `vence en ${nf0.format(x.dias_restantes)} d`}
+                </Chip>
+              )}
+            </div>
+            <p className="text-sm text-slate-600">
+              Recibido el {fmtFecha(x.recibido_el)} por {x.recibio}
+            </p>
+            <p className="text-lg font-extrabold">
+              {x.monto_nota_usd === null ? (
+                <span className="text-sm font-normal text-amber-800">Sin monto definido</span>
+              ) : fmtUsd(x.monto_nota_usd)}
+            </p>
+
+            {editando === x.id ? (
+              <div className="space-y-2">
+                <Campo etiqueta="Monto de la nota en dólares">
+                  <MontoInput digitos={montoDig} onDigitos={setMontoDig} prefijo="$" />
+                </Campo>
+                <div className="flex gap-2">
+                  <button type="button" className="btn-primario flex-1" disabled={ocupado} onClick={() => guardarMonto(x.id)}>
+                    Guardar monto
+                  </button>
+                  <button type="button" className="btn-sec !px-3" onClick={() => { setEditando(null); setMontoDig(''); }}>
+                    Cancelar
+                  </button>
+                </div>
+              </div>
+            ) : pagando === x.id ? (
+              <div className="space-y-2">
+                <CapturaFoto
+                  etiqueta="Foto de la factura"
+                  ayuda="La que te acaban de entregar al pagar"
+                  destino="factura"
+                  valor={fotoPago}
+                  onCambio={setFotoPago}
+                  subirFoto={subirFoto}
+                  aviso={aviso}
+                  requerido
+                />
+                <div className="flex gap-2">
+                  <button type="button" className="btn-primario flex-1" disabled={ocupado} onClick={() => marcarPagado(x.id)}>
+                    {ocupado ? 'Guardando…' : 'Confirmar el pago'}
+                  </button>
+                  <button type="button" className="btn-sec !px-3" onClick={() => { setPagando(null); setFotoPago(''); }}>
+                    Cancelar
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  className="btn-sec !py-2 !min-h-[40px] flex-1"
+                  onClick={() => {
+                    setEditando(x.id);
+                    setMontoDig(x.monto_nota_usd ? String(Math.round(Number(x.monto_nota_usd) * 100)) : '');
+                  }}
+                >
+                  {x.monto_nota_usd === null ? 'Poner el monto' : 'Corregir monto'}
+                </button>
+                <button type="button" className="btn-primario !py-2 !min-h-[40px] flex-1" onClick={() => setPagando(x.id)}>
+                  Marcar pagado
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function RecibirSolicitud({ call, aviso, onListo, subirFoto, proveedores }) {
   const [solicitudes, setSolicitudes] = useState(null);
   const [selId, setSelId] = useState('');
   const [lineas, setLineas] = useState([]);
   const [factura, setFactura] = useState('');
   const [facturaDigital, setFacturaDigital] = useState(false);
+  const [montoNota, setMontoNota] = useState('');
+  /* Para las solicitudes viejas que se hicieron sin proveedor */
+  const [provElegido, setProvElegido] = useState('');
   const [obs, setObs] = useState('');
   const [enviando, setEnviando] = useState(false);
 
@@ -1413,6 +1947,8 @@ function RecibirSolicitud({ call, aviso, onListo, subirFoto, proveedores }) {
     setSelId(id);
     setFactura('');
     setFacturaDigital(false);
+    setMontoNota('');
+    setProvElegido('');
     const sol = (solicitudes || []).find((x) => x.id === id);
     const items = sol && Array.isArray(sol.detalle_items) ? sol.detalle_items : [];
     setLineas(items.map((it) => ({
@@ -1434,20 +1970,33 @@ function RecibirSolicitud({ call, aviso, onListo, subirFoto, proveedores }) {
     else setLinea(i, { estado, cantidad: '' });
   };
 
-  /* Cómo factura este proveedor decide si la foto es obligatoria */
-  const prov = sel && proveedores.find((p) => p.id === sel.proveedor_id);
-  const tipoFactura = (prov && prov.tipo_factura) || (sel && sel.tipo_factura) || 'fisica';
-  const permiteDigital = tipoFactura === 'ambas';
-  const exigeFoto = tipoFactura === 'fisica' || (permiteDigital && !facturaDigital);
+  /*
+   * El proveedor sale de la solicitud. Las solicitudes hechas antes de que
+   * el proveedor fuera obligatorio no lo tienen, así que para esas se
+   * elige aquí: de lo contrario no habría forma de recibirlas.
+   */
+  const provIdEfectivo = (sel && sel.proveedor_id) || (provElegido ? Number(provElegido) : null);
+  const prov = provIdEfectivo && proveedores.find((p) => p.id === provIdEfectivo);
+  const tipoFactura = (prov && prov.tipo_factura) || 'fisica';
+  const aCredito = Boolean(prov) && prov.metodo_pago === 'credito';
+  const permiteDigital = !aCredito && tipoFactura === 'ambas';
+  const exigeFoto = Boolean(prov) && !aCredito
+    && (tipoFactura === 'fisica' || (permiteDigital && !facturaDigital));
+
+  /* Qué falta por llenar, para decirlo en el botón */
+  const falta = (() => {
+    if (!sel) return 'elegir la solicitud';
+    if (!provIdEfectivo) return 'el proveedor';
+    const i = lineas.findIndex((l) => l.estado === 'otra' && !(Number(l.cantidad) > 0));
+    if (i >= 0) return `cuánto llegó de ${lineas[i].nombre}`;
+    if (!lineas.some((l) => Number(l.cantidad) > 0)) return 'marcar algo que haya llegado';
+    if (aCredito && !(digitosANumero(montoNota, 2) > 0)) return 'el monto de la nota';
+    if (exigeFoto && !factura) return 'la foto de la factura';
+    return null;
+  })();
 
   const enviar = async (e) => {
     e.preventDefault();
-    if (!sel) return aviso('Elija una solicitud', 'error');
-    for (const l of lineas) {
-      if (l.estado === 'otra' && (l.cantidad === '' || Number(l.cantidad) <= 0)) {
-        return aviso(`Indique cuánto llegó de ${l.nombre}`, 'error');
-      }
-    }
     if (!lineas.some((l) => Number(l.cantidad) > 0)) {
       return aviso('No llegó ningún producto. Si de verdad no llegó nada, rechace la solicitud desde Reportes.', 'error');
     }
@@ -1456,16 +2005,18 @@ function RecibirSolicitud({ call, aviso, onListo, subirFoto, proveedores }) {
       await call('/api/entradas/mercancia', {
         method: 'POST',
         body: {
-          proveedor_id: sel.proveedor_id,
+          proveedor_id: provIdEfectivo,
           solicitud_id: sel.id,
           items: lineas.map((l) => ({ producto_id: l.producto_id, cantidad: Number(l.cantidad) })),
           foto_factura_url: factura || undefined,
           factura_digital: permiteDigital ? facturaDigital : undefined,
+          monto_nota_usd: aCredito ? digitosANumero(montoNota, 2) : undefined,
           observaciones: obs || undefined,
         },
       });
       aviso('Recepción registrada y solicitud cerrada', 'ok');
-      setSelId(''); setLineas([]); setObs(''); setFactura(''); setFacturaDigital(false);
+      setSelId(''); setLineas([]); setObs(''); setFactura('');
+      setFacturaDigital(false); setMontoNota(''); setProvElegido('');
       await cargar();
       onListo();
     } catch (err) {
@@ -1488,7 +2039,7 @@ function RecibirSolicitud({ call, aviso, onListo, subirFoto, proveedores }) {
   }
 
   return (
-    <form onSubmit={enviar} className="card space-y-3">
+    <form onSubmit={enviar} className="card space-y-3" noValidate>
       <div>
         <h3 className="font-bold">Recibir un pedido que se solicitó</h3>
         <p className="text-xs text-slate-500">
@@ -1515,6 +2066,23 @@ function RecibirSolicitud({ call, aviso, onListo, subirFoto, proveedores }) {
             La pidió {sel.pidio}
             {sel.proveedor ? ` · Proveedor: ${sel.proveedor}` : ''}
           </p>
+
+          {!sel.proveedor_id && (
+            <div className="rounded-xl bg-amber-50 p-3 space-y-2">
+              <Campo etiqueta="¿De qué proveedor llegó?">
+                <Select
+                  valor={provElegido}
+                  onChange={setProvElegido}
+                  opciones={filtrarProveedores(proveedores, 'mercancia').map((pv) => [String(pv.id), pv.nombre])}
+                  vacio="Seleccione…"
+                />
+              </Campo>
+              <p className="text-xs text-amber-900">
+                Esta solicitud se hizo antes de que el proveedor fuera obligatorio, así que
+                hay que indicarlo ahora. Las nuevas ya lo traen.
+              </p>
+            </div>
+          )}
 
           {lineas.length === 0 ? (
             <Vacio texto="Esa solicitud no tiene productos detallados" />
@@ -1548,11 +2116,26 @@ function RecibirSolicitud({ call, aviso, onListo, subirFoto, proveedores }) {
             </div>
           ))}
 
+          {aCredito && (
+            <div className="rounded-xl bg-amber-50 p-3 space-y-2">
+              <Campo etiqueta="Monto de la nota de entrega, en dólares">
+                <MontoInput digitos={montoNota} onDigitos={setMontoNota} prefijo="$" />
+              </Campo>
+              <p className="text-xs text-amber-900">
+                {prov.nombre} trabaja a crédito: no entrega factura ahora, sino una nota.
+                Escribe el monto que dice esa nota. La factura se le pide el día del pago
+                {Number(prov.dias_credito) > 0
+                  ? `, y el pedido vence en ${nf0.format(prov.dias_credito)} días.`
+                  : '.'}
+              </p>
+            </div>
+          )}
+
           {exigeFoto ? (
             <CapturaFoto
               etiqueta="Foto de la factura"
               ayuda={tipoFactura === 'fisica'
-                ? `${sel.proveedor || 'Este proveedor'} entrega factura física: la foto es obligatoria`
+                ? `${(prov && prov.nombre) || 'Este proveedor'} entrega factura física: la foto es obligatoria`
                 : 'Que se lean los montos y la fecha'}
               destino="factura"
               valor={factura}
@@ -1561,13 +2144,13 @@ function RecibirSolicitud({ call, aviso, onListo, subirFoto, proveedores }) {
               aviso={aviso}
               requerido
             />
-          ) : (
+          ) : (prov && !aCredito) ? (
             <p className="text-xs text-slate-500 rounded-lg bg-slate-50 p-2">
               {tipoFactura === 'digital'
-                ? `${sel.proveedor || 'Este proveedor'} envía la factura al correo de la empresa, así que no hace falta la foto.`
+                ? `${prov.nombre} envía la factura al correo de la empresa, así que no hace falta la foto.`
                 : 'Marcaste factura digital, así que no hace falta la foto.'}
             </p>
-          )}
+          ) : null}
 
           {permiteDigital && (
             <label className="flex items-center gap-3 min-h-[44px] text-sm">
@@ -1585,8 +2168,8 @@ function RecibirSolicitud({ call, aviso, onListo, subirFoto, proveedores }) {
             <textarea className="campo" rows={2} maxLength={500} value={obs} onChange={(e) => setObs(e.target.value)} />
           </Campo>
 
-          <button className="btn-primario w-full" disabled={enviando}>
-            {enviando ? 'Guardando…' : 'Registrar recepción'}
+          <button className="btn-primario w-full" disabled={enviando || Boolean(falta)}>
+            {enviando ? 'Guardando…' : falta ? `Falta ${falta}` : 'Registrar recepción'}
           </button>
         </>
       )}
@@ -1602,6 +2185,7 @@ function EntradaMercancia({
   const [filas, setFilas] = useState([{ producto_id: '', cantidad: '' }]);
   const [factura, setFactura] = useState('');
   const [facturaDigital, setFacturaDigital] = useState(false);
+  const [montoNota, setMontoNota] = useState('');
   const [enviando, setEnviando] = useState(false);
 
   /*
@@ -1612,10 +2196,29 @@ function EntradaMercancia({
    */
   const provSel = datos.proveedores.find((p) => String(p.id) === String(proveedor));
   const tipoFactura = (provSel && provSel.tipo_factura) || 'fisica';
-  const permiteDigital = tipoFactura === 'ambas';
-  const exigeFoto = Boolean(provSel) && (tipoFactura === 'fisica' || (permiteDigital && !facturaDigital));
+  /*
+   * A crédito no hay factura todavía: el proveedor deja una nota de
+   * entrega y la factura llega el día del pago. Así que en vez de la foto
+   * se pide el monto que queda debiéndose.
+   */
+  const aCredito = Boolean(provSel) && provSel.metodo_pago === 'credito';
+  const permiteDigital = !aCredito && tipoFactura === 'ambas';
+  const exigeFoto = Boolean(provSel) && !aCredito
+    && (tipoFactura === 'fisica' || (permiteDigital && !facturaDigital));
 
   const setFila = (i, k, v) => setFilas((p) => p.map((f, idx) => (idx === i ? { ...f, [k]: v } : f)));
+
+  /* Qué falta por llenar, en orden, para decirlo en el botón */
+  const faltaManual = (() => {
+    if (!proveedor) return 'el proveedor';
+    const i = filas.findIndex((f) => !f.producto_id);
+    if (i >= 0) return `el producto ${i + 1}`;
+    const j = filas.findIndex((f) => !(Number(f.cantidad) > 0));
+    if (j >= 0) return `la cantidad del producto ${j + 1}`;
+    if (aCredito && !(digitosANumero(montoNota, 2) > 0)) return 'el monto de la nota';
+    if (exigeFoto && !factura) return 'la foto de la factura';
+    return null;
+  })();
 
   const enviar = async (e) => {
     e.preventDefault();
@@ -1631,6 +2234,7 @@ function EntradaMercancia({
           })),
           foto_factura_url: factura || undefined,
           factura_digital: permiteDigital ? facturaDigital : undefined,
+          monto_nota_usd: aCredito ? digitosANumero(montoNota, 2) : undefined,
         },
       });
       aviso('Mercancía recibida y stock actualizado', 'ok');
@@ -1638,6 +2242,7 @@ function EntradaMercancia({
       setObs('');
       setFactura('');
       setFacturaDigital(false);
+      setMontoNota('');
       onListo();
     } catch (err) {
       aviso(err.message, 'error');
@@ -1662,6 +2267,8 @@ function EntradaMercancia({
 
   return (
     <div className="space-y-4">
+      <PedidosPorPagar call={call} aviso={aviso} subirFoto={subirFoto} />
+
       <RecibirSolicitud
         call={call}
         aviso={aviso}
@@ -1670,7 +2277,7 @@ function EntradaMercancia({
         proveedores={datos.proveedores}
       />
 
-      <form onSubmit={enviar} className="card space-y-3">
+      <form onSubmit={enviar} className="card space-y-3" noValidate>
         <h3 className="font-bold">O cargar a mano lo que llegó</h3>
         <Campo etiqueta="Proveedor de mercancía (obligatorio)">
           <Select
@@ -1707,6 +2314,21 @@ function EntradaMercancia({
           + Agregar ítem
         </button>
         {!puedeCatalogo && <AgregarProductoRapido call={call} aviso={aviso} onListo={onListo} />}
+        {aCredito && (
+          <div className="rounded-xl bg-amber-50 p-3 space-y-2">
+            <Campo etiqueta="Monto de la nota de entrega, en dólares">
+              <MontoInput digitos={montoNota} onDigitos={setMontoNota} prefijo="$" />
+            </Campo>
+            <p className="text-xs text-amber-900">
+              {provSel.nombre} trabaja a crédito: no entrega factura ahora, sino una nota.
+              Escribe el monto que dice esa nota. La factura se le pide el día que se le
+              pague, y mientras tanto el pedido sale en «pedidos por pagar»
+              {Number(provSel.dias_credito) > 0
+                ? `, con vencimiento en ${nf0.format(provSel.dias_credito)} días.`
+                : '.'}
+            </p>
+          </div>
+        )}
         {exigeFoto && (
           <CapturaFoto
             etiqueta="Foto de la factura"
@@ -1721,7 +2343,7 @@ function EntradaMercancia({
             requerido
           />
         )}
-        {provSel && !exigeFoto && (
+        {provSel && !exigeFoto && !aCredito && (
           <p className="text-xs text-slate-500 rounded-lg bg-slate-50 p-2">
             {tipoFactura === 'digital'
               ? `${provSel.nombre} envía la factura al correo de la empresa, así que no hace falta la foto.`
@@ -1742,7 +2364,9 @@ function EntradaMercancia({
         <Campo etiqueta="Observaciones (opcional)">
           <textarea className="campo" rows={2} maxLength={500} value={obs} onChange={(e) => setObs(e.target.value)} />
         </Campo>
-        <button className="btn-primario w-full" disabled={enviando || !proveedor}>{enviando ? 'Guardando…' : 'Registrar recepción'}</button>
+        <button className="btn-primario w-full" disabled={enviando || Boolean(faltaManual)}>
+          {enviando ? 'Guardando…' : faltaManual ? `Falta ${faltaManual}` : 'Registrar recepción'}
+        </button>
       </form>
       <h3 className="font-bold">Últimos 30 días</h3>
       {datos.mercancia.length === 0 ? <Vacio texto="Sin entradas de mercancía" /> : datos.mercancia.map((e) => (
@@ -1772,6 +2396,7 @@ function EntradaMercancia({
 function Catalogo({ call, aviso, datos, onListo, puedeEliminar }) {
   const [prov, setProv] = useState({
     nombre: '', tipo: 'ambos', contacto: '', rif: '', telefono: '', tipo_factura: 'fisica',
+    metodo_pago: 'contado', dias_credito: '0',
   });
   const [prod, setProd] = useState({
     nombre: '', categoria: 'mercancia', subcategoria: 'bebidas',
@@ -1800,8 +2425,9 @@ function Catalogo({ call, aviso, datos, onListo, puedeEliminar }) {
         className="card space-y-3"
         onSubmit={(e) => {
           e.preventDefault();
-          guardar('/api/proveedores', prov, () => setProv({
+          guardar('/api/proveedores', { ...prov, dias_credito: Number(prov.dias_credito || 0) }, () => setProv({
             nombre: '', tipo: 'ambos', contacto: '', rif: '', telefono: '', tipo_factura: 'fisica',
+            metodo_pago: 'contado', dias_credito: '0',
           }));
         }}
       >
@@ -1815,6 +2441,20 @@ function Catalogo({ call, aviso, datos, onListo, puedeEliminar }) {
         Si entrega factura física, al recibir su mercancía la foto será obligatoria.
         Si la envía al correo de la empresa, no se pedirá.
       </p>
+      <Campo etiqueta="Cómo se le paga">
+        <Select valor={prov.metodo_pago} onChange={(v) => setProv({ ...prov, metodo_pago: v })} opciones={METODOS_PAGO_PROVEEDOR} />
+      </Campo>
+      {prov.metodo_pago === 'credito' && (
+        <Campo etiqueta="Días de crédito (cuentan desde la recepción)">
+          <NumInput value={prov.dias_credito} onChange={(v) => setProv({ ...prov, dias_credito: v })} step="1" />
+        </Campo>
+      )}
+      {prov.metodo_pago === 'credito' && (
+        <p className="text-xs text-slate-500 -mt-1">
+          Al recibir de este proveedor no se pedirá foto de factura, sino el monto en
+          dólares de la nota de entrega. La foto se pide el día que se le pague.
+        </p>
+      )}
         <Campo etiqueta="Contacto"><input className="campo" value={prov.contacto} onChange={(e) => setProv({ ...prov, contacto: e.target.value })} /></Campo>
         <div className="grid grid-cols-2 gap-2">
           <Campo etiqueta="RIF"><input className="campo" value={prov.rif} onChange={(e) => setProv({ ...prov, rif: e.target.value })} /></Campo>
@@ -1999,6 +2639,8 @@ function ProveedorEditable({ proveedor, call, aviso, onListo, puedeEliminar }) {
     rif: proveedor.rif || '',
     telefono: proveedor.telefono || '',
     tipo_factura: proveedor.tipo_factura || 'fisica',
+    metodo_pago: proveedor.metodo_pago || 'contado',
+    dias_credito: String(proveedor.dias_credito ?? 0),
     activo: proveedor.activo,
   });
   const [guardando, setGuardando] = useState(false);
@@ -2006,7 +2648,10 @@ function ProveedorEditable({ proveedor, call, aviso, onListo, puedeEliminar }) {
   const guardar = async () => {
     setGuardando(true);
     try {
-      await call(`/api/proveedores/${proveedor.id}`, { method: 'PUT', body: f });
+      await call(`/api/proveedores/${proveedor.id}`, {
+        method: 'PUT',
+        body: { ...f, dias_credito: Number(f.dias_credito || 0) },
+      });
       aviso('Proveedor actualizado', 'ok');
       setAbierto(false);
       onListo();
@@ -2032,6 +2677,9 @@ function ProveedorEditable({ proveedor, call, aviso, onListo, puedeEliminar }) {
           <Chip tono="azul">{etiquetaDe(TIPOS_PROVEEDOR, proveedor.tipo)}</Chip>
           {proveedor.tipo_factura === 'digital' && <Chip>factura digital</Chip>}
           {proveedor.tipo_factura === 'ambas' && <Chip>factura variable</Chip>}
+          {proveedor.metodo_pago === 'credito' && (
+            <Chip tono="ambar">{`crédito ${nf0.format(proveedor.dias_credito || 0)}d`}</Chip>
+          )}
         </span>
       </button>
     );
@@ -2056,6 +2704,20 @@ function ProveedorEditable({ proveedor, call, aviso, onListo, puedeEliminar }) {
         Si entrega factura física, al recibir su mercancía la foto será obligatoria.
         Si la envía al correo de la empresa, no se pedirá.
       </p>
+      <Campo etiqueta="Cómo se le paga">
+        <Select valor={f.metodo_pago} onChange={(v) => setF({ ...f, metodo_pago: v })} opciones={METODOS_PAGO_PROVEEDOR} />
+      </Campo>
+      {f.metodo_pago === 'credito' && (
+        <Campo etiqueta="Días de crédito (cuentan desde la recepción)">
+          <NumInput value={f.dias_credito} onChange={(v) => setF({ ...f, dias_credito: v })} step="1" />
+        </Campo>
+      )}
+      {f.metodo_pago === 'credito' && (
+        <p className="text-xs text-slate-500 -mt-1">
+          Al recibir de este proveedor no se pedirá foto de factura, sino el monto en
+          dólares de la nota de entrega. La foto se pide el día que se le pague.
+        </p>
+      )}
       <Campo etiqueta="Contacto">
         <input className="campo" value={f.contacto} onChange={(e) => setF({ ...f, contacto: e.target.value })} />
       </Campo>
@@ -2433,6 +3095,7 @@ function VistaSolicitudesProductos({ usuario, call, aviso }) {
 
 function FormSolicitudMercancia({ datos, call, aviso, onListo }) {
   const [titulo, setTitulo] = useState('Pedido de mercancía');
+  const [proveedor, setProveedor] = useState('');
   const [descripcion, setDescripcion] = useState('');
   const [filas, setFilas] = useState([{ producto_id: '', cantidad_empaques: '' }]);
   const [enviando, setEnviando] = useState(false);
@@ -2449,6 +3112,7 @@ function FormSolicitudMercancia({ datos, call, aviso, onListo }) {
         body: {
           tipo_solicitud: 'mercancia',
           titulo,
+          proveedor_id: Number(proveedor),
           descripcion,
           detalle_items: filas.map((f) => ({
             producto_id: Number(f.producto_id),
@@ -2458,6 +3122,7 @@ function FormSolicitudMercancia({ datos, call, aviso, onListo }) {
       });
       aviso('Solicitud de mercancía enviada', 'ok');
       setFilas([{ producto_id: '', cantidad_empaques: '' }]);
+      setProveedor('');
       setDescripcion('');
       onListo();
     } catch (err) {
@@ -2467,13 +3132,37 @@ function FormSolicitudMercancia({ datos, call, aviso, onListo }) {
     }
   };
 
-  const completo = filas.every((f) => f.producto_id && Number(f.cantidad_empaques) > 0);
+  /*
+   * Qué falta por llenar, en orden. El botón queda inhabilitado y dice el
+   * primer pendiente, en vez de dejar que el navegador saque su globo en
+   * inglés al intentar enviar.
+   */
+  const falta = (() => {
+    if (!titulo.trim() || titulo.trim().length < 3) return 'el título';
+    if (!proveedor) return 'el proveedor';
+    if (datos.productos.length === 0) return 'productos en el catálogo';
+    const i = filas.findIndex((f) => !f.producto_id);
+    if (i >= 0) return `el producto ${i + 1}`;
+    const j = filas.findIndex((f) => !(Number(f.cantidad_empaques) > 0));
+    if (j >= 0) return `la cantidad del producto ${j + 1}`;
+    return null;
+  })();
 
   return (
-    <form onSubmit={enviar} className="card space-y-3">
+    <form onSubmit={enviar} className="card space-y-3" noValidate>
       <Campo etiqueta="Título">
-        <input className="campo" value={titulo} onChange={(e) => setTitulo(e.target.value)} minLength={3} maxLength={120} required />
+        <input className="campo" value={titulo} onChange={(e) => setTitulo(e.target.value)} minLength={3} maxLength={120} />
       </Campo>
+
+      <Campo etiqueta="Proveedor al que se le pide">
+        <Select
+          valor={proveedor}
+          onChange={setProveedor}
+          opciones={filtrarProveedores(datos.proveedores, 'mercancia').map((pv) => [String(pv.id), pv.nombre])}
+          vacio="Seleccione…"
+        />
+      </Campo>
+      <AgregarProveedorRapido call={call} aviso={aviso} onListo={onListo} tipoPorDefecto="mercancia" />
 
       {datos.productos.length === 0 ? (
         <p className="text-sm text-slate-500">No hay productos en el catálogo todavía. Agrégalos con el botón de abajo.</p>
@@ -2488,11 +3177,10 @@ function FormSolicitudMercancia({ datos, call, aviso, onListo }) {
                 onChange={(v) => setFila(i, 'producto_id', v)}
                 grupos={agruparProductos(datos.productos)}
                 vacio="Seleccione…"
-                required
               />
             </Campo>
             <Campo etiqueta={p ? `¿Cuántas ${EMPAQUETADO_PLURAL[p.empaquetado]}?` : 'Cantidad de empaques'}>
-              <NumInput value={f.cantidad_empaques} onChange={(v) => setFila(i, 'cantidad_empaques', v)} step="1" required />
+              <NumInput value={f.cantidad_empaques} onChange={(v) => setFila(i, 'cantidad_empaques', v)} step="1" />
             </Campo>
             {total > 0 && (
               <p className="text-sm text-agua-800 bg-agua-50 rounded-lg p-2">
@@ -2519,8 +3207,8 @@ function FormSolicitudMercancia({ datos, call, aviso, onListo }) {
       <Campo etiqueta="Nota (opcional)">
         <textarea className="campo" rows={2} maxLength={2000} value={descripcion} onChange={(e) => setDescripcion(e.target.value)} />
       </Campo>
-      <button className="btn-primario w-full" disabled={enviando || !completo || datos.productos.length === 0}>
-        {enviando ? 'Enviando…' : 'Enviar solicitud'}
+      <button className="btn-primario w-full" disabled={enviando || Boolean(falta)}>
+        {enviando ? 'Enviando…' : falta ? `Falta ${falta}` : 'Enviar solicitud'}
       </button>
     </form>
   );
@@ -4200,6 +4888,7 @@ function VistaAjustes({ call, aviso }) {
   const [anticipacion, setAnticipacion] = useState('');
   const [guardando, setGuardando] = useState(false);
   const [cerrarDia, setCerrarDia] = useState({ fecha: hoyCaracas(), motivo: '' });
+  // La hora se guarda como digitos: el campo pone los dos puntos solo
   const [corregir, setCorregir] = useState({ fecha: hoyCaracas(), hora: '' });
 
   const cargar = useCallback(async () => {
@@ -4253,13 +4942,13 @@ function VistaAjustes({ call, aviso }) {
   };
 
   const corregirHora = async () => {
-    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(corregir.hora)) {
-      return aviso('La hora debe ir como HH:MM, por ejemplo 08:15', 'error');
+    if (!horaValida(corregir.hora)) {
+      return aviso('Escriba una hora válida, de 00:00 a 23:59', 'error');
     }
     try {
       await call('/api/tienda/hora', {
         method: 'PUT',
-        body: { fecha: corregir.fecha, hora: corregir.hora },
+        body: { fecha: corregir.fecha, hora: horaDesdeDigitos(corregir.hora) },
       });
       aviso('Hora de apertura corregida', 'ok');
       setCorregir({ fecha: hoyCaracas(), hora: '' });
@@ -4365,14 +5054,10 @@ function VistaAjustes({ call, aviso }) {
               onChange={(e) => setCorregir({ ...corregir, fecha: e.target.value })}
             />
           </Campo>
-          <Campo etiqueta="Hora real (HH:MM)">
-            <input
-              className="campo"
-              inputMode="numeric"
-              placeholder="08:15"
-              maxLength={5}
-              value={corregir.hora}
-              onChange={(e) => setCorregir({ ...corregir, hora: e.target.value })}
+          <Campo etiqueta="Hora real">
+            <HoraInput
+              digitos={corregir.hora}
+              onDigitos={(v) => setCorregir({ ...corregir, hora: v })}
             />
           </Campo>
         </div>
@@ -4590,7 +5275,7 @@ export default function PurissimaApp() {
       </header>
 
       <main className="flex-1 w-full max-w-2xl mx-auto px-4 py-4 pb-24">
-        <BarraTienda call={call} aviso={aviso} />
+        <BarraTienda usuario={usuario} call={call} aviso={aviso} />
         {vista === 'motos' && <VistaMotos {...props} />}
         {vista === 'caja' && <VistaCaja {...props} />}
         {vista === 'recepcion' && <VistaRecepcion {...props} />}
