@@ -22,6 +22,10 @@ END $$;
 -- ---------------------------------------------------------------------
 -- Limpieza (el orden no importa por el CASCADE)
 -- ---------------------------------------------------------------------
+DROP TABLE IF EXISTS confirmaciones_apertura CASCADE;
+DROP TABLE IF EXISTS aperturas_tienda   CASCADE;
+DROP TABLE IF EXISTS combustible_motos  CASCADE;
+DROP TABLE IF EXISTS configuracion      CASCADE;
 DROP TABLE IF EXISTS checklist_motos    CASCADE;
 DROP TABLE IF EXISTS entradas_agua      CASCADE;
 DROP TABLE IF EXISTS entradas_mercancia CASCADE;
@@ -177,6 +181,11 @@ CREATE TABLE checklist_motos (
                                          OR foto_falla_url ~* '^https?://'
                                          OR (foto_falla_url ~ '^[a-z0-9][a-z0-9/_.-]{3,250}$'
                                              AND position('..' in foto_falla_url) = 0)),
+  -- El kilometraje AL MOMENTO del cambio de aceite, que es la marca desde
+  -- la cual se cuenta hasta el próximo. Puede ser igual o mayor al del
+  -- arranque del día, nunca menor: eso lo valida el backend, que conoce
+  -- los dos números a la vez.
+  km_cambio_aceite         integer     CHECK (km_cambio_aceite IS NULL OR km_cambio_aceite >= 0),
   -- Las tres del día: tablero (que se lea el km), frontal y contrapicado
   -- trasero. Que sean obligatorias lo exige la aplicación, no la base,
   -- para que los checklists viejos sigan siendo válidos.
@@ -209,6 +218,12 @@ CREATE TABLE proveedores (
   contacto  varchar(120),
   rif       varchar(20),
   telefono  varchar(30),
+  -- Cómo factura: decide si al recibir su mercancía la foto de la factura
+  -- es obligatoria. Es una característica del proveedor y no una decisión
+  -- de quien recibe, para que no exista la salida de marcar "digital" el
+  -- día que se pierda el papel.
+  tipo_factura varchar(10) NOT NULL DEFAULT 'fisica'
+                           CHECK (tipo_factura IN ('fisica', 'digital', 'ambas')),
   activo    boolean      NOT NULL DEFAULT TRUE
 );
 CREATE UNIQUE INDEX ux_proveedores_nombre ON proveedores (lower(nombre));
@@ -267,6 +282,12 @@ CREATE TABLE entradas_mercancia (
                                   OR foto_factura_url ~* '^https?://'
                                   OR (foto_factura_url ~ '^[a-z0-9][a-z0-9/_.-]{3,250}$'
                                       AND position('..' in foto_factura_url) = 0)),
+  -- Queda registrado cuando la factura se cargó como digital, para
+  -- distinguirla de una a la que simplemente le falta la foto.
+  factura_digital   boolean     NOT NULL DEFAULT FALSE,
+  -- De qué solicitud vino esta recepción, si vino de alguna. La llave
+  -- foránea se agrega más abajo, porque "solicitudes" se crea después.
+  solicitud_id      uuid,
   observaciones     text
 );
 CREATE INDEX ix_entradas_merc_fecha ON entradas_mercancia (fecha_hora);
@@ -393,6 +414,96 @@ CREATE UNIQUE INDEX ux_checklist_moto_dia
 
 CREATE UNIQUE INDEX ux_cierres_fecha ON cierres_caja (fecha) WHERE NOT anulado;
 
+-- La recepción que vino de una solicitud. El índice único es PARCIAL: una
+-- solicitud se recibe una sola vez, pero si esa recepción se anula, vuelve
+-- a poder recibirse.
+ALTER TABLE entradas_mercancia
+  ADD CONSTRAINT fk_mercancia_solicitud FOREIGN KEY (solicitud_id) REFERENCES solicitudes (id);
+CREATE UNIQUE INDEX ux_mercancia_solicitud ON entradas_mercancia (solicitud_id)
+  WHERE solicitud_id IS NOT NULL AND NOT anulado;
+
+-- =====================================================================
+-- APERTURA DE LA TIENDA
+--
+-- Una fila por día. La hora la pone el servidor al marcar la apertura: no
+-- se escribe a mano, igual que el usuario de una anulación.
+--
+-- Es el cimiento de los promedios de finanzas: el promedio diario divide
+-- entre los días que la tienda abrió, no entre los del calendario. Un
+-- domingo cerrado no es un día flojo, es un día que no existió.
+--
+-- Sin apertura no se puede cerrar la caja de ese día.
+-- =====================================================================
+CREATE TABLE aperturas_tienda (
+  fecha          date        PRIMARY KEY,
+  abierta        boolean     NOT NULL,
+  hora_apertura  timestamptz,
+  usuario_id     integer     REFERENCES usuarios (id),
+  -- Cuando el día se cierra a propósito: feriado, inventario, lo que sea
+  motivo_cierre  text,
+  -- Si el Master corrige una hora mal registrada, la original se conserva
+  hora_original  timestamptz,
+  corregida_por  integer     REFERENCES usuarios (id),
+  corregida_en   timestamptz,
+  creado_en      timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT ck_apertura_coherente CHECK (
+    (abierta AND hora_apertura IS NOT NULL AND usuario_id IS NOT NULL)
+    OR (NOT abierta AND motivo_cierre IS NOT NULL AND length(trim(motivo_cierre)) > 0)
+  )
+);
+
+-- Quién vio la apertura del día: una fila por persona y por día, para que
+-- la tarjeta no reaparezca y para saber quién se enteró y quién no.
+CREATE TABLE confirmaciones_apertura (
+  fecha         date        NOT NULL,
+  usuario_id    integer     NOT NULL REFERENCES usuarios (id),
+  confirmado_en timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (fecha, usuario_id)
+);
+
+-- =====================================================================
+-- COMBUSTIBLE
+--
+-- El monto va en bolívares, que es con lo que se paga en la bomba. No
+-- entra a los costos operativos del cierre de caja: esa gestión se lleva
+-- aparte. Lleva las columnas de anulación como el resto de los registros.
+-- =====================================================================
+CREATE TABLE combustible_motos (
+  id               uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
+  moto_id          integer       NOT NULL REFERENCES motos (id),
+  usuario_id       integer       NOT NULL REFERENCES usuarios (id),
+  litros           numeric(10,2) NOT NULL CHECK (litros > 0),
+  monto_bs         numeric(14,2) NOT NULL DEFAULT 0 CHECK (monto_bs >= 0),
+  metodo_pago      varchar(20)   NOT NULL CHECK (metodo_pago IN
+                                 ('transferencia', 'pago_movil', 'tarjeta_debito')),
+  fecha_hora       timestamptz   NOT NULL DEFAULT now(),
+  observacion      text,
+  anulado          boolean       NOT NULL DEFAULT FALSE,
+  anulado_por      integer       REFERENCES usuarios (id),
+  anulado_en       timestamptz,
+  motivo_anulacion text
+);
+CREATE INDEX ix_combustible_moto  ON combustible_motos (moto_id, fecha_hora DESC);
+CREATE INDEX ix_combustible_fecha ON combustible_motos (fecha_hora DESC);
+
+-- =====================================================================
+-- AJUSTES DEL MASTER
+--
+-- Valores que antes estaban escritos en el código y cambiarlos exigía un
+-- despliegue. dias_apertura usa la numeración ISO: 1 es lunes, 7 domingo.
+-- =====================================================================
+CREATE TABLE configuracion (
+  clave           varchar(40) PRIMARY KEY,
+  valor           jsonb       NOT NULL,
+  actualizado_por integer     REFERENCES usuarios (id),
+  actualizado_en  timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO configuracion (clave, valor) VALUES
+  ('dias_apertura',         '[1,2,3,4,5,6]'::jsonb),
+  ('km_aceite',             '1500'::jsonb),
+  ('km_aviso_anticipacion', '200'::jsonb);
+
 -- =====================================================================
 -- SEGURIDAD: cerrar la puerta de la API pública de Supabase
 --
@@ -408,6 +519,8 @@ DO $$
 DECLARE t text;
 BEGIN
   FOREACH t IN ARRAY ARRAY['roles', 'usuarios', 'motos', 'checklist_motos', 'proveedores', 'productos',
+                           'aperturas_tienda', 'confirmaciones_apertura',
+                           'combustible_motos', 'configuracion',
                            'entradas_agua', 'entradas_mercancia', 'cierres_caja',
                            'solicitudes', 'incidencias']
   LOOP

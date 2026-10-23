@@ -16,6 +16,17 @@ const CHECKLISTS = {
 };
 const MODELOS = [['carguera_200cc', 'Bera Carguera 200cc'], ['sbr_150cc', 'Bera SBR 150cc'], ['otro', 'Otro']];
 
+/*
+ * Cómo factura un proveedor. Decide si al recibir su mercancía la foto de
+ * la factura es obligatoria: el papel que entrega en la mano hay que
+ * respaldarlo, el que manda al correo de la empresa ya está respaldado.
+ */
+const TIPOS_FACTURA = [
+  ['fisica', 'Física (entrega el papel)'],
+  ['digital', 'Digital (la envía al correo)'],
+  ['ambas', 'Depende de la entrega'],
+];
+
 const MODULOS = {
   motos: { etiqueta: 'Motos', icono: '🏍️' },
   caja: { etiqueta: 'Caja', icono: '💵' },
@@ -534,12 +545,159 @@ function Login({ onLogin }) {
 /* ------------------------------------------------------------------ */
 /* Motos                                                               */
 /* ------------------------------------------------------------------ */
+const DIAS_SEMANA = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+const nombreDia = (fechaISO) => DIAS_SEMANA[new Date(`${fechaISO}T00:00:00Z`).getUTCDay()] || '';
+
+const horaCorta = (iso) => (iso
+  ? new Date(iso).toLocaleTimeString('es-VE', {
+    timeZone: 'America/Caracas', hour: 'numeric', minute: '2-digit', hour12: true,
+  })
+  : '');
+
+/*
+ * La barra de la tienda, arriba de todo y en cualquier módulo.
+ *
+ * El aviso de apertura no puede vivir dentro de Caja: Caja se abre al
+ * final del día, cuando toca cerrar, así que el botón quedaría tocándose
+ * a las siete de la noche y la hora de apertura saldría siempre mal.
+ *
+ * Tres situaciones:
+ *   cerrada en día laborable -> alarma grande, porque hay algo que hacer
+ *   abierta sin confirmar    -> tarjeta con la hora y el botón de enterado
+ *   todo en orden            -> una línea tranquila que no estorba
+ */
+function BarraTienda({ call, aviso }) {
+  const [info, setInfo] = useState(null);
+  const [ocupado, setOcupado] = useState(false);
+
+  const cargar = useCallback(async () => {
+    try {
+      setInfo(await call('/api/tienda/estado'));
+    } catch {
+      setInfo(null); // si falla, la barra simplemente no aparece
+    }
+  }, [call]);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  const accion = async (ruta, mensaje) => {
+    setOcupado(true);
+    try {
+      await call(ruta, { method: 'POST' });
+      aviso(mensaje, 'ok');
+      await cargar();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setOcupado(false);
+    }
+  };
+
+  if (!info || !info.dia) return null;
+  const d = info.dia;
+  const abierta = d.estado === 'abierta';
+  const debeConfirmar = info.ve_confirmacion && abierta && !d.confirmada_por_mi;
+  // Sólo es una alarma si hay algo que hacer: día laborable sin apertura
+  const esAlarma = d.estado === 'sin_registrar' && d.laborable && (info.puede_abrir || info.ve_confirmacion);
+
+  if (abierta && !debeConfirmar) {
+    return (
+      <p className="mb-3 text-xs text-slate-500">
+        Tienda abierta a las {horaCorta(d.hora_apertura)}
+        {d.abrio ? ` · ${d.abrio}` : ''}
+        {d.corregida ? ' · hora corregida' : ''}
+      </p>
+    );
+  }
+
+  if (!esAlarma && !debeConfirmar) {
+    // Domingo, o día marcado como cerrado a propósito: nada que hacer
+    const detalle = d.motivo_cierre || (!d.laborable ? nombreDia(d.fecha) : '');
+    return (
+      <p className="mb-3 text-xs text-slate-500">
+        Tienda cerrada{detalle ? ` · ${detalle}` : ''}
+      </p>
+    );
+  }
+
+  return (
+    <div className={`mb-3 rounded-xl p-3 ${abierta ? 'bg-emerald-50' : 'bg-amber-100'}`}>
+      <p className={`font-bold ${abierta ? 'text-emerald-900' : 'text-amber-900'}`}>
+        {abierta ? `Tienda abierta a las ${horaCorta(d.hora_apertura)}` : 'Tienda cerrada'}
+      </p>
+      {!abierta && (
+        <p className="text-xs text-amber-900 mt-0.5">
+          Hoy es {nombreDia(d.fecha)} y la tienda todavía no se marcó como abierta.
+          Sin eso no se puede cerrar la caja del día.
+        </p>
+      )}
+      {abierta && d.abrio && <p className="text-xs text-emerald-900 mt-0.5">La abrió {d.abrio}</p>}
+      <div className="mt-2 flex gap-2">
+        {!abierta && info.puede_abrir && (
+          <button
+            type="button"
+            className="btn-primario flex-1"
+            disabled={ocupado}
+            onClick={() => accion('/api/tienda/abrir', 'Tienda abierta')}
+          >
+            {ocupado ? 'Abriendo…' : 'Abrir la tienda'}
+          </button>
+        )}
+        {debeConfirmar && (
+          <button
+            type="button"
+            className="btn-sec flex-1"
+            disabled={ocupado}
+            onClick={() => accion('/api/tienda/confirmar', 'Confirmado')}
+          >
+            {ocupado ? '…' : 'Enterado'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/*
+ * El aviso del próximo cambio de aceite, debajo del estado del checklist.
+ *
+ * Dice las dos cosas que el motorizado necesita: a qué número del tablero
+ * toca y cuántos kilómetros le quedan. El color avisa con tiempo:
+ * amarillo desde la anticipación configurada, para que haya margen de
+ * comprar el aceite sin parar la moto, y rojo sólo cuando ya se pasó.
+ */
+function AvisoAceite({ aviso }) {
+  if (!aviso) return null;
+  const estilos = {
+    gris: 'bg-slate-50 text-slate-600',
+    amarillo: 'bg-amber-100 text-amber-900',
+    rojo: 'bg-red-100 text-red-900',
+  };
+  return (
+    <p className={`mt-1 rounded-lg px-2 py-1 text-xs ${estilos[aviso.color] || estilos.gris}`}>
+      {aviso.vencido ? (
+        <>
+          <b>Cambio de aceite vencido</b>
+          {' · '}
+          {nf0.format(Math.abs(aviso.faltan))} km de más
+        </>
+      ) : (
+        <>
+          Siguiente aceite a los <b>{nf0.format(aviso.toca_en)} km</b>
+          {' · faltan '}
+          {nf0.format(aviso.faltan)}
+        </>
+      )}
+    </p>
+  );
+}
+
 function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
   const lista = CHECKLISTS[moto.tipo_modelo] || [];
   const [seUso, setSeUso] = useState(true);
   const [km, setKm] = useState(String(moto.ultimo_kilometraje));
   const [items, setItems] = useState(() => Object.fromEntries(lista.map((i) => [i, true])));
   const [cambioAceite, setCambioAceite] = useState(false);
+  const [kmAceite, setKmAceite] = useState('');
   const [tieneFalla, setTieneFalla] = useState(false);
   const [obs, setObs] = useState('');
   const [enviando, setEnviando] = useState(false);
@@ -566,6 +724,15 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
   const enviar = async (e) => {
     e.preventDefault();
     if (falla && !obs.trim()) return aviso('Describa la falla en la observación', 'error');
+    if (cambioAceite) {
+      if (kmAceite === '') return aviso('Falta el kilometraje del cambio de aceite', 'error');
+      const piso = seUso && km !== '' ? Number(km) : Number(moto.ultimo_kilometraje);
+      if (Number(kmAceite) < piso) {
+        return aviso(seUso
+          ? 'El kilometraje del cambio de aceite no puede ser menor al del arranque del día'
+          : 'El kilometraje del cambio de aceite no puede ser menor al último registrado de la moto', 'error');
+      }
+    }
     if (faltanFotos && faltanFotos.length) {
       return aviso(`Faltan ${faltanFotos.length} foto(s) por tomar`, 'error');
     }
@@ -578,6 +745,7 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
           kilometraje_inicial: seUso || km !== '' ? Number(km) : undefined,
           items: seUso ? items : {},
           cambio_aceite_realizado: cambioAceite,
+          km_cambio_aceite: cambioAceite ? Number(kmAceite) : undefined,
           tiene_falla: falla,
           observacion_falla: falla ? obs.trim() : undefined,
           foto_tablero: fotos.tablero || undefined,
@@ -605,14 +773,39 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
         <button type="button" className="text-slate-500 text-2xl px-2" onClick={onCancelar} aria-label="Cerrar">×</button>
       </div>
 
-      <label className="flex items-center gap-3 min-h-[44px]">
-        <input type="checkbox" className="h-6 w-6" checked={seUso} onChange={(e) => setSeUso(e.target.checked)} />
-        <span className="font-medium">La moto se usó hoy</span>
-      </label>
+      <div>
+        <p className="etiqueta">¿Se usó la moto hoy?</p>
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={() => setSeUso(true)}
+            className={`rounded-xl px-3 py-3 font-semibold min-h-[52px] ${
+              seUso ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-600'
+            }`}
+          >
+            Se usó hoy
+          </button>
+          <button
+            type="button"
+            onClick={() => setSeUso(false)}
+            className={`rounded-xl px-3 py-3 font-semibold min-h-[52px] ${
+              !seUso ? 'bg-agua-700 text-white' : 'bg-slate-100 text-slate-600'
+            }`}
+          >
+            No se usó
+          </button>
+        </div>
+      </div>
 
-      <Campo etiqueta={seUso ? 'Kilometraje inicial (obligatorio)' : 'Kilometraje (opcional)'}>
-        <NumInput value={km} onChange={setKm} step="1" required={seUso} />
-      </Campo>
+      {seUso ? (
+        <Campo etiqueta="Kilometraje inicial (obligatorio)">
+          <NumInput value={km} onChange={setKm} step="1" required />
+        </Campo>
+      ) : (
+        <p className="text-sm text-slate-500">
+          Como la moto no se usó, no hace falta el kilometraje ni la revisión de los puntos.
+        </p>
+      )}
 
       {seUso && lista.length > 0 && (
         <div className="space-y-2">
@@ -641,10 +834,23 @@ function FormChecklist({ moto, call, aviso, subirFoto, onListo, onCancelar }) {
         </div>
       )}
 
-      <label className="flex items-center gap-3 min-h-[44px]">
-        <input type="checkbox" className="h-6 w-6" checked={cambioAceite} onChange={(e) => setCambioAceite(e.target.checked)} />
-        <span className="font-medium">Se hizo cambio de aceite hoy</span>
-      </label>
+      <div>
+        <label className="flex items-center gap-3 min-h-[44px]">
+          <input type="checkbox" className="h-6 w-6" checked={cambioAceite} onChange={(e) => setCambioAceite(e.target.checked)} />
+          <span className="font-medium">Se hizo cambio de aceite hoy</span>
+        </label>
+        {cambioAceite && (
+          <div className="mt-1 rounded-xl bg-amber-50 p-3 space-y-2">
+            <Campo etiqueta="Kilometraje al momento del cambio (obligatorio)">
+              <NumInput value={kmAceite} onChange={setKmAceite} step="1" required />
+            </Campo>
+            <p className="text-xs text-slate-600">
+              El del tablero cuando le cambiaron el aceite, que puede ser mayor al del
+              arranque del día. Desde este número se cuenta hasta el próximo cambio.
+            </p>
+          </div>
+        )}
+      </div>
 
       <label className="flex items-center gap-3 min-h-[44px]">
         <input type="checkbox" className="h-6 w-6" checked={falla} disabled={seUso && hayItemMalo} onChange={(e) => setTieneFalla(e.target.checked)} />
@@ -802,11 +1008,9 @@ function VistaMotos({ usuario, call, aviso, subirFoto }) {
               <p className="font-bold">{m.nombre}</p>
               <p className="text-sm text-slate-500 truncate">{m.placa} · {m.color} · {nf0.format(m.ultimo_kilometraje)} km</p>
               <div className="flex gap-1 mt-1 flex-wrap">
-                <Chip tono={m.km_desde_aceite >= 3000 ? 'rojo' : m.km_desde_aceite >= 2500 ? 'ambar' : 'verde'}>
-                  Aceite: {nf0.format(m.km_desde_aceite)} km
-                </Chip>
                 {m.checklist_hoy ? <Chip tono="verde">Checklist hoy ✓</Chip> : <Chip tono="ambar">Pendiente hoy</Chip>}
               </div>
+              <AvisoAceite aviso={m.aviso_aceite} />
             </div>
             <button className="btn-primario shrink-0" disabled={m.checklist_hoy} onClick={() => setSeleccion(m)}>Revisar</button>
           </div>
@@ -1168,6 +1372,228 @@ function EntradaAgua({ call, aviso, datos, onListo, puedeCatalogo, puedeAnular }
   );
 }
 
+/*
+ * Recibir una solicitud que se pidió antes.
+ *
+ * Carga los productos de la solicitud con la cantidad que se pidió, y de
+ * cada uno se marca qué pasó: llegó completo, llegó con otra cantidad, o
+ * no llegó. Lo que no llegó entra con cantidad cero: queda constancia de
+ * que se pidió y no vino, y no suma al stock.
+ *
+ * La solicitud se cierra en una sola entrega, como pasa en el negocio.
+ */
+const ESTADOS_ITEM = [
+  ['completo', 'Llegó completo'],
+  ['otra', 'Llegó otra cantidad'],
+  ['no_llego', 'No llegó'],
+];
+
+function RecibirSolicitud({ call, aviso, onListo, subirFoto, proveedores }) {
+  const [solicitudes, setSolicitudes] = useState(null);
+  const [selId, setSelId] = useState('');
+  const [lineas, setLineas] = useState([]);
+  const [factura, setFactura] = useState('');
+  const [facturaDigital, setFacturaDigital] = useState(false);
+  const [obs, setObs] = useState('');
+  const [enviando, setEnviando] = useState(false);
+
+  const cargar = useCallback(async () => {
+    try {
+      setSolicitudes((await call('/api/solicitudes/pendientes-mercancia')).solicitudes);
+    } catch (err) {
+      aviso(err.message, 'error');
+      setSolicitudes([]);
+    }
+  }, [call, aviso]);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  const sel = (solicitudes || []).find((x) => x.id === selId);
+
+  const elegir = (id) => {
+    setSelId(id);
+    setFactura('');
+    setFacturaDigital(false);
+    const sol = (solicitudes || []).find((x) => x.id === id);
+    const items = sol && Array.isArray(sol.detalle_items) ? sol.detalle_items : [];
+    setLineas(items.map((it) => ({
+      producto_id: Number(it.producto_id),
+      nombre: it.nombre,
+      empaquetado: it.empaquetado,
+      pedida: Number(it.cantidad_empaques) || 0,
+      estado: 'completo',
+      cantidad: String(Number(it.cantidad_empaques) || 0),
+    })));
+  };
+
+  const setLinea = (i, cambios) => setLineas((p) => p.map((l, idx) => (idx === i ? { ...l, ...cambios } : l)));
+
+  const marcar = (i, estado) => {
+    const l = lineas[i];
+    if (estado === 'completo') setLinea(i, { estado, cantidad: String(l.pedida) });
+    else if (estado === 'no_llego') setLinea(i, { estado, cantidad: '0' });
+    else setLinea(i, { estado, cantidad: '' });
+  };
+
+  /* Cómo factura este proveedor decide si la foto es obligatoria */
+  const prov = sel && proveedores.find((p) => p.id === sel.proveedor_id);
+  const tipoFactura = (prov && prov.tipo_factura) || (sel && sel.tipo_factura) || 'fisica';
+  const permiteDigital = tipoFactura === 'ambas';
+  const exigeFoto = tipoFactura === 'fisica' || (permiteDigital && !facturaDigital);
+
+  const enviar = async (e) => {
+    e.preventDefault();
+    if (!sel) return aviso('Elija una solicitud', 'error');
+    for (const l of lineas) {
+      if (l.estado === 'otra' && (l.cantidad === '' || Number(l.cantidad) <= 0)) {
+        return aviso(`Indique cuánto llegó de ${l.nombre}`, 'error');
+      }
+    }
+    if (!lineas.some((l) => Number(l.cantidad) > 0)) {
+      return aviso('No llegó ningún producto. Si de verdad no llegó nada, rechace la solicitud desde Reportes.', 'error');
+    }
+    setEnviando(true);
+    try {
+      await call('/api/entradas/mercancia', {
+        method: 'POST',
+        body: {
+          proveedor_id: sel.proveedor_id,
+          solicitud_id: sel.id,
+          items: lineas.map((l) => ({ producto_id: l.producto_id, cantidad: Number(l.cantidad) })),
+          foto_factura_url: factura || undefined,
+          factura_digital: permiteDigital ? facturaDigital : undefined,
+          observaciones: obs || undefined,
+        },
+      });
+      aviso('Recepción registrada y solicitud cerrada', 'ok');
+      setSelId(''); setLineas([]); setObs(''); setFactura(''); setFacturaDigital(false);
+      await cargar();
+      onListo();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setEnviando(false);
+    }
+  };
+
+  if (solicitudes === null) return <Cargando />;
+  if (solicitudes.length === 0) {
+    return (
+      <div className="card">
+        <p className="text-center text-slate-500 text-sm">
+          No hay solicitudes de mercancía pendientes. Si llegó algo que nadie pidió
+          formalmente, cárgalo abajo a mano.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={enviar} className="card space-y-3">
+      <div>
+        <h3 className="font-bold">Recibir un pedido que se solicitó</h3>
+        <p className="text-xs text-slate-500">
+          Marca producto por producto qué llegó de verdad. Lo que no llegó queda
+          registrado y no suma al stock.
+        </p>
+      </div>
+
+      <Campo etiqueta="Solicitud pendiente">
+        <Select
+          valor={selId}
+          onChange={elegir}
+          opciones={solicitudes.map((x) => [
+            x.id,
+            `${fmtFecha(x.fecha)} · ${x.proveedor || 'sin proveedor'} · ${x.titulo}`,
+          ])}
+          vacio="Seleccione…"
+        />
+      </Campo>
+
+      {sel && (
+        <>
+          <p className="text-xs text-slate-500">
+            La pidió {sel.pidio}
+            {sel.proveedor ? ` · Proveedor: ${sel.proveedor}` : ''}
+          </p>
+
+          {lineas.length === 0 ? (
+            <Vacio texto="Esa solicitud no tiene productos detallados" />
+          ) : lineas.map((l, i) => (
+            <div key={l.producto_id} className="rounded-xl border border-slate-200 p-3 space-y-2">
+              <div className="flex justify-between items-start gap-2">
+                <span className="font-medium min-w-0">{l.nombre}</span>
+                <Chip>{`se pidieron ${nf0.format(l.pedida)}`}</Chip>
+              </div>
+              <div className="grid grid-cols-3 gap-1">
+                {ESTADOS_ITEM.map(([clave, etiqueta]) => (
+                  <button
+                    key={clave}
+                    type="button"
+                    onClick={() => marcar(i, clave)}
+                    className={`rounded-lg px-2 py-2 text-xs font-semibold min-h-[44px] ${
+                      l.estado === clave
+                        ? (clave === 'no_llego' ? 'bg-red-600 text-white' : 'bg-emerald-600 text-white')
+                        : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    {etiqueta}
+                  </button>
+                ))}
+              </div>
+              {l.estado === 'otra' && (
+                <Campo etiqueta={`¿Cuántos llegaron? (se pidieron ${nf0.format(l.pedida)})`}>
+                  <NumInput value={l.cantidad} onChange={(v) => setLinea(i, { cantidad: v })} required />
+                </Campo>
+              )}
+            </div>
+          ))}
+
+          {exigeFoto ? (
+            <CapturaFoto
+              etiqueta="Foto de la factura"
+              ayuda={tipoFactura === 'fisica'
+                ? `${sel.proveedor || 'Este proveedor'} entrega factura física: la foto es obligatoria`
+                : 'Que se lean los montos y la fecha'}
+              destino="factura"
+              valor={factura}
+              onCambio={setFactura}
+              subirFoto={subirFoto}
+              aviso={aviso}
+              requerido
+            />
+          ) : (
+            <p className="text-xs text-slate-500 rounded-lg bg-slate-50 p-2">
+              {tipoFactura === 'digital'
+                ? `${sel.proveedor || 'Este proveedor'} envía la factura al correo de la empresa, así que no hace falta la foto.`
+                : 'Marcaste factura digital, así que no hace falta la foto.'}
+            </p>
+          )}
+
+          {permiteDigital && (
+            <label className="flex items-center gap-3 min-h-[44px] text-sm">
+              <input
+                type="checkbox"
+                className="h-5 w-5"
+                checked={facturaDigital}
+                onChange={(e) => setFacturaDigital(e.target.checked)}
+              />
+              <span>Factura digital (la enviaron al correo de la empresa)</span>
+            </label>
+          )}
+
+          <Campo etiqueta="Observaciones (opcional)">
+            <textarea className="campo" rows={2} maxLength={500} value={obs} onChange={(e) => setObs(e.target.value)} />
+          </Campo>
+
+          <button className="btn-primario w-full" disabled={enviando}>
+            {enviando ? 'Guardando…' : 'Registrar recepción'}
+          </button>
+        </>
+      )}
+    </form>
+  );
+}
+
 function EntradaMercancia({
   call, aviso, datos, onListo, puedeCatalogo, puedeAnular, subirFoto, verFoto,
 }) {
@@ -1175,7 +1601,19 @@ function EntradaMercancia({
   const [obs, setObs] = useState('');
   const [filas, setFilas] = useState([{ producto_id: '', cantidad: '' }]);
   const [factura, setFactura] = useState('');
+  const [facturaDigital, setFacturaDigital] = useState(false);
   const [enviando, setEnviando] = useState(false);
+
+  /*
+   * La foto de la factura se exige según cómo facture el proveedor
+   * elegido, no según lo que decida quien recibe. Si el proveedor entrega
+   * papel, la foto es el respaldo de que llegó; si factura al correo, no
+   * hay papel que fotografiar.
+   */
+  const provSel = datos.proveedores.find((p) => String(p.id) === String(proveedor));
+  const tipoFactura = (provSel && provSel.tipo_factura) || 'fisica';
+  const permiteDigital = tipoFactura === 'ambas';
+  const exigeFoto = Boolean(provSel) && (tipoFactura === 'fisica' || (permiteDigital && !facturaDigital));
 
   const setFila = (i, k, v) => setFilas((p) => p.map((f, idx) => (idx === i ? { ...f, [k]: v } : f)));
 
@@ -1192,12 +1630,14 @@ function EntradaMercancia({
             producto_id: Number(f.producto_id), cantidad: Number(f.cantidad),
           })),
           foto_factura_url: factura || undefined,
+          factura_digital: permiteDigital ? facturaDigital : undefined,
         },
       });
       aviso('Mercancía recibida y stock actualizado', 'ok');
       setFilas([{ producto_id: '', cantidad: '' }]);
       setObs('');
       setFactura('');
+      setFacturaDigital(false);
       onListo();
     } catch (err) {
       aviso(err.message, 'error');
@@ -1222,7 +1662,16 @@ function EntradaMercancia({
 
   return (
     <div className="space-y-4">
+      <RecibirSolicitud
+        call={call}
+        aviso={aviso}
+        onListo={onListo}
+        subirFoto={subirFoto}
+        proveedores={datos.proveedores}
+      />
+
       <form onSubmit={enviar} className="card space-y-3">
+        <h3 className="font-bold">O cargar a mano lo que llegó</h3>
         <Campo etiqueta="Proveedor de mercancía (obligatorio)">
           <Select
             valor={proveedor}
@@ -1258,15 +1707,38 @@ function EntradaMercancia({
           + Agregar ítem
         </button>
         {!puedeCatalogo && <AgregarProductoRapido call={call} aviso={aviso} onListo={onListo} />}
-        <CapturaFoto
-          etiqueta="Foto de la factura (opcional)"
-          ayuda="Que se lean los montos y la fecha"
-          destino="factura"
-          valor={factura}
-          onCambio={setFactura}
-          subirFoto={subirFoto}
-          aviso={aviso}
-        />
+        {exigeFoto && (
+          <CapturaFoto
+            etiqueta="Foto de la factura"
+            ayuda={tipoFactura === 'fisica'
+              ? `${provSel.nombre} entrega factura física: la foto es obligatoria`
+              : 'Que se lean los montos y la fecha'}
+            destino="factura"
+            valor={factura}
+            onCambio={setFactura}
+            subirFoto={subirFoto}
+            aviso={aviso}
+            requerido
+          />
+        )}
+        {provSel && !exigeFoto && (
+          <p className="text-xs text-slate-500 rounded-lg bg-slate-50 p-2">
+            {tipoFactura === 'digital'
+              ? `${provSel.nombre} envía la factura al correo de la empresa, así que no hace falta la foto.`
+              : 'Marcaste factura digital, así que no hace falta la foto.'}
+          </p>
+        )}
+        {permiteDigital && (
+          <label className="flex items-center gap-3 min-h-[44px] text-sm">
+            <input
+              type="checkbox"
+              className="h-5 w-5"
+              checked={facturaDigital}
+              onChange={(e) => setFacturaDigital(e.target.checked)}
+            />
+            <span>Factura digital (la enviaron al correo de la empresa)</span>
+          </label>
+        )}
         <Campo etiqueta="Observaciones (opcional)">
           <textarea className="campo" rows={2} maxLength={500} value={obs} onChange={(e) => setObs(e.target.value)} />
         </Campo>
@@ -1298,7 +1770,9 @@ function EntradaMercancia({
 }
 
 function Catalogo({ call, aviso, datos, onListo, puedeEliminar }) {
-  const [prov, setProv] = useState({ nombre: '', tipo: 'ambos', contacto: '', rif: '', telefono: '' });
+  const [prov, setProv] = useState({
+    nombre: '', tipo: 'ambos', contacto: '', rif: '', telefono: '', tipo_factura: 'fisica',
+  });
   const [prod, setProd] = useState({
     nombre: '', categoria: 'mercancia', subcategoria: 'bebidas',
     empaquetado: 'caja', unidades_por_empaquetado: '1',
@@ -1326,12 +1800,21 @@ function Catalogo({ call, aviso, datos, onListo, puedeEliminar }) {
         className="card space-y-3"
         onSubmit={(e) => {
           e.preventDefault();
-          guardar('/api/proveedores', prov, () => setProv({ nombre: '', tipo: 'ambos', contacto: '', rif: '', telefono: '' }));
+          guardar('/api/proveedores', prov, () => setProv({
+            nombre: '', tipo: 'ambos', contacto: '', rif: '', telefono: '', tipo_factura: 'fisica',
+          }));
         }}
       >
         <h3 className="font-bold">Nuevo proveedor</h3>
         <Campo etiqueta="Nombre"><input className="campo" value={prov.nombre} onChange={(e) => setProv({ ...prov, nombre: e.target.value })} required minLength={2} /></Campo>
         <Campo etiqueta="Tipo"><Select valor={prov.tipo} onChange={(v) => setProv({ ...prov, tipo: v })} opciones={TIPOS_PROVEEDOR} /></Campo>
+      <Campo etiqueta="Cómo factura">
+        <Select valor={prov.tipo_factura} onChange={(v) => setProv({ ...prov, tipo_factura: v })} opciones={TIPOS_FACTURA} />
+      </Campo>
+      <p className="text-xs text-slate-500 -mt-1">
+        Si entrega factura física, al recibir su mercancía la foto será obligatoria.
+        Si la envía al correo de la empresa, no se pedirá.
+      </p>
         <Campo etiqueta="Contacto"><input className="campo" value={prov.contacto} onChange={(e) => setProv({ ...prov, contacto: e.target.value })} /></Campo>
         <div className="grid grid-cols-2 gap-2">
           <Campo etiqueta="RIF"><input className="campo" value={prov.rif} onChange={(e) => setProv({ ...prov, rif: e.target.value })} /></Campo>
@@ -1515,6 +1998,7 @@ function ProveedorEditable({ proveedor, call, aviso, onListo, puedeEliminar }) {
     contacto: proveedor.contacto || '',
     rif: proveedor.rif || '',
     telefono: proveedor.telefono || '',
+    tipo_factura: proveedor.tipo_factura || 'fisica',
     activo: proveedor.activo,
   });
   const [guardando, setGuardando] = useState(false);
@@ -1544,7 +2028,11 @@ function ProveedorEditable({ proveedor, call, aviso, onListo, puedeEliminar }) {
           {proveedor.nombre}
           {proveedor.telefono ? <span className="text-slate-400"> · {proveedor.telefono}</span> : null}
         </span>
-        <Chip tono="azul">{etiquetaDe(TIPOS_PROVEEDOR, proveedor.tipo)}</Chip>
+        <span className="flex gap-1 shrink-0">
+          <Chip tono="azul">{etiquetaDe(TIPOS_PROVEEDOR, proveedor.tipo)}</Chip>
+          {proveedor.tipo_factura === 'digital' && <Chip>factura digital</Chip>}
+          {proveedor.tipo_factura === 'ambas' && <Chip>factura variable</Chip>}
+        </span>
       </button>
     );
   }
@@ -1561,6 +2049,13 @@ function ProveedorEditable({ proveedor, call, aviso, onListo, puedeEliminar }) {
       <Campo etiqueta="Tipo">
         <Select valor={f.tipo} onChange={(v) => setF({ ...f, tipo: v })} opciones={TIPOS_PROVEEDOR} />
       </Campo>
+      <Campo etiqueta="Cómo factura">
+        <Select valor={f.tipo_factura} onChange={(v) => setF({ ...f, tipo_factura: v })} opciones={TIPOS_FACTURA} />
+      </Campo>
+      <p className="text-xs text-slate-500 -mt-1">
+        Si entrega factura física, al recibir su mercancía la foto será obligatoria.
+        Si la envía al correo de la empresa, no se pedirá.
+      </p>
       <Campo etiqueta="Contacto">
         <input className="campo" value={f.contacto} onChange={(e) => setF({ ...f, contacto: e.target.value })} />
       </Campo>
@@ -2367,8 +2862,151 @@ function EditarMoto({ moto, call, aviso, onListo }) {
   );
 }
 
-function DetalleMoto({ detalle, onVolver, call, aviso, verFoto, onRecargar }) {
-  const { moto, checklists, incidencias, cambios_aceite: cambios } = detalle;
+/*
+ * Combustible de una moto: lo que se le ha surtido y el formulario para
+ * cargar una tanqueada nueva.
+ *
+ * El monto va en bolívares porque es la moneda con la que se paga en la
+ * bomba. No entra a los costos operativos del cierre de caja: esa gestión
+ * se lleva aparte.
+ */
+const METODOS_COMBUSTIBLE = [
+  ['transferencia', 'Transferencia'],
+  ['pago_movil', 'Pago móvil'],
+  ['tarjeta_debito', 'Tarjeta de débito'],
+];
+const etiquetaMetodo = (m) => (METODOS_COMBUSTIBLE.find(([k]) => k === m) || [null, m])[1];
+
+function TabCombustible({ moto, cargas, totales, call, aviso, onListo, puedeAnular }) {
+  const [abierto, setAbierto] = useState(false);
+  const [f, setF] = useState({ litros: '', monto_bs: '', metodo_pago: 'pago_movil', observacion: '' });
+  const [enviando, setEnviando] = useState(false);
+
+  const enviar = async (e) => {
+    e.preventDefault();
+    setEnviando(true);
+    try {
+      await call('/api/combustible', {
+        method: 'POST',
+        body: {
+          moto_id: moto.id,
+          litros: Number(f.litros),
+          monto_bs: Number(f.monto_bs || 0),
+          metodo_pago: f.metodo_pago,
+          observacion: f.observacion || undefined,
+        },
+      });
+      aviso('Combustible registrado', 'ok');
+      setF({ litros: '', monto_bs: '', metodo_pago: 'pago_movil', observacion: '' });
+      setAbierto(false);
+      onListo();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setEnviando(false);
+    }
+  };
+
+  const vivas = cargas.filter((c) => !c.anulado);
+
+  return (
+    <div className="space-y-3">
+      <div className="card space-y-3">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <h3 className="font-bold">⛽ Combustible</h3>
+            <p className="text-xs text-slate-500">
+              La fecha la pone el sistema. El monto va en bolívares.
+            </p>
+          </div>
+          <button
+            type="button"
+            className="btn-sec !py-2 !min-h-[40px] shrink-0"
+            onClick={() => setAbierto((v) => !v)}
+          >
+            {abierto ? 'Cerrar' : '+ Cargar'}
+          </button>
+        </div>
+
+        {totales && vivas.length > 0 && (
+          <div className="grid grid-cols-3 gap-2">
+            <Tarjeta titulo="Tanqueadas" valor={nf0.format(totales.cargas)} />
+            <Tarjeta titulo="Litros" valor={nf.format(totales.litros)} />
+            <Tarjeta titulo="Gasto" valor={fmtBs(totales.monto_bs)} />
+          </div>
+        )}
+
+        {abierto && (
+          <form onSubmit={enviar} className="rounded-xl bg-slate-50 p-3 space-y-3">
+            <p className="font-bold text-sm">{moto.nombre} · {moto.placa}</p>
+            <div className="grid grid-cols-2 gap-2">
+              <Campo etiqueta="Litros">
+                <NumInput value={f.litros} onChange={(v) => setF({ ...f, litros: v })} required />
+              </Campo>
+              <Campo etiqueta="Monto en Bs">
+                <NumInput value={f.monto_bs} onChange={(v) => setF({ ...f, monto_bs: v })} required />
+              </Campo>
+            </div>
+            <Campo etiqueta="Método de pago">
+              <Select
+                valor={f.metodo_pago}
+                onChange={(v) => setF({ ...f, metodo_pago: v })}
+                opciones={METODOS_COMBUSTIBLE}
+              />
+            </Campo>
+            <Campo etiqueta="Observación (opcional)">
+              <input
+                className="campo"
+                maxLength={300}
+                value={f.observacion}
+                onChange={(e) => setF({ ...f, observacion: e.target.value })}
+              />
+            </Campo>
+            <button className="btn-primario w-full" disabled={enviando}>
+              {enviando ? 'Guardando…' : 'Registrar combustible'}
+            </button>
+          </form>
+        )}
+      </div>
+
+      {cargas.length === 0 ? <Vacio texto="Sin combustible registrado" /> : cargas.map((c) => (
+        <div key={c.id} className={`card !p-3 text-sm space-y-1 ${c.anulado ? 'opacity-75' : ''}`}>
+          <div className="flex justify-between items-start gap-2">
+            <span className="font-semibold">{fmtFecha(c.fecha)}</span>
+            <div className="flex gap-1 shrink-0 flex-wrap justify-end">
+              {c.anulado && <Chip tono="gris">anulado</Chip>}
+              <Chip tono="azul">{etiquetaMetodo(c.metodo_pago)}</Chip>
+            </div>
+          </div>
+          <p className="text-slate-600">
+            {nf.format(c.litros)} litros · {fmtBs(c.monto_bs)} · {c.usuario}
+          </p>
+          {c.observacion && <p className="text-slate-500 text-xs">{c.observacion}</p>}
+          <SelloAnulado registro={c} />
+          {puedeAnular && (
+            <div className="flex justify-end pt-1">
+              <BotonAnular
+                recurso="combustible"
+                id={c.id}
+                anulado={c.anulado}
+                call={call}
+                aviso={aviso}
+                onListo={onListo}
+                etiqueta={`la carga de combustible del ${fmtFecha(c.fecha)}`}
+              />
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DetalleMoto({ detalle, onVolver, call, aviso, verFoto, onRecargar, puedeAnular }) {
+  const {
+    moto, checklists, incidencias, cambios_aceite: cambios,
+    combustible = [], combustible_totales: totalesComb,
+  } = detalle;
   const [tab, setTab] = useState('checklists');
 
   return (
@@ -2390,6 +3028,7 @@ function DetalleMoto({ detalle, onVolver, call, aviso, verFoto, onRecargar }) {
           valor={`${nf0.format(moto.ultimo_kilometraje - moto.ultimo_cambio_aceite_km)} km`}
         />
       </div>
+      <AvisoAceite aviso={moto.aviso_aceite} />
 
       <EditarMoto moto={moto} call={call} aviso={aviso} onListo={onRecargar} />
 
@@ -2397,6 +3036,7 @@ function DetalleMoto({ detalle, onVolver, call, aviso, verFoto, onRecargar }) {
         opciones={[
           ['checklists', `Checklists (${checklists.length})`],
           ['aceite', `Aceite (${cambios.length})`],
+          ['combustible', `Combustible (${combustible.filter((f) => !f.anulado).length})`],
           ['incidencias', `Incidencias (${incidencias.length})`],
         ]}
         activa={tab}
@@ -2458,6 +3098,18 @@ function DetalleMoto({ detalle, onVolver, call, aviso, verFoto, onRecargar }) {
         </div>
       )))}
 
+      {tab === 'combustible' && (
+        <TabCombustible
+          moto={moto}
+          cargas={combustible}
+          totales={totalesComb}
+          call={call}
+          aviso={aviso}
+          onListo={onRecargar}
+          puedeAnular={puedeAnular}
+        />
+      )}
+
       {tab === 'incidencias' && (incidencias.length === 0 ? <Vacio texto="Sin incidencias" /> : incidencias.map((i) => (
         <div key={i.id} className={`card !p-3 mb-2 text-sm space-y-1 ${i.anulado ? 'opacity-75' : ''}`}>
           <div className="flex justify-between items-start gap-2">
@@ -2480,7 +3132,7 @@ function DetalleMoto({ detalle, onVolver, call, aviso, verFoto, onRecargar }) {
   );
 }
 
-function VistaReporteMotos({ call, aviso, verFoto }) {
+function VistaReporteMotos({ usuario, call, aviso, verFoto }) {
   const [datos, setDatos] = useState(null);
   const [detalle, setDetalle] = useState(null);
   const [abriendo, setAbriendo] = useState(false);
@@ -2527,6 +3179,7 @@ function VistaReporteMotos({ call, aviso, verFoto }) {
         aviso={aviso}
         verFoto={verFoto}
         onRecargar={recargarDetalle}
+        puedeAnular={puede(usuario, 'anular_registros')}
       />
     );
   }
@@ -2666,26 +3319,163 @@ function TablaPeriodos({ filas, formato }) {
 
 const MESES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
 
+/*
+ * Los promedios de facturación.
+ *
+ * El dólar va primero porque es lo único comparable entre periodos: en
+ * bolívares, una tasa que se movió hace parecer que el negocio creció
+ * cuando vendió exactamente lo mismo. El bolívar va debajo como
+ * referencia de lo que de verdad pasó por la caja.
+ *
+ * Y todos los promedios diarios se dividen entre los días que la tienda
+ * ABRIÓ, no entre los días del calendario: un domingo cerrado no es un
+ * día flojo, es un día que no existió.
+ */
+function TarjetasPromedios({ p }) {
+  const [abierto, setAbierto] = useState(false);
+  const sa = p.semana_anterior;
+  const c4 = p.ultimas_4_semanas;
+  const cm = p.cierre_mes;
+  const usd = (v) => (v === null || v === undefined ? '—' : fmtUsd(v));
+  const bs = (v) => (v === null || v === undefined ? '' : fmtBs(v));
+
+  return (
+    <div className="card space-y-3">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="font-bold">Promedios de facturación</h3>
+          <p className="text-xs text-slate-500">
+            En dólares, que es lo comparable entre semanas. Divididos entre los días que abrió.
+          </p>
+        </div>
+        <button type="button" className="btn-sec !py-2 !min-h-[40px] shrink-0" onClick={() => setAbierto((v) => !v)}>
+          {abierto ? 'Menos' : 'Detalle'}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Tarjeta
+          titulo="Promedio diario"
+          valor={usd(sa.promedio_usd)}
+          nota={sa.dias_operados > 0
+            ? `${bs(sa.promedio_bs)} · semana pasada, ${nf0.format(sa.dias_operados)} día(s)`
+            : 'Sin datos la semana pasada'}
+          destacado
+        />
+        <Tarjeta
+          titulo="Promedio semanal"
+          valor={usd(c4.promedio_semanal_usd)}
+          nota={c4.semanas_con_datos > 0
+            ? `${bs(c4.promedio_semanal_bs)} · ${nf0.format(c4.semanas_con_datos)} de las últimas 4 semanas`
+            : 'Sin datos en las últimas 4 semanas'}
+          destacado
+        />
+      </div>
+
+      {abierto && (
+        <>
+          <div>
+            <p className="etiqueta">La semana pasada ({fmtFecha(sa.desde)} al {fmtFecha(sa.hasta)})</p>
+            <p className="text-sm text-slate-600">
+              {usd(sa.total_usd)} en total · {bs(sa.total_bs)} · abrió {nf0.format(sa.dias_operados)} día(s)
+            </p>
+          </div>
+
+          <div>
+            <p className="etiqueta">Las últimas 4 semanas, una por una</p>
+            <div className="space-y-1">
+              {c4.semanas.map((w) => (
+                <div key={w.desde} className="flex justify-between text-sm border-b border-slate-100 py-1">
+                  <span className="text-slate-500">
+                    {fmtFecha(w.desde)} al {fmtFecha(w.hasta)}
+                  </span>
+                  <span className="shrink-0">
+                    {w.dias_operados > 0
+                      ? <>{usd(w.total_usd)} <span className="text-slate-400">· {nf0.format(w.dias_operados)}d</span></>
+                      : <span className="text-slate-400">sin datos</span>}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="rounded-xl bg-slate-50 p-3">
+            <p className="font-bold text-sm">
+              Cierre de {MESES[Number(cm.mes.slice(5, 7)) - 1]} {cm.mes.slice(0, 4)}
+            </p>
+            {cm.dias_operados > 0 ? (
+              <div className="mt-1 space-y-0.5 text-sm text-slate-600">
+                <p>Facturado: <b>{usd(cm.total_usd)}</b> · {bs(cm.total_bs)}</p>
+                <p>Promedio por día abierto: <b>{usd(cm.promedio_usd)}</b> · {bs(cm.promedio_bs)}</p>
+                <p>Promedio por semana: <b>{usd(cm.promedio_semanal_usd)}</b> · {bs(cm.promedio_semanal_bs)}</p>
+                <p>
+                  Abrió {nf0.format(cm.dias_operados)} de {nf0.format(cm.dias_esperados)} días laborables
+                </p>
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500 mt-1">Sin cierres registrados ese mes.</p>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function VistaFinanzas({ call, aviso }) {
+  const hoy = hoyCaracas();
   const [rango, setRango] = useState('mes');
   const [tab, setTab] = useState('diario');
   const [datos, setDatos] = useState(null);
+  const [promedios, setPromedios] = useState(null);
+  /* Periodo a medida: un rango continuo o días sueltos no consecutivos */
+  const [desde, setDesde] = useState(`${hoy.slice(0, 7)}-01`);
+  const [hasta, setHasta] = useState(hoy);
+  const [diaSuelto, setDiaSuelto] = useState('');
+  const [diasSueltos, setDiasSueltos] = useState([]);
+  const [aplicado, setAplicado] = useState(0);
 
   const cargar = useCallback(async () => {
     setDatos(null);
     try {
-      const hoy = hoyCaracas();
       const params = { hasta: hoy };
       if (rango === '7') params.desde = sumarDias(hoy, -6);
       if (rango === 'mes') params.desde = `${hoy.slice(0, 7)}-01`;
       if (rango === '90') params.desde = sumarDias(hoy, -89);
+      if (rango === 'libre') {
+        if (diasSueltos.length) {
+          delete params.hasta;
+          params.dias = diasSueltos.join(',');
+        } else {
+          params.desde = desde;
+          params.hasta = hasta;
+        }
+      }
       setDatos(await call(`/api/reportes/financieros${qs(params)}`));
     } catch (err) {
       aviso(err.message, 'error');
       setDatos({});
     }
-  }, [call, aviso, rango]);
+  // aplicado fuerza la recarga sólo cuando se toca "Aplicar", para no
+  // consultar en cada tecleo mientras se escribe una fecha
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [call, aviso, rango, hoy, aplicado]);
   useEffect(() => { cargar(); }, [cargar]);
+
+  /* Los promedios no dependen del periodo elegido: son fijos por definición */
+  useEffect(() => {
+    let vivo = true;
+    call('/api/reportes/promedios')
+      .then((d) => { if (vivo) setPromedios(d); })
+      .catch(() => { if (vivo) setPromedios(null); });
+    return () => { vivo = false; };
+  }, [call]);
+
+  const agregarDia = () => {
+    if (!diaSuelto || diasSueltos.includes(diaSuelto)) return;
+    setDiasSueltos((p) => [...p, diaSuelto].sort());
+    setDiaSuelto('');
+  };
 
   const t = datos && datos.totales;
 
@@ -2693,10 +3483,64 @@ function VistaFinanzas({ call, aviso }) {
     <div className="space-y-3">
       <Titulo>Finanzas</Titulo>
       <Pestanas
-        opciones={[['7', 'Últimos 7 días'], ['mes', 'Este mes'], ['90', '90 días'], ['todo', 'Acumulado']]}
+        opciones={[['7', '7 días'], ['mes', 'Este mes'], ['90', '90 días'], ['todo', 'Acumulado'], ['libre', 'A medida']]}
         activa={rango}
         onChange={setRango}
       />
+
+      {promedios && <TarjetasPromedios p={promedios} />}
+
+      {rango === 'libre' && (
+        <div className="card space-y-3">
+          <div>
+            <h3 className="font-bold">Periodo a medida</h3>
+            <p className="text-xs text-slate-500">
+              Un rango de fechas, o días sueltos para comparar entre sí
+              (por ejemplo los últimos tres sábados).
+            </p>
+          </div>
+
+          {diasSueltos.length === 0 && (
+            <div className="grid grid-cols-2 gap-2">
+              <Campo etiqueta="Desde">
+                <input type="date" className="campo" value={desde} max={hoy} onChange={(e) => setDesde(e.target.value)} />
+              </Campo>
+              <Campo etiqueta="Hasta">
+                <input type="date" className="campo" value={hasta} max={hoy} onChange={(e) => setHasta(e.target.value)} />
+              </Campo>
+            </div>
+          )}
+
+          <div>
+            <p className="etiqueta">Días sueltos</p>
+            <div className="flex gap-2">
+              <input type="date" className="campo" value={diaSuelto} max={hoy} onChange={(e) => setDiaSuelto(e.target.value)} />
+              <button type="button" className="btn-sec !px-3 shrink-0" onClick={agregarDia}>Agregar</button>
+            </div>
+            {diasSueltos.length > 0 && (
+              <div className="flex flex-wrap gap-1 mt-2">
+                {diasSueltos.map((d) => (
+                  <button
+                    key={d}
+                    type="button"
+                    className="chip bg-sky-100 text-sky-800"
+                    onClick={() => setDiasSueltos((p) => p.filter((x) => x !== d))}
+                  >
+                    {fmtFecha(d)} ×
+                  </button>
+                ))}
+                <button type="button" className="chip bg-slate-100 text-slate-700" onClick={() => setDiasSueltos([])}>
+                  limpiar
+                </button>
+              </div>
+            )}
+          </div>
+
+          <button type="button" className="btn-primario w-full" onClick={() => setAplicado((n) => n + 1)}>
+            Aplicar
+          </button>
+        </div>
+      )}
       {datos === null ? <Cargando /> : !t ? <Vacio texto="Sin datos" /> : (
         <>
           <p className="text-sm text-slate-500">
@@ -2715,6 +3559,34 @@ function VistaFinanzas({ call, aviso }) {
             <Tarjeta titulo="Neto en Bs" valor={fmtBs(t.neto_bs)} nota="Total − impuestos − costos" />
             <Tarjeta titulo="Tasa promedio" valor={t.tasa_promedio ? fmtTasa(t.tasa_promedio) : '—'} nota="Promedio del periodo" />
           </div>
+          {datos.promedios && datos.promedios.dias_operados !== null && (
+            <div className="grid grid-cols-2 gap-3">
+              <Tarjeta
+                titulo="Promedio por día"
+                valor={datos.promedios.por_dia_usd !== null ? fmtUsd(datos.promedios.por_dia_usd) : '—'}
+                nota={datos.promedios.por_dia_bs !== null ? fmtBs(datos.promedios.por_dia_bs) : ''}
+                destacado
+              />
+              <Tarjeta
+                titulo="Días que abrió"
+                valor={nf0.format(datos.promedios.dias_operados)}
+                nota="El promedio se divide entre estos"
+              />
+            </div>
+          )}
+          {Array.isArray(datos.dias_sin_registrar) && datos.dias_sin_registrar.length > 0 && (
+            <div className="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">
+              <p className="font-bold">
+                {datos.dias_sin_registrar.length === 1
+                  ? 'Hay 1 día laborable sin registrar'
+                  : `Hay ${datos.dias_sin_registrar.length} días laborables sin registrar`}
+              </p>
+              <p className="text-xs mt-1">
+                Ni apertura ni cierre de caja, así que no entran a los promedios:
+                {' '}{datos.dias_sin_registrar.map(fmtFecha).join(', ')}
+              </p>
+            </div>
+          )}
           <Pestanas opciones={[['diario', 'Diario'], ['semanal', 'Semanal'], ['mensual', 'Mensual']]} activa={tab} onChange={setTab} />
           {tab === 'diario' && <TablaPeriodos filas={datos.diario} formato={fmtFecha} />}
           {tab === 'semanal' && <TablaPeriodos filas={datos.semanal} formato={(p) => `Semana del ${fmtFecha(p)}`} />}
@@ -3312,6 +4184,207 @@ function VistaAccesos({ usuario, call, aviso }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Master: Ajustes                                                     */
+/*                                                                     */
+/* Valores que antes estaban escritos en el código y cambiarlos exigía  */
+/* un despliegue. Ahora los cambia el Master desde aquí.               */
+/* ------------------------------------------------------------------ */
+const DIAS_AJUSTES = [
+  [1, 'Lunes'], [2, 'Martes'], [3, 'Miércoles'], [4, 'Jueves'],
+  [5, 'Viernes'], [6, 'Sábado'], [7, 'Domingo'],
+];
+
+function VistaAjustes({ call, aviso }) {
+  const [dias, setDias] = useState(null);
+  const [kmAceite, setKmAceite] = useState('');
+  const [anticipacion, setAnticipacion] = useState('');
+  const [guardando, setGuardando] = useState(false);
+  const [cerrarDia, setCerrarDia] = useState({ fecha: hoyCaracas(), motivo: '' });
+  const [corregir, setCorregir] = useState({ fecha: hoyCaracas(), hora: '' });
+
+  const cargar = useCallback(async () => {
+    try {
+      const d = await call('/api/ajustes');
+      setDias(Array.isArray(d.ajustes.dias_apertura) ? d.ajustes.dias_apertura : []);
+      setKmAceite(String(d.ajustes.km_aceite));
+      setAnticipacion(String(d.ajustes.km_aviso_anticipacion));
+    } catch (err) {
+      aviso(err.message, 'error');
+      setDias([]);
+    }
+  }, [call, aviso]);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  const alternarDia = (n) => setDias((p) => (p.includes(n) ? p.filter((x) => x !== n) : [...p, n].sort()));
+
+  const guardar = async () => {
+    if (!dias || dias.length === 0) return aviso('Debe quedar al menos un día de apertura', 'error');
+    setGuardando(true);
+    try {
+      await call('/api/ajustes', {
+        method: 'PUT',
+        body: {
+          dias_apertura: dias,
+          km_aceite: Number(kmAceite),
+          km_aviso_anticipacion: Number(anticipacion),
+        },
+      });
+      aviso('Ajustes guardados', 'ok');
+      await cargar();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setGuardando(false);
+    }
+  };
+
+  const marcarCerrado = async () => {
+    if (!cerrarDia.motivo.trim()) return aviso('Indique por qué no se abrió ese día', 'error');
+    try {
+      await call('/api/tienda/cerrada', {
+        method: 'PUT',
+        body: { fecha: cerrarDia.fecha, motivo_cierre: cerrarDia.motivo.trim() },
+      });
+      aviso('Día marcado como cerrado', 'ok');
+      setCerrarDia({ fecha: hoyCaracas(), motivo: '' });
+    } catch (err) {
+      aviso(err.message, 'error');
+    }
+  };
+
+  const corregirHora = async () => {
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(corregir.hora)) {
+      return aviso('La hora debe ir como HH:MM, por ejemplo 08:15', 'error');
+    }
+    try {
+      await call('/api/tienda/hora', {
+        method: 'PUT',
+        body: { fecha: corregir.fecha, hora: corregir.hora },
+      });
+      aviso('Hora de apertura corregida', 'ok');
+      setCorregir({ fecha: hoyCaracas(), hora: '' });
+    } catch (err) {
+      aviso(err.message, 'error');
+    }
+  };
+
+  if (dias === null) return <Cargando />;
+
+  return (
+    <div className="space-y-4">
+      <Titulo>Ajustes</Titulo>
+
+      <div className="card space-y-3">
+        <div>
+          <h3 className="font-bold">Días que se espera abrir</h3>
+          <p className="text-xs text-slate-500">
+            Los días que no marques no piden apertura, no exigen cierre de caja y no
+            entran a los promedios de finanzas.
+          </p>
+        </div>
+        <div className="space-y-1">
+          {DIAS_AJUSTES.map(([n, etiqueta]) => (
+            <label key={n} className="flex items-center gap-3 min-h-[44px] border-b border-slate-100">
+              <input type="checkbox" className="h-6 w-6" checked={dias.includes(n)} onChange={() => alternarDia(n)} />
+              <span>{etiqueta}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div className="card space-y-3">
+        <div>
+          <h3 className="font-bold">Cambio de aceite</h3>
+          <p className="text-xs text-slate-500">
+            Cada cuántos kilómetros toca, y con cuánta anticipación quieres que el
+            cartel se ponga amarillo.
+          </p>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <Campo etiqueta="Cada cuántos km">
+            <NumInput value={kmAceite} onChange={setKmAceite} step="100" required />
+          </Campo>
+          <Campo etiqueta="Avisar con (km)">
+            <NumInput value={anticipacion} onChange={setAnticipacion} step="50" required />
+          </Campo>
+        </div>
+      </div>
+
+      <button className="btn-primario w-full" disabled={guardando} onClick={guardar}>
+        {guardando ? 'Guardando…' : 'Guardar ajustes'}
+      </button>
+
+      <div className="card space-y-3">
+        <div>
+          <h3 className="font-bold">Marcar un día como cerrado</h3>
+          <p className="text-xs text-slate-500">
+            Para un feriado o un día de inventario. Ese día no entra a los promedios
+            y queda distinguido de un olvido.
+          </p>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <Campo etiqueta="Fecha">
+            <input
+              type="date"
+              className="campo"
+              value={cerrarDia.fecha}
+              max={hoyCaracas()}
+              onChange={(e) => setCerrarDia({ ...cerrarDia, fecha: e.target.value })}
+            />
+          </Campo>
+          <Campo etiqueta="Motivo">
+            <input
+              className="campo"
+              maxLength={300}
+              placeholder="Feriado"
+              value={cerrarDia.motivo}
+              onChange={(e) => setCerrarDia({ ...cerrarDia, motivo: e.target.value })}
+            />
+          </Campo>
+        </div>
+        <button type="button" className="btn-sec w-full" onClick={marcarCerrado}>
+          Marcar como cerrado
+        </button>
+      </div>
+
+      <div className="card space-y-3">
+        <div>
+          <h3 className="font-bold">Corregir una hora de apertura</h3>
+          <p className="text-xs text-slate-500">
+            Si abrieron a las ocho y nadie marcó hasta las dos. Queda anotado que la
+            corregiste tú, y la hora original se conserva.
+          </p>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <Campo etiqueta="Fecha">
+            <input
+              type="date"
+              className="campo"
+              value={corregir.fecha}
+              max={hoyCaracas()}
+              onChange={(e) => setCorregir({ ...corregir, fecha: e.target.value })}
+            />
+          </Campo>
+          <Campo etiqueta="Hora real (HH:MM)">
+            <input
+              className="campo"
+              inputMode="numeric"
+              placeholder="08:15"
+              maxLength={5}
+              value={corregir.hora}
+              onChange={(e) => setCorregir({ ...corregir, hora: e.target.value })}
+            />
+          </Campo>
+        </div>
+        <button type="button" className="btn-sec w-full" onClick={corregirHora}>
+          Corregir la hora
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Mi cuenta                                                           */
 /* ------------------------------------------------------------------ */
 function VistaPerfil({ usuario, call, aviso }) {
@@ -3462,6 +4535,8 @@ export default function PurissimaApp() {
     Object.entries(VISTAS_MASTER).forEach(([clave, v]) => {
       if (puede(u, v.permiso)) items.push({ clave, ...v });
     });
+    // Los ajustes no se conceden por función: son del Master y de nadie más
+    if (u.es_master) items.push({ clave: 'ajustes', etiqueta: 'Ajustes', icono: '⚙️' });
     return items;
   }, [sesion]);
 
@@ -3515,6 +4590,7 @@ export default function PurissimaApp() {
       </header>
 
       <main className="flex-1 w-full max-w-2xl mx-auto px-4 py-4 pb-24">
+        <BarraTienda call={call} aviso={aviso} />
         {vista === 'motos' && <VistaMotos {...props} />}
         {vista === 'caja' && <VistaCaja {...props} />}
         {vista === 'recepcion' && <VistaRecepcion {...props} />}
@@ -3525,6 +4601,7 @@ export default function PurissimaApp() {
         {vista === 'repmotos' && puede(usuario, 'ver_reporte_motos') && <VistaReporteMotos {...props} />}
         {vista === 'finanzas' && puede(usuario, 'ver_finanzas') && <VistaFinanzas {...props} />}
         {vista === 'accesos' && puede(usuario, 'ver_accesos') && <VistaAccesos {...props} />}
+        {vista === 'ajustes' && usuario.es_master && <VistaAjustes {...props} />}
         {vista === 'perfil' && <VistaPerfil {...props} />}
       </main>
       <Toast toast={toast} />

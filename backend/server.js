@@ -58,6 +58,7 @@ const PERMISOS_ESPECIALES = Object.freeze([
   { clave: 'ver_reporte_motos', grupo: 'ver', etiqueta: 'Reporte de motos', detalle: 'Alertas e historial completo de cada moto' },
   { clave: 'ver_finanzas', grupo: 'ver', etiqueta: 'Finanzas', detalle: 'Los totales del negocio' },
   { clave: 'ver_accesos', grupo: 'ver', etiqueta: 'Accesos', detalle: 'La lista de empleados y sus permisos, sin poder cambiarlos' },
+  { clave: 'ver_apertura_diaria', grupo: 'ver', etiqueta: 'Apertura del día', detalle: 'Al entrar cada día, si la tienda abrió y a qué hora' },
   { clave: 'ver_de_todos', grupo: 'ver', etiqueta: 'Registros de todo el equipo', detalle: 'En sus módulos, ver lo de todos y no sólo lo suyo' },
   { clave: 'ver_anulados', grupo: 'ver', etiqueta: 'Registros anulados', detalle: 'Ver también lo que fue anulado' },
   // --- lo que puede HACER ---
@@ -80,7 +81,64 @@ const ANULABLES = Object.freeze({
   'entrada-mercancia': 'entradas_mercancia',
   solicitud: 'solicitudes',
   incidencia: 'incidencias',
+  combustible: 'combustible_motos',
 });
+
+/* Formas de pagar el combustible */
+const METODOS_PAGO_COMBUSTIBLE = Object.freeze(['transferencia', 'pago_movil', 'tarjeta_debito']);
+
+/* Cómo factura un proveedor, y qué implica para la foto de la factura */
+const TIPOS_FACTURA = Object.freeze(['fisica', 'digital', 'ambas']);
+
+/* ------------------------------------------------------------------ */
+/* Ajustes que el Master cambia desde la aplicación                    */
+/*                                                                     */
+/* Antes estaban escritos en el código y cambiarlos exigía un          */
+/* despliegue. Ahora viven en la tabla "configuracion".                */
+/*                                                                     */
+/* dias_apertura usa la numeración ISO de Postgres: 1 es lunes y 7 es  */
+/* domingo.                                                            */
+/* ------------------------------------------------------------------ */
+const AJUSTES_POR_DEFECTO = Object.freeze({
+  dias_apertura: [1, 2, 3, 4, 5, 6],
+  km_aceite: 1500,
+  km_aviso_anticipacion: 200,
+});
+
+/*
+ * Se guardan en memoria unos segundos para no consultar la base en cada
+ * petición, pero poco tiempo: así un cambio del Master surte efecto casi
+ * de inmediato sin tener que reiniciar nada.
+ */
+const AJUSTES_TTL_MS = 20000;
+let cacheAjustes = { valores: null, vence: 0 };
+
+async function leerAjustes() {
+  if (cacheAjustes.valores && Date.now() < cacheAjustes.vence) return cacheAjustes.valores;
+  const valores = { ...AJUSTES_POR_DEFECTO };
+  try {
+    const { rows } = await pool.query('SELECT clave, valor FROM configuracion');
+    for (const r of rows) {
+      if (Object.prototype.hasOwnProperty.call(AJUSTES_POR_DEFECTO, r.clave)) valores[r.clave] = r.valor;
+    }
+  } catch (err) {
+    // Si la tabla no existe todavía, se sigue con los valores por defecto
+    console.warn('[ajustes] No se pudieron leer, se usan los valores por defecto:', err.message);
+  }
+  cacheAjustes = { valores, vence: Date.now() + AJUSTES_TTL_MS };
+  return valores;
+}
+
+const olvidarAjustes = () => { cacheAjustes = { valores: null, vence: 0 }; };
+
+/** ¿Se espera que la tienda abra ese día, según los ajustes? */
+function esDiaLaborable(fechaISO, ajustes) {
+  // getUTCDay sobre una fecha pura: 0 es domingo, 1 lunes. Se pasa a ISO.
+  const dia = new Date(`${fechaISO}T00:00:00Z`).getUTCDay();
+  const iso = dia === 0 ? 7 : dia;
+  const dias = Array.isArray(ajustes.dias_apertura) ? ajustes.dias_apertura : AJUSTES_POR_DEFECTO.dias_apertura;
+  return dias.includes(iso);
+}
 
 /* Listas exactas e inmodificables, indexadas por motos.tipo_modelo */
 const CHECKLISTS = Object.freeze({
@@ -168,6 +226,14 @@ const COLUMNAS_REQUERIDAS = [
   ['usuarios', 'permisos_especiales'],
   ['roles', 'clave'],
   ['roles', 'es_master'],
+  ['configuracion', 'clave'],
+  ['aperturas_tienda', 'abierta'],
+  ['confirmaciones_apertura', 'confirmado_en'],
+  ['combustible_motos', 'litros'],
+  ['checklist_motos', 'km_cambio_aceite'],
+  ['entradas_mercancia', 'solicitud_id'],
+  ['entradas_mercancia', 'factura_digital'],
+  ['proveedores', 'tipo_factura'],
   ['checklist_motos', 'foto_tablero'],
   ['checklist_motos', 'foto_frontal'],
   ['checklist_motos', 'foto_trasera'],
@@ -254,6 +320,44 @@ function hoyCaracas() {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
   }).format(new Date());
+}
+
+/**
+ * Aritmética de fechas sobre el texto AAAA-MM-DD, en UTC a propósito.
+ *
+ * Se trabaja con la fecha "pura" y no con instantes: hoyCaracas() ya
+ * resolvió en qué día estamos en Caracas, y a partir de ahí sumar días o
+ * buscar el lunes de la semana es aritmética de calendario. Usar UTC
+ * evita que un cambio de horario corra un día.
+ */
+function sumarDias(fechaISO, n) {
+  const d = new Date(`${fechaISO}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+/** El lunes de la semana a la que pertenece esa fecha. */
+function lunesDe(fechaISO) {
+  const d = new Date(`${fechaISO}T00:00:00Z`);
+  const dow = d.getUTCDay(); // 0 domingo, 1 lunes
+  const retroceder = dow === 0 ? 6 : dow - 1;
+  return sumarDias(fechaISO, -retroceder);
+}
+
+/**
+ * Las últimas N semanas COMPLETAS antes de la semana en curso, de lunes a
+ * domingo. La semana actual no entra porque todavía no terminó y
+ * promediarla contra semanas completas daría un número más bajo que no
+ * significa nada.
+ */
+function semanasCompletas(hoyISO, cuantas) {
+  const lunesEstaSemana = lunesDe(hoyISO);
+  const semanas = [];
+  for (let i = cuantas; i >= 1; i -= 1) {
+    const lunes = sumarDias(lunesEstaSemana, -7 * i);
+    semanas.push({ desde: lunes, hasta: sumarDias(lunes, 6) });
+  }
+  return semanas;
 }
 
 function fechaValida(s) {
@@ -716,6 +820,43 @@ async function protegerMaster(actor, rolObjetivo, cliente) {
   }
 }
 
+/**
+ * Nadie puede asignar un cargo que conceda más de lo que él mismo tiene.
+ *
+ * Sin esto, quien tenga "gestionar empleados" podría crear una cuenta con
+ * un cargo más poderoso que el suyo y entrar con ella: no sería escalar
+ * por encima del Master, pero sí por encima de sí mismo, que para el caso
+ * es lo mismo.
+ *
+ * El Master queda exento porque él es quien crea los cargos.
+ */
+async function exigirPuedeAsignarRol(actor, clave, cliente) {
+  if (actor.es_master) return;
+  const { rows } = await (cliente || pool).query(
+    'SELECT nombre, modulos_permitidos, permisos_especiales FROM roles WHERE clave = $1',
+    [clave],
+  );
+  const rol = rows[0];
+  if (!rol) throw bad('El cargo no existe');
+
+  const misFunciones = new Set(actor.permisos_efectivos || []);
+  const misModulos = new Set(actor.modulos_efectivos || []);
+  const faltanFunciones = (rol.permisos_especiales || []).filter((p) => !misFunciones.has(p));
+  const faltanModulos = (rol.modulos_permitidos || []).filter((m) => !misModulos.has(m));
+
+  if (faltanFunciones.length || faltanModulos.length) {
+    const nombres = [
+      ...faltanFunciones.map((p) => {
+        const d = PERMISOS_ESPECIALES.find((x) => x.clave === p);
+        return d ? d.etiqueta : p;
+      }),
+      ...faltanModulos,
+    ];
+    throw new HttpError(403,
+      `No puede asignar el cargo "${rol.nombre}": concede cosas que usted no tiene (${nombres.join(', ')})`);
+  }
+}
+
 /** Comprueba que la cuenta exista y que quien actúa tenga derecho a tocarla. */
 async function exigirPuedeTocar(actor, id) {
   const { rows } = await pool.query('SELECT id, rol FROM usuarios WHERE id = $1', [id]);
@@ -763,6 +904,7 @@ app.post('/api/usuarios', autenticar, requierePermiso('gestionar_empleados'), as
   const apellido = texto(b.apellido, 'Apellido', { max: 80 });
   const rol = await validarRol(b.rol);
   await protegerMaster(req.usuario, rol);
+  await exigirPuedeAsignarRol(req.usuario, rol);
   if (!esPinValido(b.pin)) throw bad('El PIN debe tener entre 4 y 8 dígitos');
   const modulos = validarModulos(b.modulos_permitidos || []);
   const { rows } = await pool.query(
@@ -794,6 +936,8 @@ app.put('/api/usuarios/:id', autenticar, requierePermiso('gestionar_empleados'),
     // si quien edita no es Master
     await protegerMaster(req.usuario, actual.rol, c);
     await protegerMaster(req.usuario, rol, c);
+    // Sólo si de verdad le está cambiando el cargo
+    if (rol !== actual.rol) await exigirPuedeAsignarRol(req.usuario, rol, c);
 
     // El Master no puede quitarse a sí mismo el nivel Master
     if (id === req.usuario.id && req.usuario.es_master && !(await esRolMaster(rol, c))) {
@@ -1244,12 +1388,41 @@ app.get('/api/fotos/firma', autenticar, asyncH(async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* Motos                                                               */
 /* ------------------------------------------------------------------ */
-app.get('/api/motos/config', autenticar, requiereModulo('motos'), (req, res) => {
-  res.json({ checklists: CHECKLISTS, fotos_habilitadas: FOTOS_HABILITADAS });
-});
+app.get('/api/motos/config', autenticar, requiereModulo('motos'), asyncH(async (req, res) => {
+  const ajustes = await leerAjustes();
+  res.json({
+    checklists: CHECKLISTS,
+    fotos_habilitadas: FOTOS_HABILITADAS,
+    km_aceite: ajustes.km_aceite,
+    km_aviso_anticipacion: ajustes.km_aviso_anticipacion,
+  });
+}));
+
+/**
+ * Calcula el aviso del próximo cambio de aceite de una moto.
+ *
+ * Devuelve el kilometraje al que toca, cuántos faltan, y un color:
+ *   gris     -> todavía falta bastante
+ *   amarillo -> entra en la anticipación configurada, hay tiempo de
+ *               comprar el aceite sin parar la moto
+ *   rojo     -> ya se pasó
+ */
+function avisoAceite(moto, ajustes) {
+  const cada = Number(ajustes.km_aceite) || AJUSTES_POR_DEFECTO.km_aceite;
+  const anticipacion = Number(ajustes.km_aviso_anticipacion) || 0;
+  const ultimo = Number(moto.ultimo_cambio_aceite_km) || 0;
+  const actual = Number(moto.ultimo_kilometraje) || 0;
+  const toca_en = ultimo + cada;
+  const faltan = toca_en - actual;
+  let color = 'gris';
+  if (faltan <= 0) color = 'rojo';
+  else if (faltan <= anticipacion) color = 'amarillo';
+  return { cada, toca_en, faltan, color, vencido: faltan <= 0 };
+}
 
 app.get('/api/motos', autenticar, requiereModulo('motos'), asyncH(async (req, res) => {
   const hoy = hoyCaracas();
+  const ajustes = await leerAjustes();
   const verTodas = tienePermiso(req.usuario, 'gestionar_motos') && req.query.todas === 'true';
   const { rows } = await pool.query(
     `SELECT m.id, m.nombre, m.color, m.placa, m.tipo_modelo,
@@ -1266,7 +1439,10 @@ app.get('/api/motos', autenticar, requiereModulo('motos'), asyncH(async (req, re
       ORDER BY m.nombre, m.placa`,
     [hoy, verTodas],
   );
-  res.json({ motos: rows, fecha: hoy });
+  res.json({
+    motos: rows.map((m) => ({ ...m, aviso_aceite: avisoAceite(m, ajustes) })),
+    fecha: hoy,
+  });
 }));
 
 app.post('/api/motos', autenticar, requierePermiso('gestionar_motos'), asyncH(async (req, res) => {
@@ -1388,6 +1564,11 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
       }
     } else if (b.kilometraje_inicial !== undefined && b.kilometraje_inicial !== null && b.kilometraje_inicial !== '') {
       km = entero(b.kilometraje_inicial, 'Kilometraje inicial', { min: 0 });
+      // Tampoco se admite hacia atrás cuando la moto no se usó: un odómetro
+      // sólo avanza, y un número menor descuadra las cuentas del aceite.
+      if (km < moto.ultimo_kilometraje) {
+        throw bad(`El kilometraje (${km}) no puede ser menor al último registrado (${moto.ultimo_kilometraje})`);
+      }
     }
 
     const tieneFalla = Boolean(b.tiene_falla) || hayItemMalo;
@@ -1396,6 +1577,26 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
 
     const cambioAceite = Boolean(b.cambio_aceite_realizado);
     const foto = validarFotoOEnlace(b.foto_falla_url, 'Foto de la falla');
+
+    /*
+     * El kilometraje AL MOMENTO del cambio de aceite, que es la marca
+     * desde la cual se cuenta hasta el próximo. Antes se usaba el del
+     * arranque del día, pero el aceite se cambia durante o después de la
+     * jornada, así que ese número quedaba corto.
+     *
+     * Puede ser igual al del arranque, nunca menor: el odómetro no
+     * retrocede entre que la moto sale y le cambian el aceite.
+     */
+    let kmAceite = null;
+    if (cambioAceite) {
+      kmAceite = entero(b.km_cambio_aceite, 'Kilometraje del cambio de aceite', { min: 0 });
+      const piso = km !== null ? km : moto.ultimo_kilometraje;
+      if (kmAceite < piso) {
+        throw bad(km !== null
+          ? `El kilometraje del cambio de aceite (${kmAceite}) no puede ser menor al del arranque del día (${km})`
+          : `El kilometraje del cambio de aceite (${kmAceite}) no puede ser menor al último registrado (${moto.ultimo_kilometraje})`);
+      }
+    }
 
     /*
      * Las tres fotos del día son obligatorias, pero sólo se exigen cuando
@@ -1420,20 +1621,29 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
       `INSERT INTO checklist_motos
          (moto_id, usuario_id, se_uso_hoy, kilometraje_inicial, cambio_aceite_realizado,
           detalles_items, tiene_falla, observacion_falla, foto_falla_url,
-          foto_tablero, foto_frontal, foto_trasera)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12) RETURNING *`,
+          foto_tablero, foto_frontal, foto_trasera, km_cambio_aceite)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
       [id, req.usuario.id, seUso, km, cambioAceite, JSON.stringify(items),
         tieneFalla, tieneFalla ? obs : null, foto || null,
-        fotos.tablero, fotos.frontal, fotos.trasera],
+        fotos.tablero, fotos.frontal, fotos.trasera, kmAceite],
     );
 
-    // Actualiza kilometraje y, si corresponde, el km del cambio de aceite
-    if (km !== null && km > moto.ultimo_kilometraje) {
-      await c.query('UPDATE motos SET ultimo_kilometraje = $2 WHERE id = $1', [id, km]);
+    /*
+     * El odómetro de la moto queda en el número más alto de los tres que
+     * conoce: el que tenía, el del arranque del día y el del cambio de
+     * aceite. Así nunca retrocede.
+     */
+    const kmMasAlto = Math.max(
+      Number(moto.ultimo_kilometraje) || 0,
+      km !== null ? km : 0,
+      kmAceite !== null ? kmAceite : 0,
+    );
+    if (kmMasAlto > Number(moto.ultimo_kilometraje)) {
+      await c.query('UPDATE motos SET ultimo_kilometraje = $2 WHERE id = $1', [id, kmMasAlto]);
     }
+    // La marca del aceite es el número que escribió el motorizado, no el del arranque
     if (cambioAceite) {
-      const kmFinal = km !== null && km > moto.ultimo_kilometraje ? km : moto.ultimo_kilometraje;
-      await c.query('UPDATE motos SET ultimo_cambio_aceite_km = $2 WHERE id = $1', [id, kmFinal]);
+      await c.query('UPDATE motos SET ultimo_cambio_aceite_km = $2 WHERE id = $1', [id, kmAceite]);
     }
 
     let incidencia = null;
@@ -1458,6 +1668,329 @@ app.post('/api/motos/:id/checklist', autenticar, requiereModulo('motos'), asyncH
     });
   }
   res.status(201).json({ checklist: resultado.checklist, incidencia: resultado.incidencia });
+}));
+
+/* ------------------------------------------------------------------ */
+/* Combustible                                                         */
+/*                                                                     */
+/* Lo registra quien tenga acceso al reporte de motos, porque el que    */
+/* echa gasolina es el motorizado. Una carga mal hecha no se borra: se  */
+/* anula, igual que el resto de los registros.                          */
+/*                                                                     */
+/* El monto va en bolívares. No entra a los costos operativos del       */
+/* cierre de caja: esa gestión se lleva aparte, por decisión del dueño. */
+/* ------------------------------------------------------------------ */
+const COLS_COMBUSTIBLE = `f.id, f.moto_id, f.litros, f.monto_bs, f.metodo_pago,
+            f.fecha_hora, (f.fecha_hora AT TIME ZONE 'America/Caracas')::date AS fecha,
+            f.observacion, f.anulado, f.anulado_en, f.motivo_anulacion,
+            m.nombre AS moto, m.placa,
+            trim(u.nombre || ' ' || u.apellido) AS usuario,
+            trim(a.nombre || ' ' || a.apellido) AS anulado_por_nombre`;
+
+app.get('/api/combustible', autenticar, requierePermiso('ver_reporte_motos'), asyncH(async (req, res) => {
+  const hoy = hoyCaracas();
+  const desde = leerFecha(req.query.desde, sumarDias(hoy, -30), 'desde');
+  const hasta = leerFecha(req.query.hasta, hoy, 'hasta');
+  const moto = req.query.moto_id ? entero(req.query.moto_id, 'moto_id', { min: 1 }) : null;
+  const verAnulados = tienePermiso(req.usuario, 'ver_anulados') && req.query.anulados === 'true';
+
+  const { rows } = await pool.query(
+    `SELECT ${COLS_COMBUSTIBLE}
+       FROM combustible_motos f
+       JOIN motos m ON m.id = f.moto_id
+       JOIN usuarios u ON u.id = f.usuario_id
+       LEFT JOIN usuarios a ON a.id = f.anulado_por
+      WHERE (f.fecha_hora AT TIME ZONE 'America/Caracas')::date BETWEEN $1::date AND $2::date
+        AND ($3::int IS NULL OR f.moto_id = $3)
+        AND ($4::boolean OR NOT f.anulado)
+      ORDER BY f.fecha_hora DESC
+      LIMIT 300`,
+    [desde, hasta, moto, verAnulados],
+  );
+
+  // Totales del periodo, sin contar lo anulado
+  const vivos = rows.filter((r) => !r.anulado);
+  const litros = vivos.reduce((s, r) => s + Number(r.litros), 0);
+  const bs = vivos.reduce((s, r) => s + Number(r.monto_bs), 0);
+
+  res.json({
+    cargas: rows,
+    desde,
+    hasta,
+    metodos_pago: METODOS_PAGO_COMBUSTIBLE,
+    totales: {
+      cargas: vivos.length,
+      litros: redondearMoneda(litros),
+      monto_bs: redondearMoneda(bs),
+      bs_por_litro: litros > 0 ? redondearMoneda(bs / litros) : null,
+    },
+  });
+}));
+
+app.post('/api/combustible', autenticar, requierePermiso('ver_reporte_motos'), asyncH(async (req, res) => {
+  const b = req.body || {};
+  const motoId = entero(b.moto_id, 'Moto', { min: 1 });
+  const litros = monto(b.litros, 'Litros');
+  if (litros <= 0) throw bad('Los litros deben ser mayores que cero');
+  const montoBs = monto(b.monto_bs ?? 0, 'Monto en bolívares');
+  const metodo = unoDe(b.metodo_pago, METODOS_PAGO_COMBUSTIBLE, 'Método de pago');
+  const obs = texto(b.observacion, 'Observación', { max: 300 });
+
+  const { rows: mt } = await pool.query('SELECT id, activa FROM motos WHERE id = $1', [motoId]);
+  if (!mt[0]) throw new HttpError(404, 'Moto no encontrada');
+  if (!mt[0].activa) throw bad('Esa moto está inactiva');
+
+  const { rows } = await pool.query(
+    `INSERT INTO combustible_motos (moto_id, usuario_id, litros, monto_bs, metodo_pago, observacion)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+    [motoId, req.usuario.id, litros, montoBs, metodo, obs || null],
+  );
+
+  const { rows: creada } = await pool.query(
+    `SELECT ${COLS_COMBUSTIBLE}
+       FROM combustible_motos f
+       JOIN motos m ON m.id = f.moto_id
+       JOIN usuarios u ON u.id = f.usuario_id
+       LEFT JOIN usuarios a ON a.id = f.anulado_por
+      WHERE f.id = $1`,
+    [rows[0].id],
+  );
+  res.status(201).json({ carga: creada[0] });
+}));
+
+/* ------------------------------------------------------------------ */
+/* Apertura de la tienda                                               */
+/*                                                                     */
+/* Una fila por día. La hora la pone el servidor al marcar la apertura: */
+/* no se escribe a mano, igual que el usuario de una anulación.         */
+/*                                                                     */
+/* Esto es el cimiento de los promedios de finanzas: el promedio diario */
+/* se divide entre los días que la tienda abrió, no entre los días del  */
+/* calendario. Un domingo cerrado no es un día flojo, es un día que no  */
+/* existió.                                                            */
+/*                                                                     */
+/* Tres estados posibles para un día:                                  */
+/*   abierta        -> tiene hora y quién la abrió                      */
+/*   cerrada        -> cerrada a propósito, con su motivo               */
+/*   sin registrar  -> no tiene fila. Si es día laborable, falta algo   */
+/* ------------------------------------------------------------------ */
+
+/** El estado de un día, con todo lo que el frontend necesita para decidir qué mostrar. */
+async function estadoDelDia(fecha, usuarioId, cliente) {
+  const q = cliente || pool;
+  const ajustes = await leerAjustes();
+  const { rows } = await q.query(
+    `SELECT a.fecha, a.abierta, a.hora_apertura, a.motivo_cierre,
+            a.hora_original, a.corregida_en,
+            trim(u.nombre || ' ' || u.apellido) AS abrio,
+            trim(c.nombre || ' ' || c.apellido) AS corrigio
+       FROM aperturas_tienda a
+       LEFT JOIN usuarios u ON u.id = a.usuario_id
+       LEFT JOIN usuarios c ON c.id = a.corregida_por
+      WHERE a.fecha = $1::date`,
+    [fecha],
+  );
+  const fila = rows[0] || null;
+  const laborable = esDiaLaborable(fecha, ajustes);
+
+  let confirmada = false;
+  if (usuarioId) {
+    const { rows: cf } = await q.query(
+      'SELECT 1 FROM confirmaciones_apertura WHERE fecha = $1::date AND usuario_id = $2',
+      [fecha, usuarioId],
+    );
+    confirmada = cf.length > 0;
+  }
+
+  let estado = 'sin_registrar';
+  if (fila) estado = fila.abierta ? 'abierta' : 'cerrada';
+
+  return {
+    fecha,
+    estado,
+    laborable,
+    // Un día no laborable sin registrar es normal; uno laborable, no
+    falta_registrar: estado === 'sin_registrar' && laborable,
+    hora_apertura: fila ? fila.hora_apertura : null,
+    motivo_cierre: fila ? fila.motivo_cierre : null,
+    abrio: fila ? fila.abrio : null,
+    corregida: Boolean(fila && fila.corregida_en),
+    hora_original: fila ? fila.hora_original : null,
+    corrigio: fila ? fila.corrigio : null,
+    confirmada_por_mi: confirmada,
+  };
+}
+
+app.get('/api/tienda/estado', autenticar, asyncH(async (req, res) => {
+  const hoy = hoyCaracas();
+  const fecha = req.query.fecha ? leerFecha(req.query.fecha, hoy, 'fecha') : hoy;
+  res.json({
+    dia: await estadoDelDia(fecha, req.usuario.id),
+    puede_abrir: tieneModulo(req.usuario, 'caja'),
+    puede_corregir: req.usuario.es_master === true,
+    ve_confirmacion: tienePermiso(req.usuario, 'ver_apertura_diaria'),
+  });
+}));
+
+/**
+ * Marca la tienda como abierta. La hora es la del servidor.
+ * Hoy la puede marcar quien tenga Caja; una fecha pasada, sólo el Master,
+ * para el caso de que se olvidaran de marcarla ese día.
+ */
+app.post('/api/tienda/abrir', autenticar, asyncH(async (req, res) => {
+  const hoy = hoyCaracas();
+  const b = req.body || {};
+  const fecha = b.fecha ? leerFecha(b.fecha, hoy, 'fecha') : hoy;
+  if (fecha > hoy) throw bad('No se puede abrir la tienda en una fecha futura');
+  if (fecha !== hoy && !req.usuario.es_master) {
+    throw new HttpError(403, 'Sólo el Master puede registrar la apertura de un día pasado');
+  }
+  if (fecha === hoy && !tieneModulo(req.usuario, 'caja')) {
+    throw new HttpError(403, 'No tiene acceso al módulo "caja"');
+  }
+
+  const dia = await withTx(async (c) => {
+    const { rows } = await c.query(
+      'SELECT abierta, motivo_cierre FROM aperturas_tienda WHERE fecha = $1::date FOR UPDATE',
+      [fecha],
+    );
+    if (rows[0] && rows[0].abierta) throw new HttpError(409, 'La tienda ya está marcada como abierta');
+    // Si el día estaba marcado como cerrado, abrirlo lo reemplaza
+    await c.query(
+      `INSERT INTO aperturas_tienda (fecha, abierta, hora_apertura, usuario_id)
+       VALUES ($1::date, TRUE, now(), $2)
+       ON CONFLICT (fecha) DO UPDATE
+         SET abierta = TRUE, hora_apertura = now(), usuario_id = $2,
+             motivo_cierre = NULL`,
+      [fecha, req.usuario.id],
+    );
+    return estadoDelDia(fecha, req.usuario.id, c);
+  });
+  res.status(201).json({ dia });
+}));
+
+/** Marca un día como cerrado a propósito, con su motivo. Exclusivo del Master. */
+app.put('/api/tienda/cerrada', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const hoy = hoyCaracas();
+  const b = req.body || {};
+  const fecha = leerFecha(b.fecha, hoy, 'fecha');
+  if (fecha > hoy) throw bad('No se puede marcar una fecha futura');
+  const motivo = texto(b.motivo_cierre, 'Motivo', { requerido: true, min: 3, max: 300 });
+
+  const dia = await withTx(async (c) => {
+    const { rows } = await c.query(
+      `SELECT id FROM cierres_caja WHERE fecha = $1::date AND NOT anulado`, [fecha],
+    );
+    if (rows.length) {
+      throw bad(`El ${fecha} tiene un cierre de caja registrado. Anúlelo antes de marcar el día como cerrado.`);
+    }
+    await c.query(
+      `INSERT INTO aperturas_tienda (fecha, abierta, motivo_cierre)
+       VALUES ($1::date, FALSE, $2)
+       ON CONFLICT (fecha) DO UPDATE
+         SET abierta = FALSE, motivo_cierre = $2,
+             hora_apertura = NULL, usuario_id = NULL`,
+      [fecha, motivo],
+    );
+    return estadoDelDia(fecha, req.usuario.id, c);
+  });
+  res.json({ dia });
+}));
+
+/**
+ * Corrige una hora de apertura mal registrada, para el caso de que
+ * abrieran a las ocho y nadie marcara hasta las dos. La hora original se
+ * conserva y la corrección queda firmada.
+ */
+app.put('/api/tienda/hora', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const hoy = hoyCaracas();
+  const b = req.body || {};
+  const fecha = leerFecha(b.fecha, hoy, 'fecha');
+  const hora = texto(b.hora, 'Hora', { requerido: true, max: 5 });
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(hora)) throw bad('La hora debe tener el formato HH:MM, de 00:00 a 23:59');
+
+  const dia = await withTx(async (c) => {
+    const { rows } = await c.query(
+      'SELECT abierta, hora_apertura, hora_original FROM aperturas_tienda WHERE fecha = $1::date FOR UPDATE',
+      [fecha],
+    );
+    const actual = rows[0];
+    if (!actual) throw new HttpError(404, `El ${fecha} no tiene apertura registrada`);
+    if (!actual.abierta) throw bad(`El ${fecha} está marcado como día cerrado`);
+    await c.query(
+      `UPDATE aperturas_tienda
+          SET hora_original = COALESCE(hora_original, hora_apertura),
+              hora_apertura = ($2::date + $3::time) AT TIME ZONE 'America/Caracas',
+              corregida_por = $4, corregida_en = now()
+        WHERE fecha = $1::date`,
+      [fecha, fecha, hora, req.usuario.id],
+    );
+    return estadoDelDia(fecha, req.usuario.id, c);
+  });
+  res.json({ dia });
+}));
+
+/** Confirma que vio la apertura del día. Una vez por persona y por día. */
+app.post('/api/tienda/confirmar', autenticar, requierePermiso('ver_apertura_diaria'), asyncH(async (req, res) => {
+  const hoy = hoyCaracas();
+  await pool.query(
+    `INSERT INTO confirmaciones_apertura (fecha, usuario_id) VALUES ($1::date, $2)
+     ON CONFLICT (fecha, usuario_id) DO NOTHING`,
+    [hoy, req.usuario.id],
+  );
+  res.json({ dia: await estadoDelDia(hoy, req.usuario.id) });
+}));
+
+/* ------------------------------------------------------------------ */
+/* Ajustes del Master                                                  */
+/* ------------------------------------------------------------------ */
+app.get('/api/ajustes', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT c.clave, c.valor, c.actualizado_en,
+            trim(u.nombre || ' ' || u.apellido) AS actualizado_por
+       FROM configuracion c LEFT JOIN usuarios u ON u.id = c.actualizado_por
+      ORDER BY c.clave`,
+  );
+  res.json({ ajustes: await leerAjustes(), detalle: rows, por_defecto: AJUSTES_POR_DEFECTO });
+}));
+
+app.put('/api/ajustes', autenticar, soloAdmin, asyncH(async (req, res) => {
+  const b = req.body || {};
+  const cambios = [];
+
+  if (b.dias_apertura !== undefined) {
+    if (!Array.isArray(b.dias_apertura)) throw bad('Los días de apertura deben ser una lista');
+    const dias = [...new Set(b.dias_apertura.map(Number))].sort((x, y) => x - y);
+    for (const d of dias) {
+      if (!Number.isInteger(d) || d < 1 || d > 7) throw bad('Cada día debe ser un número del 1 (lunes) al 7 (domingo)');
+    }
+    if (!dias.length) throw bad('Debe quedar al menos un día de apertura');
+    cambios.push(['dias_apertura', JSON.stringify(dias)]);
+  }
+  if (b.km_aceite !== undefined) {
+    const v = entero(b.km_aceite, 'Kilómetros entre cambios de aceite', { min: 100, max: 50000 });
+    cambios.push(['km_aceite', JSON.stringify(v)]);
+  }
+  if (b.km_aviso_anticipacion !== undefined) {
+    const v = entero(b.km_aviso_anticipacion, 'Kilómetros de anticipación del aviso', { min: 0, max: 10000 });
+    cambios.push(['km_aviso_anticipacion', JSON.stringify(v)]);
+  }
+  if (!cambios.length) throw bad('No se indicó ningún ajuste para cambiar');
+
+  await withTx(async (c) => {
+    for (const [clave, valor] of cambios) {
+      // eslint-disable-next-line no-await-in-loop
+      await c.query(
+        `INSERT INTO configuracion (clave, valor, actualizado_por, actualizado_en)
+         VALUES ($1, $2::jsonb, $3, now())
+         ON CONFLICT (clave) DO UPDATE
+           SET valor = $2::jsonb, actualizado_por = $3, actualizado_en = now()`,
+        [clave, valor, req.usuario.id],
+      );
+    }
+  });
+  olvidarAjustes();
+  res.json({ ajustes: await leerAjustes() });
 }));
 
 /* ------------------------------------------------------------------ */
@@ -1542,6 +2075,25 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
 
   const cierre = await withTx(async (c) => {
     await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`caja:${fecha}`]);
+
+    /*
+     * Sin apertura no hay cierre. La apertura es lo que le dice al
+     * sistema que ese día la tienda trabajó, y de eso dependen todos los
+     * promedios de finanzas: un día sin apertura no entra al cálculo, así
+     * que permitir su cierre dejaría ventas fuera de los promedios.
+     */
+    const ap = await c.query(
+      'SELECT abierta, motivo_cierre FROM aperturas_tienda WHERE fecha = $1::date', [fecha],
+    );
+    if (!ap.rows[0]) {
+      throw bad(fecha === hoy
+        ? 'La tienda no está marcada como abierta hoy. Marque la apertura y vuelva a cerrar la caja.'
+        : `El ${fecha} no tiene apertura registrada. El Master debe registrarla antes de cerrar esa caja.`);
+    }
+    if (!ap.rows[0].abierta) {
+      throw bad(`El ${fecha} está marcado como día cerrado (${ap.rows[0].motivo_cierre}). No se puede cerrar caja.`);
+    }
+
     const previos = await c.query('SELECT id FROM cierres_caja WHERE fecha = $1::date AND NOT anulado FOR UPDATE', [fecha]);
     if (previos.rowCount) throw new HttpError(409, `La caja del ${fecha} ya fue cerrada`);
     const { rows } = await c.query(
@@ -1619,12 +2171,16 @@ app.get('/api/proveedores', autenticar, accesoProveedores, asyncH(async (req, re
 app.post('/api/proveedores', autenticar, accesoProveedores, asyncH(async (req, res) => {
   const b = req.body || {};
   const { rows } = await pool.query(
-    'INSERT INTO proveedores (nombre, tipo, contacto, rif, telefono) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+    `INSERT INTO proveedores (nombre, tipo, contacto, rif, telefono, tipo_factura)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
     [texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 120 }),
       unoDe(b.tipo, TIPOS_PROVEEDOR, 'Tipo de proveedor'),
       texto(b.contacto, 'Contacto', { max: 120 }) || null,
       texto(b.rif, 'RIF', { max: 20 }) || null,
-      texto(b.telefono, 'Teléfono', { max: 30 }) || null],
+      texto(b.telefono, 'Teléfono', { max: 30 }) || null,
+      // Si no lo indican, se asume física: es el caso que exige respaldo,
+      // así que nadie queda sin foto por omisión.
+      b.tipo_factura === undefined ? 'fisica' : unoDe(b.tipo_factura, TIPOS_FACTURA, 'Tipo de factura')],
   );
   res.status(201).json({ proveedor: rows[0] });
 }));
@@ -1637,14 +2193,17 @@ app.put('/api/proveedores/:id', autenticar, requierePermiso('editar_catalogo'), 
     throw new HttpError(403, 'No tiene la función "Eliminar del catálogo"');
   }
   const { rows } = await pool.query(
-    `UPDATE proveedores SET nombre=$2, tipo=$3, contacto=$4, rif=$5, telefono=$6, activo=$7
+    `UPDATE proveedores SET nombre=$2, tipo=$3, contacto=$4, rif=$5, telefono=$6, activo=$7,
+            tipo_factura = COALESCE($8, tipo_factura)
       WHERE id=$1 RETURNING *`,
     [id, texto(b.nombre, 'Nombre', { requerido: true, min: 2, max: 120 }),
       unoDe(b.tipo, TIPOS_PROVEEDOR, 'Tipo de proveedor'),
       texto(b.contacto, 'Contacto', { max: 120 }) || null,
       texto(b.rif, 'RIF', { max: 20 }) || null,
       texto(b.telefono, 'Teléfono', { max: 30 }) || null,
-      b.activo === undefined ? true : Boolean(b.activo)],
+      b.activo === undefined ? true : Boolean(b.activo),
+      // Si no viene en la petición se conserva el que tenga
+      b.tipo_factura === undefined ? null : unoDe(b.tipo_factura, TIPOS_FACTURA, 'Tipo de factura')],
   );
   if (!rows[0]) throw new HttpError(404, 'Proveedor no encontrado');
   res.json({ proveedor: rows[0] });
@@ -1793,28 +2352,141 @@ app.get('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asyn
   res.json({ entradas: rows });
 }));
 
+/**
+ * Las solicitudes de mercancía que todavía no se han recibido, para
+ * poder elegir una al recibir en vez de cargar los productos a mano.
+ *
+ * Quedan fuera las anuladas, las rechazadas, las ya completadas y las que
+ * ya tienen una recepción viva asociada.
+ */
+app.get('/api/solicitudes/pendientes-mercancia', autenticar, requiereModulo('recepcion'), asyncH(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT s.id, s.titulo, s.descripcion, s.estado, s.detalle_items,
+            (s.fecha_hora AT TIME ZONE 'America/Caracas')::date AS fecha,
+            s.proveedor_id, p.nombre AS proveedor, p.tipo_factura,
+            trim(u.nombre || ' ' || u.apellido) AS pidio
+       FROM solicitudes s
+       JOIN usuarios u ON u.id = s.usuario_id
+       LEFT JOIN proveedores p ON p.id = s.proveedor_id
+      WHERE s.tipo_solicitud = 'mercancia'
+        AND NOT s.anulado
+        AND s.estado NOT IN ('completada', 'rechazada')
+        AND NOT EXISTS (
+          SELECT 1 FROM entradas_mercancia e
+           WHERE e.solicitud_id = s.id AND NOT e.anulado
+        )
+      ORDER BY s.fecha_hora DESC
+      LIMIT 100`,
+  );
+  res.json({ solicitudes: rows });
+}));
+
 app.post('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asyncH(async (req, res) => {
   const b = req.body || {};
   const proveedor = entero(b.proveedor_id, 'Proveedor', { min: 1 }); // obligatorio en el esquema
+  const solicitudId = b.solicitud_id ? uuid(b.solicitud_id, 'Solicitud') : null;
+
   if (!Array.isArray(b.items) || b.items.length === 0 || b.items.length > 100) {
     throw bad('Debe incluir entre 1 y 100 ítems');
   }
+
+  /*
+   * Al recibir contra una solicitud, un ítem puede llegar completo, llegar
+   * con otra cantidad o no llegar. Lo que no llegó entra con cantidad 0:
+   * queda constancia de que se pidió y no vino, y no suma al stock.
+   *
+   * En el método manual, en cambio, toda cantidad debe ser mayor que cero:
+   * no tiene sentido cargar a mano un producto que no llegó.
+   */
   const items = b.items.map((it, i) => {
     const cantidad = monto(it && it.cantidad, `Cantidad del ítem ${i + 1}`, { requerido: true });
-    if (cantidad <= 0) throw bad(`La cantidad del ítem ${i + 1} debe ser mayor a 0`);
+    if (cantidad < 0) throw bad(`La cantidad del ítem ${i + 1} no puede ser negativa`);
+    if (!solicitudId && cantidad <= 0) throw bad(`La cantidad del ítem ${i + 1} debe ser mayor a 0`);
     return {
       producto_id: entero(it && it.producto_id, `Producto del ítem ${i + 1}`, { min: 1 }),
       cantidad,
       costo_usd: monto(it && it.costo_usd, `Costo del ítem ${i + 1}`),
     };
   });
+  if (solicitudId && !items.some((it) => it.cantidad > 0)) {
+    throw bad('No llegó ningún producto. Si de verdad no llegó nada, rechace la solicitud en vez de registrar la recepción.');
+  }
   const ids = items.map((i) => i.producto_id);
   if (new Set(ids).size !== ids.length) throw bad('Hay productos repetidos en la entrada');
 
-  // La factura es opcional: se recibe mercancía igual aunque no la traigan
-  const foto = validarFotoOEnlace(b.foto_factura_url, 'Foto de la factura');
+  const obs = texto(b.observaciones, 'Observaciones', { max: 500 });
 
   const entrada = await withTx(async (c) => {
+    /*
+     * La foto de la factura se exige según cómo facture el proveedor, no
+     * según lo que decida quien está recibiendo:
+     *
+     *   fisica  -> entrega el papel en la mano, la foto es el respaldo
+     *   digital -> la manda al correo de la empresa, no hay papel
+     *   ambas   -> depende de la entrega, y ahí sí lo indica el empleado
+     *
+     * Dejarlo a criterio del empleado abriría la salida de marcar
+     * "digital" el día que se pierda el papel, que es justo el día en que
+     * el respaldo hace falta.
+     */
+    const { rows: pv } = await c.query(
+      'SELECT id, nombre, tipo_factura FROM proveedores WHERE id = $1 AND activo', [proveedor],
+    );
+    if (!pv[0]) throw bad('El proveedor no existe o está inactivo');
+    const tipoFactura = pv[0].tipo_factura || 'fisica';
+
+    let digital = false;
+    if (tipoFactura === 'digital') {
+      digital = true; // ese proveedor nunca entrega papel
+    } else if (tipoFactura === 'ambas') {
+      digital = Boolean(b.factura_digital);
+    } else if (b.factura_digital) {
+      throw bad(`${pv[0].nombre} entrega factura física. Tome la foto de la factura.`);
+    }
+
+    const foto = validarFotoOEnlace(b.foto_factura_url, 'Foto de la factura');
+    // Igual que con las fotos del checklist: sólo se exige si el almacén
+    // está configurado, para no trancar la recepción por una variable.
+    if (!digital && !foto && FOTOS_HABILITADAS) {
+      throw bad(tipoFactura === 'ambas'
+        ? 'Falta la foto de la factura. Si este proveedor la envió al correo, marque "factura digital".'
+        : `${pv[0].nombre} entrega factura física: la foto es obligatoria.`);
+    }
+
+    /* La solicitud debe existir, ser de mercancía y no estar ya recibida */
+    let solicitud = null;
+    if (solicitudId) {
+      const { rows: sol } = await c.query(
+        `SELECT id, tipo_solicitud, estado, anulado, proveedor_id, detalle_items, titulo
+           FROM solicitudes WHERE id = $1 FOR UPDATE`,
+        [solicitudId],
+      );
+      solicitud = sol[0];
+      if (!solicitud) throw new HttpError(404, 'La solicitud no existe');
+      if (solicitud.tipo_solicitud !== 'mercancia') throw bad('Esa solicitud no es de mercancía');
+      if (solicitud.anulado) throw bad('Esa solicitud está anulada');
+      if (solicitud.estado === 'completada') throw bad('Esa solicitud ya fue recibida');
+      if (solicitud.estado === 'rechazada') throw bad('Esa solicitud fue rechazada');
+      const { rows: ya } = await c.query(
+        'SELECT id FROM entradas_mercancia WHERE solicitud_id = $1 AND NOT anulado', [solicitudId],
+      );
+      if (ya.length) throw new HttpError(409, 'Esa solicitud ya tiene una recepción registrada');
+
+      // Lo que se pidió de cada producto, para dejarlo junto a lo que llegó
+      const pedido = Object.fromEntries(
+        (Array.isArray(solicitud.detalle_items) ? solicitud.detalle_items : [])
+          .map((d) => [Number(d.producto_id), Number(d.cantidad_empaques) || 0]),
+      );
+      for (const it of items) {
+        const pedidoDe = pedido[it.producto_id];
+        it.cantidad_pedida = pedidoDe === undefined ? null : pedidoDe;
+        if (it.cantidad === 0) it.estado = 'no_llego';
+        else if (it.cantidad_pedida === null) it.estado = 'no_pedido';
+        else if (it.cantidad === it.cantidad_pedida) it.estado = 'completo';
+        else it.estado = it.cantidad < it.cantidad_pedida ? 'incompleto' : 'de_mas';
+      }
+    }
+
     const { rows: prods } = await c.query(
       'SELECT id, nombre FROM productos WHERE id = ANY($1::int[]) AND activo ORDER BY id FOR UPDATE',
       [ids],
@@ -1822,15 +2494,30 @@ app.post('/api/entradas/mercancia', autenticar, requiereModulo('recepcion'), asy
     if (prods.length !== ids.length) throw bad('Algún producto no existe o está inactivo');
     const nombres = Object.fromEntries(prods.map((p) => [p.id, p.nombre]));
     for (const it of items) {
-      await c.query('UPDATE productos SET stock = stock + $2 WHERE id = $1', [it.producto_id, it.cantidad]);
       it.nombre = nombres[it.producto_id];
+      // Lo que no llegó no suma al stock
+      if (it.cantidad > 0) {
+        // eslint-disable-next-line no-await-in-loop
+        await c.query('UPDATE productos SET stock = stock + $2 WHERE id = $1', [it.producto_id, it.cantidad]);
+      }
     }
+
     const { rows } = await c.query(
-      `INSERT INTO entradas_mercancia (usuario_id, proveedor_id, items_recibidos, foto_factura_url, observaciones)
-       VALUES ($1, $2, $3::jsonb, $4, $5) RETURNING *`,
-      [req.usuario.id, proveedor, JSON.stringify(items), foto || null,
-        texto(b.observaciones, 'Observaciones', { max: 500 }) || null],
+      `INSERT INTO entradas_mercancia
+         (usuario_id, proveedor_id, items_recibidos, foto_factura_url, observaciones,
+          solicitud_id, factura_digital)
+       VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7) RETURNING *`,
+      [req.usuario.id, proveedor, JSON.stringify(items), foto || null, obs || null,
+        solicitudId, digital],
     );
+
+    // La solicitud se da por cerrada: llega en una sola entrega
+    if (solicitudId) {
+      await c.query(
+        `UPDATE solicitudes SET estado = 'completada', actualizado_en = now() WHERE id = $1`,
+        [solicitudId],
+      );
+    }
     return rows[0];
   });
   res.status(201).json({ entrada });
@@ -2031,15 +2718,30 @@ app.put('/api/anular/:recurso/:id', autenticar, requierePermiso('anular_registro
           WHERE id = $1 RETURNING *`,
         [id, anular, req.usuario.id, motivo || null],
       );
-      return r.rows[0];
+      const registro = r.rows[0];
+
+      /*
+       * Una recepción puede venir de una solicitud, y al recibirla la
+       * solicitud quedó "completada". Si esa recepción se anula, la
+       * solicitud tiene que volver a quedar pendiente: lo que se pidió
+       * sigue sin recibirse y debe poder recibirse de nuevo.
+       */
+      if (recurso === 'entrada-mercancia' && registro.solicitud_id) {
+        await c.query(
+          `UPDATE solicitudes SET estado = $2, actualizado_en = now() WHERE id = $1`,
+          [registro.solicitud_id, anular ? 'pendiente' : 'completada'],
+        );
+      }
+      return registro;
     });
     res.json({ recurso, registro: fila });
   } catch (err) {
     // Al reactivar puede chocar con el que ya ocupa ese día o esa fecha
     if (err.code === '23505') {
-      throw new HttpError(409, recurso === 'caja'
-        ? 'No se puede reactivar: ya hay otro cierre de caja vigente para esa fecha'
-        : 'No se puede reactivar: ya hay otro registro vigente para ese día');
+      let mensaje = 'No se puede reactivar: ya hay otro registro vigente para ese día';
+      if (recurso === 'caja') mensaje = 'No se puede reactivar: ya hay otro cierre de caja vigente para esa fecha';
+      if (recurso === 'entrada-mercancia') mensaje = 'No se puede reactivar: esa solicitud ya tiene otra recepción vigente';
+      throw new HttpError(409, mensaje);
     }
     throw err;
   }
@@ -2072,23 +2774,211 @@ async function agrupar(unidad, desde, hasta, limite) {
   return rows;
 }
 
+/**
+ * Cuántos días operó la tienda en un rango.
+ *
+ * Cuenta los días con apertura marcada Y TAMBIÉN los que tengan cierre de
+ * caja, unidos sin repetir. Lo segundo es necesario por dos razones: el
+ * registro de aperturas empieza el día que se estrena esta función, así
+ * que las semanas anteriores no lo tienen; y si alguna vez se olvidan de
+ * marcar la apertura pero cierran la caja, ese día igual operó y debe
+ * contar.
+ *
+ * Esto es el divisor de todos los promedios diarios: un domingo cerrado
+ * no es un día flojo, es un día que no existió.
+ */
+async function diasOperados(desde, hasta, cliente) {
+  const { rows } = await (cliente || pool).query(
+    `SELECT count(*)::int AS dias FROM (
+        SELECT fecha FROM aperturas_tienda
+         WHERE abierta AND fecha BETWEEN $1::date AND $2::date
+        UNION
+        SELECT fecha FROM cierres_caja
+         WHERE NOT anulado AND fecha BETWEEN $1::date AND $2::date
+     ) d`,
+    [desde, hasta],
+  );
+  return rows[0].dias;
+}
+
+/** Totales de un rango más sus promedios por día operado. */
+async function resumenPeriodo(desde, hasta) {
+  const [{ rows }, dias] = await Promise.all([
+    pool.query(
+      `SELECT ${COLS_SUMA} FROM cierres_caja
+        WHERE fecha BETWEEN $1::date AND $2::date AND NOT anulado`,
+      [desde, hasta],
+    ),
+    diasOperados(desde, hasta),
+  ]);
+  const t = rows[0];
+  const totalUsd = Number(t.total_usd) || 0;
+  const totalBs = Number(t.total_bs) || 0;
+  return {
+    desde,
+    hasta,
+    dias_operados: dias,
+    cierres: Number(t.cierres) || 0,
+    total_usd: redondearMoneda(totalUsd),
+    total_bs: redondearMoneda(totalBs),
+    // Sin días operados no hay promedio: se devuelve nulo y el frontend
+    // muestra un guion, en vez de un cero que parecería un mal resultado.
+    promedio_usd: dias > 0 ? redondearMoneda(totalUsd / dias) : null,
+    promedio_bs: dias > 0 ? redondearMoneda(totalBs / dias) : null,
+  };
+}
+
+/**
+ * Promedios de facturación.
+ *
+ * El dólar manda porque es lo único comparable entre periodos: en
+ * bolívares, una tasa que se movió hace parecer que el negocio creció
+ * cuando vendió exactamente lo mismo. Los bolívares van al lado como
+ * referencia de lo que de verdad pasó por la caja.
+ */
+app.get('/api/reportes/promedios', autenticar, requierePermiso('ver_finanzas'), asyncH(async (req, res) => {
+  const hoy = hoyCaracas();
+
+  /* La semana anterior completa, de lunes a domingo */
+  const [anterior] = semanasCompletas(hoy, 1);
+  const semanaAnterior = await resumenPeriodo(anterior.desde, anterior.hasta);
+
+  /* Las últimas 4 semanas completas, cada una por separado */
+  const cuatro = semanasCompletas(hoy, 4);
+  const detalleSemanas = [];
+  for (const s of cuatro) {
+    // eslint-disable-next-line no-await-in-loop
+    detalleSemanas.push(await resumenPeriodo(s.desde, s.hasta));
+  }
+  /*
+   * El promedio semanal se calcula sólo sobre las semanas que tuvieron
+   * actividad. Si el negocio arrancó hace dos semanas, dividir entre
+   * cuatro daría la mitad de lo real.
+   */
+  const conDatos = detalleSemanas.filter((s) => s.dias_operados > 0);
+  const sumaUsd = conDatos.reduce((a, s) => a + Number(s.total_usd), 0);
+  const sumaBs = conDatos.reduce((a, s) => a + Number(s.total_bs), 0);
+
+  /* El mes pasado, que es el último que de verdad terminó */
+  const primeroDeEsteMes = `${hoy.slice(0, 7)}-01`;
+  const finMesPasado = sumarDias(primeroDeEsteMes, -1);
+  const inicioMesPasado = `${finMesPasado.slice(0, 7)}-01`;
+  const mesPasado = await resumenPeriodo(inicioMesPasado, finMesPasado);
+  const ajustes = await leerAjustes();
+  /* Cuántos días de ese mes se esperaba abrir, según el horario */
+  let diasEsperados = 0;
+  for (let f = inicioMesPasado; f <= finMesPasado; f = sumarDias(f, 1)) {
+    if (esDiaLaborable(f, ajustes)) diasEsperados += 1;
+  }
+  const semanasDelMes = semanasCompletas(sumarDias(finMesPasado, 1), 100)
+    .filter((s) => s.desde >= inicioMesPasado && s.hasta <= finMesPasado).length;
+
+  res.json({
+    hoy,
+    semana_anterior: semanaAnterior,
+    ultimas_4_semanas: {
+      semanas: detalleSemanas,
+      semanas_con_datos: conDatos.length,
+      promedio_semanal_usd: conDatos.length ? redondearMoneda(sumaUsd / conDatos.length) : null,
+      promedio_semanal_bs: conDatos.length ? redondearMoneda(sumaBs / conDatos.length) : null,
+    },
+    cierre_mes: {
+      ...mesPasado,
+      mes: finMesPasado.slice(0, 7),
+      dias_esperados: diasEsperados,
+      semanas_completas: semanasDelMes,
+      promedio_semanal_usd: semanasDelMes > 0
+        ? redondearMoneda(Number(mesPasado.total_usd) / semanasDelMes) : null,
+      promedio_semanal_bs: semanasDelMes > 0
+        ? redondearMoneda(Number(mesPasado.total_bs) / semanasDelMes) : null,
+    },
+  });
+}));
+
 app.get('/api/reportes/financieros', autenticar, requierePermiso('ver_finanzas'), asyncH(async (req, res) => {
   const hoy = hoyCaracas();
-  const desde = leerFecha(req.query.desde, '1900-01-01', 'desde');
-  const hasta = leerFecha(req.query.hasta, hoy, 'hasta');
+
+  /*
+   * Dos formas de pedir el periodo: un rango continuo con desde/hasta, o
+   * una lista de días sueltos no consecutivos, para comparar por ejemplo
+   * los tres últimos sábados entre sí.
+   */
+  let dias = null;
+  if (req.query.dias) {
+    const lista = String(req.query.dias).split(',').map((s) => s.trim()).filter(Boolean);
+    if (!lista.length || lista.length > 62) throw bad('Indique entre 1 y 62 días');
+    dias = [...new Set(lista.map((d) => leerFecha(d, hoy, 'días')))].sort();
+  }
+
+  const desde = dias ? dias[0] : leerFecha(req.query.desde, '1900-01-01', 'desde');
+  const hasta = dias ? dias[dias.length - 1] : leerFecha(req.query.hasta, hoy, 'hasta');
   if (desde > hasta) throw bad('"desde" no puede ser posterior a "hasta"');
   const agr = req.query.agrupacion || 'todas';
   unoDe(agr, ['dia', 'semana', 'mes', 'todas'], 'agrupacion');
 
-  const out = { desde, hasta };
-  const t = await pool.query(
-    `SELECT ${COLS_SUMA} FROM cierres_caja WHERE fecha BETWEEN $1::date AND $2::date AND NOT anulado`,
-    [desde, hasta],
-  );
-  out.totales = t.rows[0];
-  if (agr === 'dia' || agr === 'todas') out.diario = await agrupar('day', desde, hasta, 120);
-  if (agr === 'semana' || agr === 'todas') out.semanal = await agrupar('week', desde, hasta, 104);
-  if (agr === 'mes' || agr === 'todas') out.mensual = await agrupar('month', desde, hasta, 60);
+  const out = { desde, hasta, dias };
+
+  if (dias) {
+    // Días sueltos: sólo tiene sentido el total y el detalle por día
+    const t = await pool.query(
+      `SELECT ${COLS_SUMA} FROM cierres_caja WHERE fecha = ANY($1::date[]) AND NOT anulado`,
+      [dias],
+    );
+    out.totales = t.rows[0];
+    const d = await pool.query(
+      `SELECT fecha AS periodo, ${COLS_SUMA} FROM cierres_caja
+        WHERE fecha = ANY($1::date[]) AND NOT anulado
+        GROUP BY 1 ORDER BY 1 DESC`,
+      [dias],
+    );
+    out.diario = d.rows;
+    out.dias_operados = (await pool.query(
+      `SELECT count(*)::int AS dias FROM (
+          SELECT fecha FROM aperturas_tienda WHERE abierta AND fecha = ANY($1::date[])
+          UNION
+          SELECT fecha FROM cierres_caja WHERE NOT anulado AND fecha = ANY($1::date[])
+       ) x`,
+      [dias],
+    )).rows[0].dias;
+  } else {
+    const t = await pool.query(
+      `SELECT ${COLS_SUMA} FROM cierres_caja WHERE fecha BETWEEN $1::date AND $2::date AND NOT anulado`,
+      [desde, hasta],
+    );
+    out.totales = t.rows[0];
+    if (agr === 'dia' || agr === 'todas') out.diario = await agrupar('day', desde, hasta, 120);
+    if (agr === 'semana' || agr === 'todas') out.semanal = await agrupar('week', desde, hasta, 104);
+    if (agr === 'mes' || agr === 'todas') out.mensual = await agrupar('month', desde, hasta, 60);
+    // 1900 es el comodín de "desde el inicio": ahí contar días no aporta
+    out.dias_operados = desde === '1900-01-01' ? null : await diasOperados(desde, hasta);
+  }
+
+  /* El promedio por día operado, que es la lectura honesta del periodo */
+  const totalUsd = Number(out.totales.total_usd) || 0;
+  const totalBs = Number(out.totales.total_bs) || 0;
+  out.promedios = {
+    dias_operados: out.dias_operados,
+    por_dia_usd: out.dias_operados > 0 ? redondearMoneda(totalUsd / out.dias_operados) : null,
+    por_dia_bs: out.dias_operados > 0 ? redondearMoneda(totalBs / out.dias_operados) : null,
+  };
+
+  /* Días laborables del rango sin apertura ni cierre: ahí falta registrar algo */
+  if (!dias && desde !== '1900-01-01' && desde >= sumarDias(hoy, -400)) {
+    const ajustes = await leerAjustes();
+    const { rows: conAlgo } = await pool.query(
+      `SELECT fecha FROM aperturas_tienda WHERE fecha BETWEEN $1::date AND $2::date
+       UNION
+       SELECT fecha FROM cierres_caja WHERE NOT anulado AND fecha BETWEEN $1::date AND $2::date`,
+      [desde, hasta],
+    );
+    const registrados = new Set(conAlgo.map((r) => String(r.fecha).slice(0, 10)));
+    const faltan = [];
+    for (let f = desde; f <= hasta && f < hoy; f = sumarDias(f, 1)) {
+      if (esDiaLaborable(f, ajustes) && !registrados.has(f)) faltan.push(f);
+    }
+    out.dias_sin_registrar = faltan.slice(0, 60);
+  }
+
   res.json(out);
 }));
 
@@ -2145,7 +3035,11 @@ app.get('/api/reportes/operativos', autenticar, requierePermiso('ver_reportes'),
 /* ------------------------------------------------------------------ */
 /* Reporte de motos (exclusivo del Master)                             */
 /* ------------------------------------------------------------------ */
-const KM_AVISO_ACEITE = Number(process.env.KM_AVISO_ACEITE) || 3000;
+/*
+ * El umbral del aceite ahora vive en los ajustes, que el Master cambia
+ * desde la aplicación. Antes estaba fijo en 3.000 km y cambiarlo exigía
+ * un despliegue.
+ */
 
 app.get('/api/reportes/motos', autenticar, requierePermiso('ver_reporte_motos'), asyncH(async (req, res) => {
   const hoy = hoyCaracas();
@@ -2196,14 +3090,24 @@ app.get('/api/reportes/motos', autenticar, requierePermiso('ver_reporte_motos'),
       ORDER BY c.fecha DESC LIMIT 200`,
   );
 
-  const aceiteVencido = motos.rows
-    .filter((m) => m.km_desde_aceite >= KM_AVISO_ACEITE)
-    .map((m) => ({ moto_id: m.id, moto: m.nombre, placa: m.placa, km_desde_aceite: m.km_desde_aceite }));
+  const ajustes = await leerAjustes();
+  const conAviso = motos.rows.map((m) => ({ ...m, aviso_aceite: avisoAceite(m, ajustes) }));
+  // Entran a la alerta las vencidas y las que ya están en la anticipación
+  const aceiteVencido = conAviso
+    .filter((m) => m.aviso_aceite.color !== 'gris')
+    .map((m) => ({
+      moto_id: m.id, moto: m.nombre, placa: m.placa,
+      km_desde_aceite: m.km_desde_aceite,
+      toca_en: m.aviso_aceite.toca_en,
+      faltan: m.aviso_aceite.faltan,
+      vencido: m.aviso_aceite.vencido,
+    }));
 
   res.json({
     fecha: hoy,
-    km_aviso_aceite: KM_AVISO_ACEITE,
-    motos: motos.rows,
+    km_aviso_aceite: ajustes.km_aceite,
+    km_aviso_anticipacion: ajustes.km_aviso_anticipacion,
+    motos: conAviso,
     alertas: {
       incidencias_abiertas: incidencias.rows,
       items_en_falla: itemsFalla.rows,
@@ -2246,16 +3150,53 @@ app.get('/api/reportes/motos/:id', autenticar, requierePermiso('ver_reporte_moto
     [id],
   );
 
-  // Los cambios de aceite anulados no cuentan
+  const combustible = await pool.query(
+    `SELECT f.id, f.litros, f.monto_bs, f.metodo_pago, f.observacion,
+            f.fecha_hora, (f.fecha_hora AT TIME ZONE 'America/Caracas')::date AS fecha,
+            f.anulado, f.anulado_en, f.motivo_anulacion,
+            trim(u.nombre || ' ' || u.apellido) AS usuario,
+            trim(a.nombre || ' ' || a.apellido) AS anulado_por_nombre
+       FROM combustible_motos f
+       JOIN usuarios u ON u.id = f.usuario_id
+       LEFT JOIN usuarios a ON a.id = f.anulado_por
+      WHERE f.moto_id = $1
+        AND (f.fecha_hora AT TIME ZONE 'America/Caracas')::date BETWEEN $2::date AND $3::date
+      ORDER BY f.fecha_hora DESC LIMIT 200`,
+    [id, desde, hasta],
+  );
+
+  /*
+   * Los cambios de aceite anulados no cuentan. El kilometraje que se
+   * muestra es el que el motorizado escribió al hacer el cambio; para los
+   * checklists anteriores a esa casilla, la migración copió el del
+   * arranque, que es lo que el sistema venía usando.
+   */
   const cambiosAceite = checklists.rows
     .filter((c) => c.cambio_aceite_realizado && !c.anulado)
-    .map((c) => ({ fecha: c.fecha, kilometraje: c.kilometraje_inicial, usuario: c.usuario }));
+    .map((c) => ({
+      fecha: c.fecha,
+      kilometraje: c.km_cambio_aceite !== null && c.km_cambio_aceite !== undefined
+        ? c.km_cambio_aceite : c.kilometraje_inicial,
+      usuario: c.usuario,
+    }));
 
+  const cargasVivas = combustible.rows.filter((f) => !f.anulado);
+  const litros = cargasVivas.reduce((a, f) => a + Number(f.litros), 0);
+  const gastoBs = cargasVivas.reduce((a, f) => a + Number(f.monto_bs), 0);
+
+  const ajustes = await leerAjustes();
   res.json({
-    moto: moto.rows[0],
+    moto: { ...moto.rows[0], aviso_aceite: avisoAceite(moto.rows[0], ajustes) },
     checklists: checklists.rows,
     incidencias: incidencias.rows,
     cambios_aceite: cambiosAceite,
+    combustible: combustible.rows,
+    combustible_totales: {
+      cargas: cargasVivas.length,
+      litros: redondearMoneda(litros),
+      monto_bs: redondearMoneda(gastoBs),
+      bs_por_litro: litros > 0 ? redondearMoneda(gastoBs / litros) : null,
+    },
   });
 }));
 
