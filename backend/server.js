@@ -298,6 +298,15 @@ class HttpError extends Error {
 }
 const bad = (msg) => new HttpError(400, msg);
 
+/**
+ * Formatea una cantidad para un mensaje de error que lee un empleado:
+ * sin decimales cuando son enteros, con dos cuando hacen falta.
+ */
+const nf2 = (n) => {
+  const v = Number(n) || 0;
+  return Number.isInteger(v) ? String(v) : v.toFixed(2);
+};
+
 /** Redondeo contable a 2 decimales corrigiendo el error de punto flotante IEEE 754. */
 function redondearMoneda(valor) {
   const n = Number(valor);
@@ -2719,6 +2728,48 @@ app.put('/api/anular/:recurso/:id', autenticar, requierePermiso('anular_registro
         [id, anular, req.usuario.id, motivo || null],
       );
       const registro = r.rows[0];
+
+      /*
+       * Una entrada de mercancía SUMÓ al stock cuando se registró, así que
+       * anularla tiene que devolverlo. Sin esto el registro quedaba
+       * anulado pero las cajas seguían contadas, y el inventario mentía
+       * sin que nada lo delatara.
+       *
+       * Los ítems se recorren en orden de producto, el mismo que usa la
+       * recepción al bloquearlos, para que dos operaciones simultáneas no
+       * se traben entre sí.
+       */
+      if (recurso === 'entrada-mercancia') {
+        const items = (Array.isArray(registro.items_recibidos) ? registro.items_recibidos : [])
+          .filter((it) => Number(it.cantidad) > 0) // lo que no llegó nunca sumó
+          .sort((x, y) => Number(x.producto_id) - Number(y.producto_id));
+        const signo = anular ? -1 : 1;
+
+        for (const it of items) {
+          const prodId = Number(it.producto_id);
+          const cantidad = Number(it.cantidad);
+          // eslint-disable-next-line no-await-in-loop
+          const { rows: pr } = await c.query(
+            'SELECT id, nombre, stock FROM productos WHERE id = $1 FOR UPDATE', [prodId],
+          );
+          // Si el producto ya no existe, no hay stock que devolver
+          if (!pr[0]) continue;
+          const resultante = Number(pr[0].stock) + signo * cantidad;
+          /*
+           * Si ya se vendió parte de lo que entró, devolver el stock lo
+           * dejaría negativo. No se fuerza ni se recorta en silencio: se
+           * explica cuál producto lo impide y con cuánto, para que el
+           * Master ajuste el inventario a conciencia y vuelva a intentar.
+           */
+          if (resultante < 0) {
+            throw bad(`No se puede anular: de "${pr[0].nombre}" entraron ${nf2(cantidad)} `
+              + `y en stock quedan ${nf2(pr[0].stock)}. Ya se vendió parte, así que `
+              + 'primero corrija el stock de ese producto y vuelva a anular.');
+          }
+          // eslint-disable-next-line no-await-in-loop
+          await c.query('UPDATE productos SET stock = $2 WHERE id = $1', [prodId, resultante]);
+        }
+      }
 
       /*
        * Una recepción puede venir de una solicitud, y al recibirla la
