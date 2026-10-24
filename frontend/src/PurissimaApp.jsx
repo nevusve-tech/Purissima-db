@@ -116,7 +116,11 @@ function redondear(n) {
   if (!Number.isFinite(v)) return 0;
   return (Math.sign(v) * Math.round((Math.abs(v) + Number.EPSILON) * 100)) / 100;
 }
-/** La tasa del día se maneja con 4 decimales; el dinero con 2. */
+/**
+ * La tasa se escribe con 2 decimales, igual que el dinero, pero se
+ * redondea a 4: la columna de la base admite cuatro y las tasas que ya
+ * están guardadas con cuatro se conservan enteras.
+ */
 const redondearTasa = (n) => {
   const v = Number(n);
   return Number.isFinite(v) && v > 0 ? Math.round((v + Number.EPSILON) * 10000) / 10000 : 0;
@@ -424,8 +428,9 @@ function NumInput({ value, onChange, ...rest }) {
  * los dígitos crudos, y de ahí se derivan las dos caras: lo que se ve y
  * lo que se envía.
  *
- * "decimales" es 2 para dinero y 4 para la tasa del día, que se cotiza
- * con más precisión.
+ * "decimales" es 2 en todos los campos de la aplicación, incluida la
+ * tasa del día. El parámetro se queda porque la base admite cuatro en la
+ * tasa y volver a pedirlos sería cambiar este número.
  */
 const soloDigitos = (s) => String(s ?? '').replace(/\D/g, '');
 
@@ -1447,6 +1452,181 @@ function AvisosCierre({ usuario, call }) {
   );
 }
 
+/*
+ * Cierre fiscal: formulario aparte, debajo del cierre de caja.
+ *
+ * Son los datos que salen de la máquina fiscal al hacer el reporte Z, y
+ * se copian del papel tal cual aparecen ahí. El sistema no calcula
+ * ninguno: el número que vale es el del papel.
+ *
+ * Va aparte porque es otro momento y otro papel, pero necesita que la
+ * caja del día ya esté cerrada: estos datos se guardan en ese cierre. Si
+ * todavía no hay cierre, el formulario lo dice y queda apagado; y
+ * mientras falte, esta tarjeta sigue a la vista recordándolo.
+ *
+ * El del día tiene que ser el siguiente del anterior, y el anterior del
+ * papel tiene que coincidir con el que quedó guardado en el cierre
+ * pasado. Ninguna de las dos cosas bloquea el guardado —el papel manda—:
+ * se guarda y queda el aviso.
+ */
+function FormularioFiscal({ usuario, cierre, cierrePasado, call, aviso, onListo }) {
+  const yaEsta = Boolean(cierre && cierre.reporte_z !== null && cierre.reporte_z !== undefined);
+  const puedeCorregir = puede(usuario, 'corregir_caja');
+  const [abierto, setAbierto] = useState(false);
+  const [enviando, setEnviando] = useState(false);
+  const [f, setF] = useState({
+    reporte_z_anterior: '', reporte_z: '', exento_bs: '', base_imponible_bs: '',
+  });
+  const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
+
+  const zAnterior = f.reporte_z_anterior === '' ? null : Number(f.reporte_z_anterior);
+  const esperadoZ = zAnterior === null ? null : zAnterior + 1;
+  const zEscrito = f.reporte_z === '' ? null : Number(f.reporte_z);
+  const zNoCuadra = esperadoZ !== null && zEscrito !== null && zEscrito !== esperadoZ;
+  const noCalzaConSistema = Boolean(
+    cierrePasado && zAnterior !== null && cierrePasado.reporte_z !== zAnterior,
+  );
+
+  const falta = (() => {
+    if (f.reporte_z_anterior === '') return 'el último reporte Z';
+    if (f.reporte_z === '') return 'el N° Reporte Z';
+    if (f.exento_bs === '') return 'el monto exento';
+    if (f.base_imponible_bs === '') return 'la base imponible 16%';
+    return '';
+  })();
+
+  /* Al corregir, el formulario arranca con lo que ya estaba guardado */
+  const corregir = () => {
+    setF({
+      reporte_z_anterior: String(cierre.reporte_z_anterior ?? ''),
+      reporte_z: String(cierre.reporte_z ?? ''),
+      exento_bs: numeroADigitos(cierre.exento_bs, 2),
+      base_imponible_bs: numeroADigitos(cierre.base_imponible_bs, 2),
+    });
+    setAbierto(true);
+  };
+
+  const enviar = async (e) => {
+    e.preventDefault();
+    if (falta) return aviso(`Falta ${falta}`, 'error');
+    setEnviando(true);
+    try {
+      const r = await call(`/api/caja/${cierre.id}/fiscal`, {
+        method: 'PUT',
+        body: {
+          reporte_z_anterior: f.reporte_z_anterior,
+          reporte_z: f.reporte_z,
+          exento_bs: digitosANumero(f.exento_bs, 2) || 0,
+          base_imponible_bs: digitosANumero(f.base_imponible_bs, 2) || 0,
+        },
+      });
+      aviso(
+        r && r.aviso_z ? `Cierre fiscal guardado. ${r.aviso_z}` : 'Cierre fiscal guardado',
+        r && r.aviso_z ? 'error' : 'ok',
+      );
+      setAbierto(false);
+      onListo();
+    } catch (err) {
+      aviso(err.message, 'error');
+    } finally {
+      setEnviando(false);
+    }
+  };
+
+  const Encabezado = () => (
+    <div>
+      <h3 className="font-bold text-slate-800">Cierre fiscal</h3>
+      <p className="text-xs text-slate-500">
+        Los datos del reporte Z, copiados del papel de la impresora.
+      </p>
+    </div>
+  );
+
+  /* Sin cierre de caja no hay dónde guardarlos */
+  if (!cierre) {
+    return (
+      <div className="card space-y-2 opacity-70">
+        <Encabezado />
+        <p className="text-sm text-slate-600">
+          Primero cierra la caja del día. Después vuelve aquí con el papel de la
+          impresora.
+        </p>
+        <button type="button" className="btn-primario w-full" disabled>
+          Falta cerrar la caja
+        </button>
+      </div>
+    );
+  }
+
+  /* Ya está guardado: se muestra, y se corrige sólo con la función */
+  if (yaEsta && !abierto) {
+    return (
+      <div className="card space-y-1">
+        <Encabezado />
+        <Chip tono="verde">Cierre fiscal registrado</Chip>
+        <p>Último reporte Z: <b>{cierre.reporte_z_anterior}</b></p>
+        <p>N° Reporte Z: <b>{cierre.reporte_z}</b></p>
+        <p>Exento: <b>{fmtBs(cierre.exento_bs)}</b></p>
+        <p>Base imponible 16%: <b>{fmtBs(cierre.base_imponible_bs)}</b></p>
+        {puedeCorregir && (
+          <button type="button" className="btn-sec w-full mt-2" onClick={corregir}>
+            Corregir un número
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={enviar} className="card space-y-3 border-2 border-slate-300" noValidate>
+      <Encabezado />
+      {yaEsta && (
+        <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+          Estás corrigiendo un cierre fiscal ya registrado.
+        </p>
+      )}
+
+      <Campo etiqueta="Último reporte Z">
+        <DigitosInput digitos={f.reporte_z_anterior} onDigitos={set('reporte_z_anterior')} largo={9} placeholder="420" />
+      </Campo>
+      {noCalzaConSistema && (
+        <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+          Ojo: el cierre del {fmtFecha(cierrePasado.fecha)} quedó guardado con el reporte Z{' '}
+          {cierrePasado.reporte_z}, no con el {zAnterior}. Si el papel dice {zAnterior}, déjalo
+          así y guarda igual: queda un aviso para el Master.
+        </p>
+      )}
+
+      <Campo etiqueta="N° Reporte Z">
+        <DigitosInput digitos={f.reporte_z} onDigitos={set('reporte_z')} largo={9} placeholder={esperadoZ !== null ? String(esperadoZ) : '421'} />
+      </Campo>
+      {zNoCuadra && (
+        <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+          Revisa los números: si el anterior es el {zAnterior}, el del día debería ser el{' '}
+          {esperadoZ}. Si en la impresora dice {zEscrito}, déjalo así y guarda igual: queda un
+          aviso para el Master.
+        </p>
+      )}
+
+      <Campo etiqueta="Exento (Bs)">
+        <MontoInput digitos={f.exento_bs} onDigitos={set('exento_bs')} prefijo="Bs" />
+      </Campo>
+      <Campo etiqueta="Base imponible 16% (Bs)">
+        <MontoInput digitos={f.base_imponible_bs} onDigitos={set('base_imponible_bs')} prefijo="Bs" />
+      </Campo>
+
+      <button className="btn-primario w-full" disabled={enviando || Boolean(falta)}>
+        {enviando ? 'Guardando…' : falta ? `Falta ${falta}` : 'Guardar cierre fiscal'}
+      </button>
+      {yaEsta && (
+        <button type="button" className="btn-sec w-full" onClick={() => setAbierto(false)}>
+          Dejarlo como está
+        </button>
+      )}
+    </form>
+  );
+}
+
 function VistaCaja({ usuario, call, aviso }) {
   const esAdmin = puede(usuario, 'anular_registros');
   const [hoy, setHoy] = useState(null);
@@ -1454,10 +1634,9 @@ function VistaCaja({ usuario, call, aviso }) {
   const [f, setF] = useState({
     pago_movil_bs: '', efectivo_bs: '', punto_venta_bs: '', tasa_dolar: '',
     impuestos_fiscales_bs: '', costos_operativos_usd: '', observacion: '',
-    reporte_z_anterior: '', reporte_z: '', exento_bs: '', base_imponible_bs: '', ultima_factura: '',
   });
   const [enviando, setEnviando] = useState(false);
-  /* Cambia al cerrar la caja para que el panel de avisos se vuelva a calcular */
+  /* Cambia al guardar el cierre fiscal para que los avisos se vuelvan a calcular */
   const [version, setVersion] = useState(0);
 
   const cargar = useCallback(async () => {
@@ -1486,8 +1665,14 @@ function VistaCaja({ usuario, call, aviso }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [f.pago_movil_bs, f.efectivo_bs, f.punto_venta_bs],
   );
-  // La tasa se cotiza con cuatro decimales, no con dos
-  const tasa = redondearTasa(digitosANumero(f.tasa_dolar, 4) || 0);
+  /*
+   * La tasa se escribe con dos decimales, igual que el dinero: teclear
+   * cuatro cada noche era un estorbo y los dos últimos siempre iban en
+   * cero. La columna de la base sigue admitiendo cuatro, así que las
+   * tasas ya guardadas se conservan enteras y se siguen mostrando con
+   * los decimales que tengan.
+   */
+  const tasa = redondearTasa(digitosANumero(f.tasa_dolar, 2) || 0);
   const totalUsd = useMemo(
     () => (tasa > 0 ? redondear(totalBs / tasa) : 0),
     [totalBs, tasa],
@@ -1505,44 +1690,13 @@ function VistaCaja({ usuario, call, aviso }) {
   );
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
 
-  /*
-   * Los dos números del reporte Z los escribe la cajera, porque los dos
-   * salen impresos en el papel: el del reporte anterior y el del día.
-   *
-   * El formulario revisa dos cosas y ninguna bloquea el envío, porque el
-   * número que vale es el del papel:
-   *   - que el del día sea el siguiente del anterior
-   *   - que el anterior del papel sea el mismo con el que quedó guardado
-   *     el cierre pasado (si no, entre un cierre y otro se hizo un
-   *     reporte Z que no quedó registrado)
-   */
-  const cierrePasado = (hoy && hoy.cierre_pasado) || null;
-  const zAnterior = f.reporte_z_anterior === '' ? null : Number(f.reporte_z_anterior);
-  const esperadoZ = zAnterior === null ? null : zAnterior + 1;
-  const zEscrito = f.reporte_z === '' ? null : Number(f.reporte_z);
-  const zNoCuadra = esperadoZ !== null && zEscrito !== null && zEscrito !== esperadoZ;
-  const noCalzaConSistema = Boolean(
-    cierrePasado && zAnterior !== null && cierrePasado.reporte_z !== zAnterior,
-  );
-
-  /* Qué falta por llenar, en orden, para decirlo en el botón */
-  const falta = (() => {
-    if (!(tasa > 0)) return 'la tasa del dólar';
-    if (f.reporte_z_anterior === '') return 'el último reporte Z';
-    if (f.reporte_z === '') return 'el N° Reporte Z';
-    if (f.exento_bs === '') return 'el monto exento';
-    if (f.base_imponible_bs === '') return 'la base imponible 16%';
-    if (f.ultima_factura === '') return 'la última factura';
-    return '';
-  })();
-
   const enviar = async (e) => {
     e.preventDefault();
-    if (falta) return aviso(`Falta ${falta}`, 'error');
-    if (!window.confirm(`¿Cerrar la caja de hoy?\n\nTotal: ${fmtBs(totalBs)}\nIngreso en dólares: ${fmtUsd(totalUsd)}\nReporte Z: ${zAnterior} → ${zEscrito}\n\nNo podrá repetirse.`)) return;
+    if (!(tasa > 0)) return aviso('Indique la tasa del dólar del día', 'error');
+    if (!window.confirm(`¿Cerrar la caja de hoy?\n\nTotal: ${fmtBs(totalBs)}\nIngreso en dólares: ${fmtUsd(totalUsd)}\n\nNo podrá repetirse.`)) return;
     setEnviando(true);
     try {
-      const r = await call('/api/caja/cierre', {
+      await call('/api/caja/cierre', {
         method: 'POST',
         body: {
           pago_movil_bs: num('pago_movil_bs'),
@@ -1554,20 +1708,9 @@ function VistaCaja({ usuario, call, aviso }) {
           impuestos_fiscales_bs: num('impuestos_fiscales_bs'),
           costos_operativos_usd: num('costos_operativos_usd'),
           observacion: f.observacion,
-          reporte_z_anterior: f.reporte_z_anterior,
-          reporte_z: f.reporte_z,
-          exento_bs: num('exento_bs'),
-          base_imponible_bs: num('base_imponible_bs'),
-          ultima_factura: f.ultima_factura,
         },
       });
-      aviso(
-        r && r.aviso_z
-          ? `Caja cerrada. ${r.aviso_z}`
-          : 'Caja cerrada correctamente',
-        r && r.aviso_z ? 'error' : 'ok',
-      );
-      setVersion((v) => v + 1);
+      aviso('Caja cerrada correctamente', 'ok');
       cargar();
     } catch (err) {
       aviso(err.message, 'error');
@@ -1596,22 +1739,11 @@ function VistaCaja({ usuario, call, aviso }) {
           <p>Impuestos: <b>{fmtBs(c.impuestos_fiscales_bs)}</b></p>
           <p>Costos operativos: <b>{fmtUsd(c.costos_operativos_usd)}</b> <span className="text-slate-500">({fmtBs(c.costos_operativos_bs)})</span></p>
           <p>Neto en Bs: <b>{fmtBs(redondear(c.total_cierre_bs - c.impuestos_fiscales_bs - c.costos_operativos_bs))}</b></p>
-          {c.reporte_z !== null && c.reporte_z !== undefined && (
-            <>
-              <hr className="my-1" />
-              <p className="font-semibold text-slate-700">Cierre fiscal</p>
-              <p>Último reporte Z: <b>{c.reporte_z_anterior}</b></p>
-              <p>N° Reporte Z: <b>{c.reporte_z}</b></p>
-              <p>Exento: <b>{fmtBs(c.exento_bs)}</b></p>
-              <p>Base imponible 16%: <b>{fmtBs(c.base_imponible_bs)}</b></p>
-              <p>Última factura: <b>{c.ultima_factura}</b></p>
-            </>
-          )}
           {c.observacion && <p className="text-sm text-slate-600">Nota: {c.observacion}</p>}
           <p className="text-sm text-slate-500">Registrado por {c.usuario}</p>
         </div>
       ) : (
-        <form onSubmit={enviar} className="card space-y-3" noValidate>
+        <form onSubmit={enviar} className="card space-y-3">
           <p className="text-sm text-slate-500">Fecha: {fmtFecha(hoy.fecha)}</p>
           <p className="text-xs text-slate-500">
             En los montos escribe sólo números: los centavos se llenan primero y el
@@ -1631,7 +1763,7 @@ function VistaCaja({ usuario, call, aviso }) {
             <p className="text-2xl font-extrabold text-agua-800">{fmtBs(totalBs)}</p>
           </div>
           <Campo etiqueta="Tasa del dólar del día (obligatoria)">
-            <MontoInput digitos={f.tasa_dolar} onDigitos={set('tasa_dolar')} decimales={4} required />
+            <MontoInput digitos={f.tasa_dolar} onDigitos={set('tasa_dolar')} required />
           </Campo>
           <div className="rounded-xl bg-emerald-50 border border-emerald-200 p-3">
             <p className="text-sm text-slate-600">Ingreso total en dólares (calculado)</p>
@@ -1641,52 +1773,6 @@ function VistaCaja({ usuario, call, aviso }) {
           <Campo etiqueta="Impuestos fiscales (Bs)">
             <MontoInput digitos={f.impuestos_fiscales_bs} onDigitos={set('impuestos_fiscales_bs')} prefijo="Bs" />
           </Campo>
-
-          {/*
-            * Cierre fiscal: los cinco datos se copian del papel de la
-            * impresora, tal cual aparecen ahí. El sistema no los calcula.
-            */}
-          <div className="rounded-xl border-2 border-slate-300 bg-white p-3 space-y-3">
-            <div>
-              <h4 className="font-bold text-slate-800">Cierre fiscal</h4>
-              <p className="text-xs text-slate-500">
-                Copia estos cinco datos del papel de la impresora, tal como aparecen ahí.
-              </p>
-            </div>
-
-            <Campo etiqueta="Último reporte Z">
-              <DigitosInput digitos={f.reporte_z_anterior} onDigitos={set('reporte_z_anterior')} largo={9} placeholder="420" />
-            </Campo>
-            {noCalzaConSistema && (
-              <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                Ojo: el cierre del {fmtFecha(cierrePasado.fecha)} quedó guardado con el reporte Z{' '}
-                {cierrePasado.reporte_z}, no con el {zAnterior}. Si el papel dice {zAnterior},
-                déjalo así y guarda igual: queda un aviso para el Master.
-              </p>
-            )}
-
-            <Campo etiqueta="N° Reporte Z">
-              <DigitosInput digitos={f.reporte_z} onDigitos={set('reporte_z')} largo={9} placeholder={esperadoZ !== null ? String(esperadoZ) : '421'} />
-            </Campo>
-            {zNoCuadra && (
-              <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                Revisa los números: si el anterior es el {zAnterior}, el del día debería ser el{' '}
-                {esperadoZ}. Si en la impresora dice {zEscrito}, déjalo así y guarda igual: queda
-                un aviso para el Master.
-              </p>
-            )}
-
-            <Campo etiqueta="Exento (Bs)">
-              <MontoInput digitos={f.exento_bs} onDigitos={set('exento_bs')} prefijo="Bs" />
-            </Campo>
-            <Campo etiqueta="Base imponible 16% (Bs)">
-              <MontoInput digitos={f.base_imponible_bs} onDigitos={set('base_imponible_bs')} prefijo="Bs" />
-            </Campo>
-            <Campo etiqueta="Última factura">
-              <DigitosInput digitos={f.ultima_factura} onDigitos={set('ultima_factura')} placeholder="00010237" />
-            </Campo>
-          </div>
-
           <Campo etiqueta="Costos operativos (USD)">
             <MontoInput digitos={f.costos_operativos_usd} onDigitos={set('costos_operativos_usd')} prefijo="$" />
           </Campo>
@@ -1702,11 +1788,19 @@ function VistaCaja({ usuario, call, aviso }) {
           <Campo etiqueta="Observación (opcional)">
             <textarea className="campo" rows={2} maxLength={500} value={f.observacion} onChange={(e) => set('observacion')(e.target.value)} />
           </Campo>
-          <button className="btn-primario w-full" disabled={enviando || Boolean(falta)}>
-            {enviando ? 'Cerrando…' : falta ? `Falta ${falta}` : 'Cerrar caja del día'}
-          </button>
+          <button className="btn-primario w-full" disabled={enviando}>{enviando ? 'Cerrando…' : 'Cerrar caja del día'}</button>
         </form>
       )}
+
+      {/* El cierre fiscal es otro papel y otro momento: formulario aparte */}
+      <FormularioFiscal
+        usuario={usuario}
+        cierre={c}
+        cierrePasado={hoy.cierre_pasado || null}
+        call={call}
+        aviso={aviso}
+        onListo={() => { setVersion((v) => v + 1); cargar(); }}
+      />
 
       <div>
         <h3 className="font-bold mb-2">Últimos 15 días</h3>

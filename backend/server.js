@@ -277,7 +277,6 @@ const COLUMNAS_REQUERIDAS = [
   ['cierres_caja', 'reporte_z'],
   ['cierres_caja', 'exento_bs'],
   ['cierres_caja', 'base_imponible_bs'],
-  ['cierres_caja', 'ultima_factura'],
   ['solicitudes', 'proveedor_id'],
   ['checklist_motos', 'anulado'],
   ['cierres_caja', 'anulado'],
@@ -2133,8 +2132,8 @@ function leerMontosCaja(b) {
 }
 
 /*
- * Cierre fiscal: los datos que salen de la máquina fiscal al hacer el
- * reporte Z del día.
+ * Cierre fiscal: los cuatro datos que salen de la máquina fiscal al hacer
+ * el reporte Z del día.
  *
  * TODO se guarda TAL CUAL lo escribe la cajera, copiado del papel de la
  * impresora. El sistema no calcula ninguno de estos números ni los deriva
@@ -2144,19 +2143,18 @@ function leerMontosCaja(b) {
  * Son dos números de reporte Z y los dos los escribe ella, porque los dos
  * salen impresos: el del reporte anterior y el del día.
  *
- * La última factura va como texto para no perder los ceros de adelante
- * (00010237), que es como la imprime la máquina.
+ * La columna cierres_caja.ultima_factura existe pero NO se usa: se pidió
+ * y se retiró el mismo día, antes de que entrara un solo dato. Se queda
+ * ahí vacía en vez de retirarse, porque quitar una columna de una tabla
+ * con datos vivos no vale el riesgo. Si algún día se quiere el número de
+ * la última factura, la columna ya está.
  */
 function leerCierreFiscal(b) {
   const zAnterior = entero(b.reporte_z_anterior, 'Último reporte Z', { min: 0, max: 999999999, requerido: true });
   const reporteZ = entero(b.reporte_z, 'N° Reporte Z', { min: 1, max: 999999999, requerido: true });
   const exento = monto(b.exento_bs, 'Exento', { requerido: true });
   const base = monto(b.base_imponible_bs, 'Base imponible 16%', { requerido: true });
-  const factura = texto(b.ultima_factura, 'Última factura', { max: 20, requerido: true });
-  if (!/^[0-9]{1,20}$/.test(factura)) {
-    throw bad('La última factura debe ser sólo números, como aparece en la impresora');
-  }
-  return { zAnterior, reporteZ, exento, base, factura };
+  return { zAnterior, reporteZ, exento, base };
 }
 
 /**
@@ -2301,10 +2299,8 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
     if (fecha > hoy) throw bad('No se puede cerrar una fecha futura');
   }
   const m = leerMontosCaja(b);
-  const fi = leerCierreFiscal(b);
   const obs = texto(b.observacion, 'Observación', { max: 500 });
 
-  let avisoZ = null;
   const cierre = await withTx(async (c) => {
     await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`caja:${fecha}`]);
 
@@ -2329,37 +2325,20 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
     const previos = await c.query('SELECT id FROM cierres_caja WHERE fecha = $1::date AND NOT anulado FOR UPDATE', [fecha]);
     if (previos.rowCount) throw new HttpError(409, `La caja del ${fecha} ya fue cerrada`);
 
-    /*
-     * El reporte Z del día debe ser el siguiente del anterior, y el
-     * anterior que trae el papel debe coincidir con el que quedó en el
-     * cierre pasado. Si algo no cuadra, el cierre se guarda igual —el
-     * número que manda es el de la impresora— y queda el aviso.
-     */
-    const pasado = await ultimoCierreConZ(fecha, c);
-    avisoZ = avisosDelCierre(pasado, fi.zAnterior, fi.reporteZ);
-
     const { rows } = await c.query(
       `INSERT INTO cierres_caja
          (fecha, usuario_id, pago_movil_bs, efectivo_bs, punto_venta_bs, total_cierre_bs,
           tasa_dolar, dolares_vendidos, total_ingreso_dolar,
-          impuestos_fiscales_bs, costos_operativos_usd, costos_operativos_bs, observacion,
-          reporte_z_anterior, reporte_z, exento_bs, base_imponible_bs, ultima_factura)
-       VALUES ($1::date, $2, $3, $4, $5, $6, $7, 0, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING *`,
+          impuestos_fiscales_bs, costos_operativos_usd, costos_operativos_bs, observacion)
+       VALUES ($1::date, $2, $3, $4, $5, $6, $7, 0, $8, $9, $10, $11, $12) RETURNING *`,
       [fecha, req.usuario.id, m.pagoMovil, m.efectivo, m.punto, m.totalBs,
-        m.tasa, m.totalUsd, m.impuestos, m.costosUsd, m.costosBs, obs || null,
-        fi.zAnterior, fi.reporteZ, fi.exento, fi.base, fi.factura],
+        m.tasa, m.totalUsd, m.impuestos, m.costosUsd, m.costosBs, obs || null],
     );
     return rows[0];
   });
 
-  notificar(`Cierre de caja ${fecha}${avisoZ ? ' — revisar el reporte Z' : ''}`, {
+  notificar(`Cierre de caja ${fecha}`, {
     Responsable: nombreCompleto(req.usuario),
-    ...(avisoZ ? { 'AVISO DE CIERRE': avisoZ } : {}),
-    'Último reporte Z': String(cierre.reporte_z_anterior),
-    'N° Reporte Z': String(cierre.reporte_z),
-    'Exento (Bs)': cierre.exento_bs.toFixed(2),
-    'Base imponible 16% (Bs)': cierre.base_imponible_bs.toFixed(2),
-    'Última factura': cierre.ultima_factura,
     'Pago móvil (Bs)': cierre.pago_movil_bs.toFixed(2),
     'Efectivo (Bs)': cierre.efectivo_bs.toFixed(2),
     'Punto de venta (Bs)': cierre.punto_venta_bs.toFixed(2),
@@ -2370,35 +2349,76 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
     'Costos operativos (USD)': cierre.costos_operativos_usd.toFixed(2),
     'Costos operativos (Bs)': cierre.costos_operativos_bs.toFixed(2),
   });
-  res.status(201).json({ cierre, aviso_z: avisoZ });
+  res.status(201).json({ cierre });
 }));
 
 app.put('/api/caja/:id', autenticar, requierePermiso('corregir_caja'), asyncH(async (req, res) => {
   const id = uuid(req.params.id, 'id');
   const m = leerMontosCaja(req.body || {});
-  const fi = leerCierreFiscal(req.body || {});
   const obs = texto(req.body && req.body.observacion, 'Observación', { max: 500 });
-  let avisoZ = null;
   const cierre = await withTx(async (c) => {
-    const { rows } = await c.query('SELECT id, fecha FROM cierres_caja WHERE id = $1 FOR UPDATE', [id]);
+    const { rows } = await c.query('SELECT id FROM cierres_caja WHERE id = $1 FOR UPDATE', [id]);
     if (!rows[0]) throw new HttpError(404, 'Cierre no encontrado');
-
-    const pasado = await ultimoCierreConZ(rows[0].fecha, c);
-    avisoZ = avisosDelCierre(pasado, fi.zAnterior, fi.reporteZ);
-
     const r = await c.query(
       `UPDATE cierres_caja SET pago_movil_bs=$2, efectivo_bs=$3, punto_venta_bs=$4, total_cierre_bs=$5,
               tasa_dolar=$6, dolares_vendidos=0, total_ingreso_dolar=$7,
               impuestos_fiscales_bs=$8, costos_operativos_usd=$9, costos_operativos_bs=$10,
-              observacion=$11,
-              reporte_z_anterior=$12, reporte_z=$13, exento_bs=$14,
-              base_imponible_bs=$15, ultima_factura=$16
+              observacion=$11
        WHERE id=$1 RETURNING *`,
       [id, m.pagoMovil, m.efectivo, m.punto, m.totalBs, m.tasa, m.totalUsd,
-        m.impuestos, m.costosUsd, m.costosBs, obs || null,
-        fi.zAnterior, fi.reporteZ, fi.exento, fi.base, fi.factura],
+        m.impuestos, m.costosUsd, m.costosBs, obs || null],
     );
     return r.rows[0];
+  });
+  res.json({ cierre });
+}));
+
+/**
+ * El cierre fiscal: los datos del reporte Z, que van en el cierre de caja
+ * del día pero se registran aparte, con su propio formulario.
+ *
+ * Se guardan una sola vez, igual que el cierre de caja. Corregir un
+ * número ya guardado exige la función "Corregir caja", que es la misma
+ * que permite modificar un cierre hecho.
+ *
+ * Si los números no cuadran NO se rechaza: el que vale es el del papel de
+ * la impresora. Se guarda y queda el aviso.
+ */
+app.put('/api/caja/:id/fiscal', autenticar, requiereModulo('caja'), asyncH(async (req, res) => {
+  const id = uuid(req.params.id, 'id');
+  const fi = leerCierreFiscal(req.body || {});
+  let avisoZ = null;
+  const cierre = await withTx(async (c) => {
+    const { rows } = await c.query(
+      'SELECT id, fecha, anulado, reporte_z FROM cierres_caja WHERE id = $1 FOR UPDATE', [id],
+    );
+    const previo = rows[0];
+    if (!previo) throw new HttpError(404, 'No se encontró ese cierre de caja');
+    if (previo.anulado) throw bad('Ese cierre de caja está anulado. Registre el cierre del día de nuevo.');
+    if (previo.reporte_z !== null && !tienePermiso(req.usuario, 'corregir_caja')) {
+      throw new HttpError(403, 'El cierre fiscal de esa fecha ya fue registrado. Hace falta la función "Corregir caja" para cambiarlo.');
+    }
+
+    const pasado = await ultimoCierreConZ(previo.fecha, c);
+    avisoZ = avisosDelCierre(pasado, fi.zAnterior, fi.reporteZ);
+
+    const r = await c.query(
+      `UPDATE cierres_caja
+          SET reporte_z_anterior = $2, reporte_z = $3, exento_bs = $4, base_imponible_bs = $5
+        WHERE id = $1 RETURNING *`,
+      [id, fi.zAnterior, fi.reporteZ, fi.exento, fi.base],
+    );
+    return r.rows[0];
+  });
+
+  notificar(`Cierre fiscal ${cierre.fecha}${avisoZ ? ' — revisar el reporte Z' : ''}`, {
+    Responsable: nombreCompleto(req.usuario),
+    ...(avisoZ ? { 'AVISO DE CIERRE': avisoZ } : {}),
+    'Último reporte Z': String(cierre.reporte_z_anterior),
+    'N° Reporte Z': String(cierre.reporte_z),
+    'Exento (Bs)': cierre.exento_bs.toFixed(2),
+    'Base imponible 16% (Bs)': cierre.base_imponible_bs.toFixed(2),
+    'Total del cierre (Bs)': cierre.total_cierre_bs.toFixed(2),
   });
   res.json({ cierre, aviso_z: avisoZ });
 }));
