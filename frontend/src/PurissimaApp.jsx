@@ -477,6 +477,29 @@ function MontoInput({ digitos, onDigitos, decimales = 2, prefijo, ...rest }) {
 }
 
 /*
+ * Campo de números sueltos: el reporte Z y el número de factura.
+ *
+ * No es dinero, así que no lleva separadores ni decimales. Se guarda el
+ * texto tal cual se escribe para no perder los ceros de adelante, que la
+ * impresora fiscal imprime en las facturas (00010237). Si se pasara por
+ * un número, "00010237" quedaría en 10237 y dejaría de coincidir con el
+ * papel.
+ */
+function DigitosInput({ digitos, onDigitos, largo = 20, ...rest }) {
+  return (
+    <input
+      type="text"
+      inputMode="numeric"
+      autoComplete="off"
+      className="campo"
+      value={digitos}
+      onChange={(e) => onDigitos(soloDigitos(e.target.value).slice(0, largo))}
+      {...rest}
+    />
+  );
+}
+
+/*
  * Campo de hora que pone los dos puntos solo.
  *
  * Mismo problema que el dinero: el teclado numérico no trae los dos
@@ -1363,6 +1386,67 @@ function VistaMotos({ usuario, call, aviso, subirFoto }) {
 /* ------------------------------------------------------------------ */
 /* Caja                                                                */
 /* ------------------------------------------------------------------ */
+/*
+ * Avisos de cierre: los reportes Z que no siguen al del cierre anterior.
+ *
+ * Sólo aparece para quien tenga la función especial "Avisos de cierre", y
+ * sólo si hay algo que avisar: si la numeración va bien, el panel no se
+ * muestra.
+ *
+ * Los avisos no se guardan, se calculan. Al corregir o anular el cierre
+ * de la fecha señalada, el aviso desaparece solo.
+ */
+function AvisosCierre({ usuario, call }) {
+  const [avisos, setAvisos] = useState([]);
+  const veAvisos = puede(usuario, 'ver_avisos_cierre');
+
+  const cargar = useCallback(async () => {
+    try {
+      const r = await call('/api/caja/avisos-cierre');
+      setAvisos(r.avisos || []);
+    } catch {
+      setAvisos([]); // sin la función especial, el panel no aparece
+    }
+  }, [call]);
+
+  useEffect(() => {
+    if (veAvisos) cargar();
+  }, [veAvisos, cargar]);
+
+  if (!veAvisos || avisos.length === 0) return null;
+
+  return (
+    <div className="card border-2 border-amber-300 bg-amber-50 space-y-2">
+      <div className="flex items-center gap-2">
+        <span aria-hidden="true">⚠️</span>
+        <h3 className="font-bold text-amber-900">
+          Avisos de cierre ({avisos.length})
+        </h3>
+      </div>
+      <p className="text-xs text-amber-800">
+        La numeración de los reportes Z no viene seguida. Revisa estos días con el
+        papel de la impresora en la mano.
+      </p>
+      <div className="space-y-2">
+        {avisos.map((a) => (
+          <div key={a.fecha} className="rounded-xl bg-white border border-amber-200 p-3 text-sm">
+            <p className="font-semibold">{fmtFecha(a.fecha)}</p>
+            <p className="text-slate-700">{a.motivo}</p>
+            <p className="text-xs text-slate-500">
+              Lo escrito ese día: anterior {a.reporte_z_anterior}, del día {a.reporte_z}
+              {a.pasado_fecha ? ` · cierre pasado: ${fmtFecha(a.pasado_fecha)} con el ${a.pasado_z}` : ''}
+            </p>
+          </div>
+        ))}
+      </div>
+      <p className="text-xs text-amber-800">
+        Para corregir un número mal escrito: anula el cierre de ese día y vuelve a
+        registrarlo con la fecha correcta.
+      </p>
+    </div>
+  );
+}
+
 function VistaCaja({ usuario, call, aviso }) {
   const esAdmin = puede(usuario, 'anular_registros');
   const [hoy, setHoy] = useState(null);
@@ -1370,8 +1454,11 @@ function VistaCaja({ usuario, call, aviso }) {
   const [f, setF] = useState({
     pago_movil_bs: '', efectivo_bs: '', punto_venta_bs: '', tasa_dolar: '',
     impuestos_fiscales_bs: '', costos_operativos_usd: '', observacion: '',
+    reporte_z_anterior: '', reporte_z: '', exento_bs: '', base_imponible_bs: '', ultima_factura: '',
   });
   const [enviando, setEnviando] = useState(false);
+  /* Cambia al cerrar la caja para que el panel de avisos se vuelva a calcular */
+  const [version, setVersion] = useState(0);
 
   const cargar = useCallback(async () => {
     try {
@@ -1418,13 +1505,44 @@ function VistaCaja({ usuario, call, aviso }) {
   );
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
 
+  /*
+   * Los dos números del reporte Z los escribe la cajera, porque los dos
+   * salen impresos en el papel: el del reporte anterior y el del día.
+   *
+   * El formulario revisa dos cosas y ninguna bloquea el envío, porque el
+   * número que vale es el del papel:
+   *   - que el del día sea el siguiente del anterior
+   *   - que el anterior del papel sea el mismo con el que quedó guardado
+   *     el cierre pasado (si no, entre un cierre y otro se hizo un
+   *     reporte Z que no quedó registrado)
+   */
+  const cierrePasado = (hoy && hoy.cierre_pasado) || null;
+  const zAnterior = f.reporte_z_anterior === '' ? null : Number(f.reporte_z_anterior);
+  const esperadoZ = zAnterior === null ? null : zAnterior + 1;
+  const zEscrito = f.reporte_z === '' ? null : Number(f.reporte_z);
+  const zNoCuadra = esperadoZ !== null && zEscrito !== null && zEscrito !== esperadoZ;
+  const noCalzaConSistema = Boolean(
+    cierrePasado && zAnterior !== null && cierrePasado.reporte_z !== zAnterior,
+  );
+
+  /* Qué falta por llenar, en orden, para decirlo en el botón */
+  const falta = (() => {
+    if (!(tasa > 0)) return 'la tasa del dólar';
+    if (f.reporte_z_anterior === '') return 'el último reporte Z';
+    if (f.reporte_z === '') return 'el N° Reporte Z';
+    if (f.exento_bs === '') return 'el monto exento';
+    if (f.base_imponible_bs === '') return 'la base imponible 16%';
+    if (f.ultima_factura === '') return 'la última factura';
+    return '';
+  })();
+
   const enviar = async (e) => {
     e.preventDefault();
-    if (!(tasa > 0)) return aviso('Indique la tasa del dólar del día', 'error');
-    if (!window.confirm(`¿Cerrar la caja de hoy?\n\nTotal: ${fmtBs(totalBs)}\nIngreso en dólares: ${fmtUsd(totalUsd)}\n\nNo podrá repetirse.`)) return;
+    if (falta) return aviso(`Falta ${falta}`, 'error');
+    if (!window.confirm(`¿Cerrar la caja de hoy?\n\nTotal: ${fmtBs(totalBs)}\nIngreso en dólares: ${fmtUsd(totalUsd)}\nReporte Z: ${zAnterior} → ${zEscrito}\n\nNo podrá repetirse.`)) return;
     setEnviando(true);
     try {
-      await call('/api/caja/cierre', {
+      const r = await call('/api/caja/cierre', {
         method: 'POST',
         body: {
           pago_movil_bs: num('pago_movil_bs'),
@@ -1436,9 +1554,20 @@ function VistaCaja({ usuario, call, aviso }) {
           impuestos_fiscales_bs: num('impuestos_fiscales_bs'),
           costos_operativos_usd: num('costos_operativos_usd'),
           observacion: f.observacion,
+          reporte_z_anterior: f.reporte_z_anterior,
+          reporte_z: f.reporte_z,
+          exento_bs: num('exento_bs'),
+          base_imponible_bs: num('base_imponible_bs'),
+          ultima_factura: f.ultima_factura,
         },
       });
-      aviso('Caja cerrada correctamente', 'ok');
+      aviso(
+        r && r.aviso_z
+          ? `Caja cerrada. ${r.aviso_z}`
+          : 'Caja cerrada correctamente',
+        r && r.aviso_z ? 'error' : 'ok',
+      );
+      setVersion((v) => v + 1);
       cargar();
     } catch (err) {
       aviso(err.message, 'error');
@@ -1453,6 +1582,7 @@ function VistaCaja({ usuario, call, aviso }) {
   return (
     <div className="space-y-4">
       <Titulo>Cierre de caja</Titulo>
+      <AvisosCierre key={version} usuario={usuario} call={call} />
       {c ? (
         <div className="card space-y-1">
           <Chip tono="verde">Caja de hoy ya cerrada</Chip>
@@ -1466,11 +1596,22 @@ function VistaCaja({ usuario, call, aviso }) {
           <p>Impuestos: <b>{fmtBs(c.impuestos_fiscales_bs)}</b></p>
           <p>Costos operativos: <b>{fmtUsd(c.costos_operativos_usd)}</b> <span className="text-slate-500">({fmtBs(c.costos_operativos_bs)})</span></p>
           <p>Neto en Bs: <b>{fmtBs(redondear(c.total_cierre_bs - c.impuestos_fiscales_bs - c.costos_operativos_bs))}</b></p>
+          {c.reporte_z !== null && c.reporte_z !== undefined && (
+            <>
+              <hr className="my-1" />
+              <p className="font-semibold text-slate-700">Cierre fiscal</p>
+              <p>Último reporte Z: <b>{c.reporte_z_anterior}</b></p>
+              <p>N° Reporte Z: <b>{c.reporte_z}</b></p>
+              <p>Exento: <b>{fmtBs(c.exento_bs)}</b></p>
+              <p>Base imponible 16%: <b>{fmtBs(c.base_imponible_bs)}</b></p>
+              <p>Última factura: <b>{c.ultima_factura}</b></p>
+            </>
+          )}
           {c.observacion && <p className="text-sm text-slate-600">Nota: {c.observacion}</p>}
           <p className="text-sm text-slate-500">Registrado por {c.usuario}</p>
         </div>
       ) : (
-        <form onSubmit={enviar} className="card space-y-3">
+        <form onSubmit={enviar} className="card space-y-3" noValidate>
           <p className="text-sm text-slate-500">Fecha: {fmtFecha(hoy.fecha)}</p>
           <p className="text-xs text-slate-500">
             En los montos escribe sólo números: los centavos se llenan primero y el
@@ -1500,6 +1641,52 @@ function VistaCaja({ usuario, call, aviso }) {
           <Campo etiqueta="Impuestos fiscales (Bs)">
             <MontoInput digitos={f.impuestos_fiscales_bs} onDigitos={set('impuestos_fiscales_bs')} prefijo="Bs" />
           </Campo>
+
+          {/*
+            * Cierre fiscal: los cinco datos se copian del papel de la
+            * impresora, tal cual aparecen ahí. El sistema no los calcula.
+            */}
+          <div className="rounded-xl border-2 border-slate-300 bg-white p-3 space-y-3">
+            <div>
+              <h4 className="font-bold text-slate-800">Cierre fiscal</h4>
+              <p className="text-xs text-slate-500">
+                Copia estos cinco datos del papel de la impresora, tal como aparecen ahí.
+              </p>
+            </div>
+
+            <Campo etiqueta="Último reporte Z">
+              <DigitosInput digitos={f.reporte_z_anterior} onDigitos={set('reporte_z_anterior')} largo={9} placeholder="420" />
+            </Campo>
+            {noCalzaConSistema && (
+              <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                Ojo: el cierre del {fmtFecha(cierrePasado.fecha)} quedó guardado con el reporte Z{' '}
+                {cierrePasado.reporte_z}, no con el {zAnterior}. Si el papel dice {zAnterior},
+                déjalo así y guarda igual: queda un aviso para el Master.
+              </p>
+            )}
+
+            <Campo etiqueta="N° Reporte Z">
+              <DigitosInput digitos={f.reporte_z} onDigitos={set('reporte_z')} largo={9} placeholder={esperadoZ !== null ? String(esperadoZ) : '421'} />
+            </Campo>
+            {zNoCuadra && (
+              <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                Revisa los números: si el anterior es el {zAnterior}, el del día debería ser el{' '}
+                {esperadoZ}. Si en la impresora dice {zEscrito}, déjalo así y guarda igual: queda
+                un aviso para el Master.
+              </p>
+            )}
+
+            <Campo etiqueta="Exento (Bs)">
+              <MontoInput digitos={f.exento_bs} onDigitos={set('exento_bs')} prefijo="Bs" />
+            </Campo>
+            <Campo etiqueta="Base imponible 16% (Bs)">
+              <MontoInput digitos={f.base_imponible_bs} onDigitos={set('base_imponible_bs')} prefijo="Bs" />
+            </Campo>
+            <Campo etiqueta="Última factura">
+              <DigitosInput digitos={f.ultima_factura} onDigitos={set('ultima_factura')} placeholder="00010237" />
+            </Campo>
+          </div>
+
           <Campo etiqueta="Costos operativos (USD)">
             <MontoInput digitos={f.costos_operativos_usd} onDigitos={set('costos_operativos_usd')} prefijo="$" />
           </Campo>
@@ -1515,7 +1702,9 @@ function VistaCaja({ usuario, call, aviso }) {
           <Campo etiqueta="Observación (opcional)">
             <textarea className="campo" rows={2} maxLength={500} value={f.observacion} onChange={(e) => set('observacion')(e.target.value)} />
           </Campo>
-          <button className="btn-primario w-full" disabled={enviando}>{enviando ? 'Cerrando…' : 'Cerrar caja del día'}</button>
+          <button className="btn-primario w-full" disabled={enviando || Boolean(falta)}>
+            {enviando ? 'Cerrando…' : falta ? `Falta ${falta}` : 'Cerrar caja del día'}
+          </button>
         </form>
       )}
 
@@ -1529,6 +1718,9 @@ function VistaCaja({ usuario, call, aviso }) {
                   <span className="font-semibold">{fmtFecha(h.fecha)}</span>
                   <span>{fmtBs(h.total_cierre_bs)} · {fmtUsd(h.total_ingreso_dolar)}</span>
                 </div>
+                {h.reporte_z !== null && h.reporte_z !== undefined && (
+                  <p className="text-xs text-slate-500">Reporte Z {h.reporte_z}</p>
+                )}
                 {esAdmin && (
                   <div className="mt-2 flex justify-end">
                     <BotonAnular

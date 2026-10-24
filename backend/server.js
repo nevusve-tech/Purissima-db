@@ -60,6 +60,7 @@ const PERMISOS_ESPECIALES = Object.freeze([
   { clave: 'ver_accesos', grupo: 'ver', etiqueta: 'Accesos', detalle: 'La lista de empleados y sus permisos, sin poder cambiarlos' },
   { clave: 'ver_apertura_diaria', grupo: 'ver', etiqueta: 'Apertura del día', detalle: 'Al entrar cada día, si la tienda abrió y a qué hora' },
   { clave: 'ver_pedidos_credito', grupo: 'ver', etiqueta: 'Pedidos por pagar', detalle: 'Lo que se le debe a los proveedores a crédito y cuándo vence' },
+  { clave: 'ver_avisos_cierre', grupo: 'ver', etiqueta: 'Avisos de cierre', detalle: 'Cuando un reporte Z no sigue al del cierre anterior' },
   { clave: 'ver_de_todos', grupo: 'ver', etiqueta: 'Registros de todo el equipo', detalle: 'En sus módulos, ver lo de todos y no sólo lo suyo' },
   { clave: 'ver_anulados', grupo: 'ver', etiqueta: 'Registros anulados', detalle: 'Ver también lo que fue anulado' },
   // --- lo que puede HACER ---
@@ -272,6 +273,11 @@ const COLUMNAS_REQUERIDAS = [
   ['productos', 'unidades_por_empaquetado'],
   ['productos', 'subcategoria'],
   ['cierres_caja', 'costos_operativos_usd'],
+  ['cierres_caja', 'reporte_z_anterior'],
+  ['cierres_caja', 'reporte_z'],
+  ['cierres_caja', 'exento_bs'],
+  ['cierres_caja', 'base_imponible_bs'],
+  ['cierres_caja', 'ultima_factura'],
   ['solicitudes', 'proveedor_id'],
   ['checklist_motos', 'anulado'],
   ['cierres_caja', 'anulado'],
@@ -2126,6 +2132,97 @@ function leerMontosCaja(b) {
   return { pagoMovil, efectivo, punto, tasa, impuestos, costosUsd, costosBs, totalBs, totalUsd };
 }
 
+/*
+ * Cierre fiscal: los datos que salen de la máquina fiscal al hacer el
+ * reporte Z del día.
+ *
+ * TODO se guarda TAL CUAL lo escribe la cajera, copiado del papel de la
+ * impresora. El sistema no calcula ninguno de estos números ni los deriva
+ * de otro: el que vale es el del papel, y si aquí se recalculara dejaría
+ * de coincidir con la máquina.
+ *
+ * Son dos números de reporte Z y los dos los escribe ella, porque los dos
+ * salen impresos: el del reporte anterior y el del día.
+ *
+ * La última factura va como texto para no perder los ceros de adelante
+ * (00010237), que es como la imprime la máquina.
+ */
+function leerCierreFiscal(b) {
+  const zAnterior = entero(b.reporte_z_anterior, 'Último reporte Z', { min: 0, max: 999999999, requerido: true });
+  const reporteZ = entero(b.reporte_z, 'N° Reporte Z', { min: 1, max: 999999999, requerido: true });
+  const exento = monto(b.exento_bs, 'Exento', { requerido: true });
+  const base = monto(b.base_imponible_bs, 'Base imponible 16%', { requerido: true });
+  const factura = texto(b.ultima_factura, 'Última factura', { max: 20, requerido: true });
+  if (!/^[0-9]{1,20}$/.test(factura)) {
+    throw bad('La última factura debe ser sólo números, como aparece en la impresora');
+  }
+  return { zAnterior, reporteZ, exento, base, factura };
+}
+
+/**
+ * El último cierre guardado que trae reporte Z, para comparar contra el
+ * número que la cajera copió del papel.
+ *
+ * Es el último cierre NO anulado con fecha anterior a la que se está
+ * cerrando. Si se anula un cierre, el anterior pasa a ser el de antes, y
+ * la cuenta sigue cuadrando sin tocar nada.
+ */
+async function ultimoCierreConZ(fecha, cliente = pool) {
+  const { rows } = await cliente.query(
+    `SELECT fecha, reporte_z FROM cierres_caja
+      WHERE NOT anulado AND reporte_z IS NOT NULL AND fecha < $1::date
+      ORDER BY fecha DESC LIMIT 1`,
+    [fecha],
+  );
+  return rows[0] || null;
+}
+
+/**
+ * Revisa los dos números que trae el papel: el del día tiene que ser el
+ * siguiente del anterior.
+ *
+ * Devuelve null si va bien, o el texto del aviso si no. NO impide
+ * guardar: el número que manda es el de la impresora, así que el cierre
+ * se registra igual y el aviso queda para que el Master lo revise.
+ */
+function revisarSecuenciaZ(anteriorZ, z) {
+  if (anteriorZ === null || anteriorZ === undefined) return null;
+  const esperado = anteriorZ + 1;
+  if (z === esperado) return null;
+  if (z > esperado) {
+    const saltados = z - esperado;
+    return saltados === 1
+      ? `Falta el reporte Z ${esperado}: el anterior es ${anteriorZ} y el del día llegó en ${z}.`
+      : `Faltan ${saltados} reportes Z (del ${esperado} al ${z - 1}): el anterior es ${anteriorZ} y el del día llegó en ${z}.`;
+  }
+  if (z === anteriorZ) return `El reporte Z ${z} está repetido: el anterior trae el mismo número.`;
+  return `El reporte Z retrocedió: el anterior es ${anteriorZ} y el del día trae el ${z}.`;
+}
+
+/**
+ * Revisa el otro lado: que el "último reporte Z" del papel sea el mismo
+ * que quedó guardado en el cierre pasado.
+ *
+ * Si no coinciden, entre un cierre y el otro se hizo un reporte Z que no
+ * está registrado, o hubo un día de venta sin cierre de caja. Es lo que
+ * más fácil se escapa, porque mirando un solo cierre los dos números
+ * calzan perfecto.
+ */
+function revisarContraCierrePasado(cierrePasado, anteriorZ) {
+  if (!cierrePasado || cierrePasado.reporte_z === null) return null;
+  if (cierrePasado.reporte_z === anteriorZ) return null;
+  return `El papel dice que el reporte anterior es ${anteriorZ}, pero el cierre del ${cierrePasado.fecha} quedó guardado con el ${cierrePasado.reporte_z}.`;
+}
+
+/** Los dos avisos juntos, en un solo texto, o null si todo va bien. */
+function avisosDelCierre(cierrePasado, anteriorZ, z) {
+  const lista = [
+    revisarSecuenciaZ(anteriorZ, z),
+    revisarContraCierrePasado(cierrePasado, anteriorZ),
+  ].filter(Boolean);
+  return lista.length ? lista.join(' ') : null;
+}
+
 app.get('/api/caja/hoy', autenticar, requiereModulo('caja'), asyncH(async (req, res) => {
   const hoy = hoyCaracas();
   const { rows } = await pool.query(
@@ -2133,7 +2230,50 @@ app.get('/api/caja/hoy', autenticar, requiereModulo('caja'), asyncH(async (req, 
        JOIN usuarios u ON u.id = c.usuario_id WHERE c.fecha = $1::date AND NOT c.anulado`,
     [hoy],
   );
-  res.json({ fecha: hoy, cierre: rows[0] || null });
+  /*
+   * El cierre pasado va como referencia: la cajera escribe el número que
+   * dice el papel, y el formulario le muestra con qué número quedó el
+   * cierre anterior para que note la diferencia si no coinciden.
+   */
+  const cierrePasado = await ultimoCierreConZ(hoy);
+  res.json({ fecha: hoy, cierre: rows[0] || null, cierre_pasado: cierrePasado });
+}));
+
+/**
+ * Avisos de cierre: los reportes Z que no siguen al del cierre anterior.
+ *
+ * No se guardan en ninguna parte: se calculan comparando los cierres
+ * entre sí cada vez que se piden. Así, si se corrige un número mal
+ * escrito o se anula un cierre, el aviso se corrige o desaparece solo.
+ * Guardado como registro quedaría señalando un error ya resuelto.
+ */
+app.get('/api/caja/avisos-cierre', autenticar, requierePermiso('ver_avisos_cierre'), asyncH(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT fecha, reporte_z, reporte_z_anterior, pasado_fecha, pasado_z FROM (
+       SELECT c.fecha, c.reporte_z, c.reporte_z_anterior,
+              lag(c.fecha)     OVER (ORDER BY c.fecha) AS pasado_fecha,
+              lag(c.reporte_z) OVER (ORDER BY c.fecha) AS pasado_z
+         FROM cierres_caja c
+        WHERE NOT c.anulado AND c.reporte_z IS NOT NULL
+     ) t
+      WHERE reporte_z_anterior IS NOT NULL
+        AND (reporte_z <> reporte_z_anterior + 1
+             OR (pasado_z IS NOT NULL AND reporte_z_anterior <> pasado_z))
+      ORDER BY fecha DESC LIMIT 100`,
+  );
+  const avisos = rows.map((r) => ({
+    fecha: r.fecha,
+    reporte_z: r.reporte_z,
+    reporte_z_anterior: r.reporte_z_anterior,
+    pasado_fecha: r.pasado_fecha,
+    pasado_z: r.pasado_z,
+    motivo: avisosDelCierre(
+      r.pasado_fecha ? { fecha: r.pasado_fecha, reporte_z: r.pasado_z } : null,
+      r.reporte_z_anterior,
+      r.reporte_z,
+    ),
+  }));
+  res.json({ avisos });
 }));
 
 app.get('/api/caja', autenticar, requiereModulo('caja'), asyncH(async (req, res) => {
@@ -2161,8 +2301,10 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
     if (fecha > hoy) throw bad('No se puede cerrar una fecha futura');
   }
   const m = leerMontosCaja(b);
+  const fi = leerCierreFiscal(b);
   const obs = texto(b.observacion, 'Observación', { max: 500 });
 
+  let avisoZ = null;
   const cierre = await withTx(async (c) => {
     await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`caja:${fecha}`]);
 
@@ -2186,20 +2328,38 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
 
     const previos = await c.query('SELECT id FROM cierres_caja WHERE fecha = $1::date AND NOT anulado FOR UPDATE', [fecha]);
     if (previos.rowCount) throw new HttpError(409, `La caja del ${fecha} ya fue cerrada`);
+
+    /*
+     * El reporte Z del día debe ser el siguiente del anterior, y el
+     * anterior que trae el papel debe coincidir con el que quedó en el
+     * cierre pasado. Si algo no cuadra, el cierre se guarda igual —el
+     * número que manda es el de la impresora— y queda el aviso.
+     */
+    const pasado = await ultimoCierreConZ(fecha, c);
+    avisoZ = avisosDelCierre(pasado, fi.zAnterior, fi.reporteZ);
+
     const { rows } = await c.query(
       `INSERT INTO cierres_caja
          (fecha, usuario_id, pago_movil_bs, efectivo_bs, punto_venta_bs, total_cierre_bs,
           tasa_dolar, dolares_vendidos, total_ingreso_dolar,
-          impuestos_fiscales_bs, costos_operativos_usd, costos_operativos_bs, observacion)
-       VALUES ($1::date, $2, $3, $4, $5, $6, $7, 0, $8, $9, $10, $11, $12) RETURNING *`,
+          impuestos_fiscales_bs, costos_operativos_usd, costos_operativos_bs, observacion,
+          reporte_z_anterior, reporte_z, exento_bs, base_imponible_bs, ultima_factura)
+       VALUES ($1::date, $2, $3, $4, $5, $6, $7, 0, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING *`,
       [fecha, req.usuario.id, m.pagoMovil, m.efectivo, m.punto, m.totalBs,
-        m.tasa, m.totalUsd, m.impuestos, m.costosUsd, m.costosBs, obs || null],
+        m.tasa, m.totalUsd, m.impuestos, m.costosUsd, m.costosBs, obs || null,
+        fi.zAnterior, fi.reporteZ, fi.exento, fi.base, fi.factura],
     );
     return rows[0];
   });
 
-  notificar(`Cierre de caja ${fecha}`, {
+  notificar(`Cierre de caja ${fecha}${avisoZ ? ' — revisar el reporte Z' : ''}`, {
     Responsable: nombreCompleto(req.usuario),
+    ...(avisoZ ? { 'AVISO DE CIERRE': avisoZ } : {}),
+    'Último reporte Z': String(cierre.reporte_z_anterior),
+    'N° Reporte Z': String(cierre.reporte_z),
+    'Exento (Bs)': cierre.exento_bs.toFixed(2),
+    'Base imponible 16% (Bs)': cierre.base_imponible_bs.toFixed(2),
+    'Última factura': cierre.ultima_factura,
     'Pago móvil (Bs)': cierre.pago_movil_bs.toFixed(2),
     'Efectivo (Bs)': cierre.efectivo_bs.toFixed(2),
     'Punto de venta (Bs)': cierre.punto_venta_bs.toFixed(2),
@@ -2210,28 +2370,37 @@ app.post('/api/caja/cierre', autenticar, requiereModulo('caja'), asyncH(async (r
     'Costos operativos (USD)': cierre.costos_operativos_usd.toFixed(2),
     'Costos operativos (Bs)': cierre.costos_operativos_bs.toFixed(2),
   });
-  res.status(201).json({ cierre });
+  res.status(201).json({ cierre, aviso_z: avisoZ });
 }));
 
 app.put('/api/caja/:id', autenticar, requierePermiso('corregir_caja'), asyncH(async (req, res) => {
   const id = uuid(req.params.id, 'id');
   const m = leerMontosCaja(req.body || {});
+  const fi = leerCierreFiscal(req.body || {});
   const obs = texto(req.body && req.body.observacion, 'Observación', { max: 500 });
+  let avisoZ = null;
   const cierre = await withTx(async (c) => {
-    const { rows } = await c.query('SELECT id FROM cierres_caja WHERE id = $1 FOR UPDATE', [id]);
+    const { rows } = await c.query('SELECT id, fecha FROM cierres_caja WHERE id = $1 FOR UPDATE', [id]);
     if (!rows[0]) throw new HttpError(404, 'Cierre no encontrado');
+
+    const pasado = await ultimoCierreConZ(rows[0].fecha, c);
+    avisoZ = avisosDelCierre(pasado, fi.zAnterior, fi.reporteZ);
+
     const r = await c.query(
       `UPDATE cierres_caja SET pago_movil_bs=$2, efectivo_bs=$3, punto_venta_bs=$4, total_cierre_bs=$5,
               tasa_dolar=$6, dolares_vendidos=0, total_ingreso_dolar=$7,
               impuestos_fiscales_bs=$8, costos_operativos_usd=$9, costos_operativos_bs=$10,
-              observacion=$11
+              observacion=$11,
+              reporte_z_anterior=$12, reporte_z=$13, exento_bs=$14,
+              base_imponible_bs=$15, ultima_factura=$16
        WHERE id=$1 RETURNING *`,
       [id, m.pagoMovil, m.efectivo, m.punto, m.totalBs, m.tasa, m.totalUsd,
-        m.impuestos, m.costosUsd, m.costosBs, obs || null],
+        m.impuestos, m.costosUsd, m.costosBs, obs || null,
+        fi.zAnterior, fi.reporteZ, fi.exento, fi.base, fi.factura],
     );
     return r.rows[0];
   });
-  res.json({ cierre });
+  res.json({ cierre, aviso_z: avisoZ });
 }));
 
 /* ------------------------------------------------------------------ */
